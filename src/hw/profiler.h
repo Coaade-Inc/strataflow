@@ -1,0 +1,47 @@
+// Hardware profiler: measures the machine so the planner can place weights.
+// See docs/PLAN.md section 3.1.
+// Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace sf {
+
+struct GpuInfo {
+    std::string name;
+    uint64_t    vram_bytes = 0;
+    double      vram_gbps  = 0.0;   // measured/estimated device bandwidth
+    int         backend    = 0;     // sf_backend value
+};
+
+struct HardwareProfile {
+    // CPU
+    unsigned      logical_cores   = 0;
+    unsigned      physical_cores  = 0;
+    bool          has_avx2        = false;
+    bool          has_avx512      = false;
+    bool          has_neon        = false;
+
+    // Memory
+    uint64_t      ram_total_bytes = 0;
+    uint64_t      ram_free_bytes  = 0;
+    double        ram_gbps        = 0.0;   // measured host read bandwidth
+
+    // Storage (where the model lives)
+    double        ssd_seq_gbps    = 0.0;   // sequential read
+    double        ssd_rand_gbps   = 0.0;   // random 4 MiB read, QD1
+
+    std::vector<GpuInfo> gpus;
+
+    std::string to_json() const;
+    std::string to_summary() const;
+};
+
+// Profiles the current machine. `model_dir` (optional) is used to benchmark the
+// disk the model actually sits on; empty uses the current working directory.
+// `quick` skips the longer bandwidth micro-benchmarks (used in tests/CI).
+HardwareProfile profile_hardware(const std::string &model_dir = {}, bool quick = false);
+
+} // namespace sf
