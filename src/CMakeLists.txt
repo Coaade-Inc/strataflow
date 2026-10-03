@@ -33,6 +33,7 @@ target_include_directories(strataflow
 
 target_compile_definitions(strataflow PRIVATE STRATAFLOW_BUILD)
 target_compile_definitions(strataflow PRIVATE STRATAFLOW_PLATFORM_${STRATAFLOW_PLATFORM})
+target_link_libraries(strataflow PUBLIC strataflow_cxx)
 target_link_libraries(strataflow PRIVATE strataflow_warnings)
 
 find_package(Threads REQUIRED)

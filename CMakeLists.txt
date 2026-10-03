@@ -8,8 +8,13 @@ project(StrataFlow
 # ---------------------------------------------------------------------------
 # Project-wide settings
 # ---------------------------------------------------------------------------
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# NOTE: do NOT set CMAKE_CXX_STANDARD globally. StrataFlow is C++20, but the
+# vendored llama.cpp (added via add_subdirectory) is written for C++17 and does
+# not compile under C++20 (u8"" string literals become char8_t, which breaks
+# its chat-template code on MSVC/Clang). A global standard would leak into the
+# submodule. Instead we apply C++20 per-target on our own targets only, via the
+# `strataflow_cxx` interface defined below, and let llama.cpp use its own
+# per-target standard.
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 11)
 
@@ -39,6 +44,10 @@ option(STRATAFLOW_HIP    "Enable HIP/ROCm backend (via ggml)" OFF)
 # ---------------------------------------------------------------------------
 # Warning flags (portable across GCC/Clang/MSVC)
 # ---------------------------------------------------------------------------
+# C++20 for StrataFlow's own targets only (kept off the vendored llama.cpp).
+add_library(strataflow_cxx INTERFACE)
+target_compile_features(strataflow_cxx INTERFACE cxx_std_20)
+
 add_library(strataflow_warnings INTERFACE)
 if(STRATAFLOW_WARNINGS)
     if(MSVC)
