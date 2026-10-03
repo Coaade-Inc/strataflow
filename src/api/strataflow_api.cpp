@@ -7,6 +7,7 @@
 #include "hw/profiler.h"
 #include "kv/kv_store.h"
 #include "model/model.h"
+#include "plan/llama_placement.h"
 #include "plan/planner.h"
 #include "predict/predictor.h"
 #include "sched/scheduler.h"
@@ -63,11 +64,13 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
 
     ctx->hw = sf::profile_hardware(params->model_path, /*quick=*/false);
 
-    sf_status st = sf::load_model(params->model_path, ctx->model);
+    // The planner runs INSIDE load_model now, so the chosen placement actually
+    // drives how the GGUF backend loads the model (VRAM layers + expert
+    // offload). An explicit budget of 0 means "auto from the profile".
+    sf_status st = sf::load_model(params->model_path, ctx->hw,
+                                  params->vram_budget, params->ram_budget,
+                                  ctx->model, &ctx->plan);
     if (st != SF_OK) return st;
-
-    ctx->plan = sf::plan_placement(ctx->hw, ctx->model->shape(),
-                                   params->vram_budget, params->ram_budget);
 
     *out_ctx = ctx.release();
     return SF_OK;
@@ -128,7 +131,19 @@ sf_status sf_describe_plan(sf_context *ctx, char *buf, size_t buf_size) {
     if (ctx == nullptr || buf == nullptr || buf_size == 0) {
         return SF_ERR_INVALID_ARGUMENT;
     }
-    std::string line = ctx->hw.to_summary() + " | " + ctx->plan.to_summary();
+    // Surface the concrete auto-decision (what llama.cpp was actually told):
+    // how many trunk layers went to VRAM, and whether MoE experts were forced
+    // onto the CPU. derive_llama_placement is the same pure translation the
+    // GGUF backend applied, so this reflects the real load params.
+    sf::LlamaPlacement place = sf::derive_llama_placement(
+        ctx->plan, ctx->model->shape(), ctx->hw.gpus);
+    std::string decision =
+        "auto[n_gpu_layers=" + std::to_string(place.n_gpu_layers) +
+        ", experts=" + (place.offload_experts_to_cpu ? "CPU-offload" : "default") +
+        "]";
+
+    std::string line = ctx->hw.to_summary() + " | " + ctx->plan.to_summary() +
+                       " | " + decision;
     std::strncpy(buf, line.c_str(), buf_size - 1);
     buf[buf_size - 1] = '\0';
     return SF_OK;
