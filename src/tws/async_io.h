@@ -1,7 +1,7 @@
 // Async block I/O for streaming expert weights off disk.
 // See docs/PLAN.md section 3.3. Phase 1 ships a portable synchronous fallback;
 // io_uring (Linux), IOCP (Windows) and F_NOCACHE+pread (macOS) land in Phase 3.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+// Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
 #include <cstddef>

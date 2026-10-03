@@ -1,7 +1,7 @@
 // Tests that the hardware profiler actually measures SSD bandwidth (Task 1).
 // A non-quick profile of a writable directory must report non-zero sequential
 // and random read throughput, and must leave no probe file behind.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+// Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "hw/profiler.h"
 #include "test_util.h"
 

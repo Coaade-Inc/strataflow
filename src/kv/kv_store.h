@@ -1,7 +1,7 @@
 // Paged KV cache. See docs/PLAN.md section 3.9.
 // Phase 1: a bookkeeping stub tracking context length and byte usage.
 // Quantized/paged storage, MLA, and RAM/SSD spill land in Phase 6.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+// Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
 #include <cstdint>

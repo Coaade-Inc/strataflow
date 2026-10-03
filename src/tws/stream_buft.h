@@ -26,7 +26,7 @@
 //     (a region smaller than the full footprint). The SlotPool/BlockFile seam
 //     is kept clean so Task 3 can plug those in.
 //   - Task 4: native direct-I/O async backends behind BlockFile.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+// Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
 #include <cstddef>

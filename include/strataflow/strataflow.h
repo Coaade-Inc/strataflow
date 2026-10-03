@@ -10,7 +10,7 @@
  * Calls behave sanely (return errors / placeholder output) so tools and tests
  * can be built against the final API shape today.
  *
- * Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+ * Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
  */
 #ifndef STRATAFLOW_H
 #define STRATAFLOW_H

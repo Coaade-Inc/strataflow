@@ -1,6 +1,6 @@
 // Placement planner: decides which weight units live in which tier.
 // See docs/PLAN.md section 3.2.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+// Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
 #include "hw/profiler.h"

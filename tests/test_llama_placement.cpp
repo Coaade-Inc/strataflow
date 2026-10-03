@@ -5,7 +5,7 @@
 // expert FFN tensors must be forced onto the CPU (the --n-cpu-moe equivalent).
 // It is a pure function over plain structs, so these cases run with NO GPU and
 // NO real model -- exactly the paths CI cannot exercise on CPU-only runners.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+// Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "plan/llama_placement.h"
 #include "plan/planner.h"
 #include "hw/profiler.h"
