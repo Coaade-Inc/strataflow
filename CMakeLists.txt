@@ -108,6 +108,9 @@ if(NOT EXISTS ${STRATAFLOW_LLAMA_DIR}/CMakeLists.txt)
 endif()
 
 # llama.cpp build knobs (set before add_subdirectory so they take effect).
+# Build llama/ggml static so the CLI and tests are self-contained — avoids
+# Windows DLL-search-path issues for the vendored libraries in CI.
+set(BUILD_SHARED_LIBS    OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)

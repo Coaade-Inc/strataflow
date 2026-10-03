@@ -22,7 +22,11 @@ set(STRATAFLOW_SOURCES
     api/strataflow_api.cpp
 )
 
-add_library(strataflow ${STRATAFLOW_SOURCES})
+# Build STATIC explicitly. A shared build on Windows produces no import .lib
+# unless the C API symbols are dllexport'd (SF_API only exports when
+# STRATAFLOW_SHARED is defined), which broke the MSVC link. Static is all we
+# need for now; a proper shared build with an export map is a later concern.
+add_library(strataflow STATIC ${STRATAFLOW_SOURCES})
 add_library(StrataFlow::strataflow ALIAS strataflow)
 
 target_include_directories(strataflow
