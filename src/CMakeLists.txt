@@ -14,6 +14,7 @@ set(STRATAFLOW_SOURCES
     plan/planner.cpp
     plan/llama_placement.cpp
     tws/async_io.cpp
+    tws/stream_buft.cpp
     tws/weight_store.cpp
     predict/predictor.cpp
     sched/scheduler.cpp
@@ -59,6 +60,13 @@ target_link_libraries(strataflow PRIVATE llama)
 target_include_directories(strataflow SYSTEM PRIVATE
     $<TARGET_PROPERTY:llama,INTERFACE_INCLUDE_DIRECTORIES>
     $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>)
+
+# tws/stream_buft.cpp implements ggml_backend_buffer_type_i / _buffer_i, whose
+# definitions live in the PRIVATE ggml header ggml-backend-impl.h under
+# ggml/src. The public ggml include dirs above do not cover that path, so add
+# it as a SYSTEM include (vendored header, not subject to our -Werror).
+target_include_directories(strataflow SYSTEM PRIVATE
+    ${STRATAFLOW_LLAMA_DIR}/ggml/src)
 
 # Backend wiring (Phase 1b): when a backend option is ON, define a macro and,
 # later, link the vendored ggml backend target. Kept inert for now.

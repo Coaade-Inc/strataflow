@@ -16,6 +16,7 @@
 #include "hw/gpu_discovery.h"
 #include "plan/llama_placement.h"
 #include "plan/planner.h"
+#include "tws/stream_buft.h"
 
 #include <ggml-backend.h>
 #include <gguf.h>
@@ -41,6 +42,17 @@ namespace {
 void ensure_backend() {
     static std::once_flag once;
     std::call_once(once, [] { llama_backend_init(); });
+}
+
+// Task 1 CI proxy: STRATAFLOW_FORCE_STREAM_EXPERTS=1 makes load_ggml_model
+// treat the model as if the plan said stream_experts=true even when every
+// expert would fit in RAM, so the streaming buffer type (Task 2) is exercised
+// in CPU-only CI on a tiny model. Any value other than "0"/""/"false" enables.
+bool force_stream_experts_env() {
+    const char *v = std::getenv("STRATAFLOW_FORCE_STREAM_EXPERTS");
+    if (v == nullptr || v[0] == '\0') return false;
+    std::string s(v);
+    return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
 }
 
 // Route llama.cpp's internal logging into our logger. Keeps the CLI/test
@@ -378,17 +390,49 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
     PlacementPlan plan;
     // The CPU/host buffer type for expert offload; must outlive the load call.
     std::array<llama_model_tensor_buft_override, 2> overrides{};
+    // Keep the override pattern string alive for the whole load call: both the
+    // Phase 2 CPU-offload path and the Phase 3 streaming path point an override
+    // entry's pattern at its c_str().
+    std::string expert_pattern;
     if (read_shape_from_gguf(path, pre_shape)) {
         plan = plan_placement(hw, pre_shape, vram_budget, ram_budget);
         place = derive_llama_placement(plan, pre_shape, hw.gpus);
 
         mp.n_gpu_layers = place.n_gpu_layers;
 
-        if (place.offload_experts_to_cpu) {
-            // Resolve "experts -> CPU" into a concrete host buffer type. This
-            // is the llama.cpp equivalent of --n-cpu-moe / -ot "exps=CPU":
-            // route the routed-expert FFN tensors to the CPU device's default
-            // buffer type via a NULL-terminated pattern override array.
+        // Phase 3 streaming is requested when the plan decides experts cannot
+        // all stay resident, OR the Task 1 CI-proxy env switch forces it. For a
+        // MoE model this routes the routed-expert FFN tensors to the custom
+        // strata_stream_buft instead of the plain CPU buffer type.
+        const bool force_stream = force_stream_experts_env();
+        const bool stream_experts =
+            pre_shape.is_moe && (plan.stream_experts || force_stream);
+
+        if (stream_experts) {
+            ggml_backend_buffer_type_t stream_buft = strata_stream_buft();
+            if (stream_buft != nullptr) {
+                // Reuse the EXISTING Phase 2 regex so the same tensors are
+                // selected; only the destination buft changes.
+                expert_pattern = expert_ffn_regex();
+                overrides[0].pattern = expert_pattern.c_str();
+                overrides[0].buft = stream_buft;
+                overrides[1].pattern = nullptr;  // NULL-terminates the array
+                overrides[1].buft = nullptr;
+                mp.tensor_buft_overrides = overrides.data();
+                log_info(std::string("GgmlModel: streaming MoE experts through "
+                                     "strata_stream_buft (pattern '") +
+                         expert_pattern + "'" +
+                         (force_stream ? ", forced via env" : "") + ")");
+            } else {
+                log_warn("load_ggml_model: strata_stream_buft unavailable; "
+                         "falling back to resident CPU experts.");
+            }
+        } else if (place.offload_experts_to_cpu) {
+            // Phase 2 behaviour (unchanged): resolve "experts -> CPU" into a
+            // concrete host buffer type. The llama.cpp equivalent of
+            // --n-cpu-moe / -ot "exps=CPU": route the routed-expert FFN tensors
+            // to the CPU device's default buffer type via a NULL-terminated
+            // pattern override array.
             ggml_backend_buffer_type_t cpu_buft = nullptr;
             ggml_backend_dev_t cpu_dev =
                 ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -398,7 +442,8 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
             if (cpu_buft == nullptr) {
                 cpu_buft = ggml_backend_cpu_buffer_type();
             }
-            overrides[0].pattern = place.expert_override_pattern.c_str();
+            expert_pattern = place.expert_override_pattern;
+            overrides[0].pattern = expert_pattern.c_str();
             overrides[0].buft = cpu_buft;
             overrides[1].pattern = nullptr;  // NULL-terminates the array
             overrides[1].buft = nullptr;
