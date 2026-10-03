@@ -6,8 +6,10 @@
 //
 // The real llama.cpp load path is exercised only when STRATAFLOW_TEST_GGUF
 // points at a readable GGUF file, so the suite stays green without downloading
-// multi-gigabyte weights. To run it against a real model:
-//     STRATAFLOW_TEST_GGUF=/path/to/model.gguf ctest -R test_model_load
+// multi-gigabyte weights. Generate a tiny fixture and run it with:
+//     python3 tools/testdata/make_tiny_gguf.py /tmp/tiny.gguf
+//     STRATAFLOW_TEST_GGUF=/tmp/tiny.gguf ctest -R test_model_load
+// (It also accepts any real .gguf checkpoint for a fuller check.)
 // Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
 #include "model/model.h"
 #include "test_util.h"

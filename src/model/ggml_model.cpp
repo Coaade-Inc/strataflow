@@ -74,26 +74,35 @@ public:
     const ModelShape &shape() const override { return shape_; }
 
     std::vector<int32_t> tokenize(const std::string &text) const override {
-        // First call with a null buffer returns the (negative) required size.
-        const int32_t n_max = static_cast<int32_t>(text.size()) + 8;
-        std::vector<llama_token> toks(static_cast<size_t>(n_max));
-        int32_t n = llama_tokenize(vocab_, text.c_str(),
+        std::vector<int32_t> ids;
+        // llama's tokenizer can throw (e.g. std::out_of_range) on a malformed
+        // or incomplete vocabulary. This method is reachable from the C ABI,
+        // which must not let C++ exceptions escape, so contain them here and
+        // degrade to a single BOS token instead of crashing the process.
+        try {
+            // First call with a small buffer returns the (negative) required size.
+            const int32_t n_max = static_cast<int32_t>(text.size()) + 8;
+            std::vector<llama_token> toks(static_cast<size_t>(n_max));
+            int32_t n = llama_tokenize(vocab_, text.c_str(),
+                                       static_cast<int32_t>(text.size()),
+                                       toks.data(), n_max,
+                                       /*add_special=*/true,
+                                       /*parse_special=*/true);
+            if (n < 0) {
+                // Buffer was too small; -n is the real count. Retry exactly once.
+                toks.resize(static_cast<size_t>(-n));
+                n = llama_tokenize(vocab_, text.c_str(),
                                    static_cast<int32_t>(text.size()),
-                                   toks.data(), n_max,
+                                   toks.data(), -n,
                                    /*add_special=*/true,
                                    /*parse_special=*/true);
-        if (n < 0) {
-            // Buffer was too small; -n is the real count. Retry exactly once.
-            toks.resize(static_cast<size_t>(-n));
-            n = llama_tokenize(vocab_, text.c_str(),
-                               static_cast<int32_t>(text.size()),
-                               toks.data(), -n,
-                               /*add_special=*/true,
-                               /*parse_special=*/true);
-        }
-        std::vector<int32_t> ids;
-        if (n > 0) {
-            ids.assign(toks.begin(), toks.begin() + n);
+            }
+            if (n > 0) {
+                ids.assign(toks.begin(), toks.begin() + n);
+            }
+        } catch (const std::exception &e) {
+            log_error(std::string("GgmlModel::tokenize: ") + e.what());
+            ids.clear();
         }
         if (ids.empty()) {
             // Keep the engine's "always have a seed token" invariant.
