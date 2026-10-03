@@ -69,6 +69,12 @@ else()
 endif()
 message(STATUS "StrataFlow platform: ${STRATAFLOW_PLATFORM}")
 
+# MSVC: use the portable CRT names (getenv, fopen, ...) without deprecation
+# warnings, and don't define min/max macros that collide with std::min/max.
+if(MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX)
+endif()
+
 add_subdirectory(src)
 
 if(STRATAFLOW_BUILD_TOOLS)

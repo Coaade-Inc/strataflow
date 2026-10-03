@@ -14,10 +14,12 @@
 #  include <unistd.h>
 #endif
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #  define SF_ARCH_X86 1
-#  if defined(__GNUC__)
+#  if defined(__GNUC__) || defined(__clang__)
 #    include <cpuid.h>
+#  elif defined(_MSC_VER)
+#    include <intrin.h>
 #  endif
 #endif
 
@@ -29,14 +31,22 @@ namespace sf {
 namespace {
 
 void detect_isa(HardwareProfile &p) {
-#if defined(SF_ARCH_X86) && defined(__GNUC__)
+#if defined(SF_ARCH_X86) && (defined(__GNUC__) || defined(__clang__))
     unsigned eax, ebx, ecx, edx;
     if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
         p.has_avx2   = (ebx & (1u << 5))  != 0;   // AVX2
         p.has_avx512 = (ebx & (1u << 16)) != 0;   // AVX-512F
     }
+#elif defined(SF_ARCH_X86) && defined(_MSC_VER)
+    int regs[4] = {0, 0, 0, 0};
+    __cpuidex(regs, 7, 0);
+    const unsigned ebx = static_cast<unsigned>(regs[1]);
+    p.has_avx2   = (ebx & (1u << 5))  != 0;
+    p.has_avx512 = (ebx & (1u << 16)) != 0;
 #elif defined(SF_ARCH_ARM)
     p.has_neon = true;  // baseline on aarch64
+#else
+    (void)p;  // no ISA probe on this target
 #endif
 }
 

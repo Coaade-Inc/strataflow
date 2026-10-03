@@ -27,11 +27,12 @@ std::vector<uint32_t> ExpertPredictor::predict(uint32_t layer, uint32_t k) const
     const auto &f = freq_[layer];
     std::vector<uint32_t> idx(f.size());
     std::iota(idx.begin(), idx.end(), 0u);
-    std::partial_sort(idx.begin(),
-                      idx.begin() + std::min<size_t>(k, idx.size()),
-                      idx.end(),
+
+    using Diff = std::vector<uint32_t>::difference_type;
+    const Diff take = static_cast<Diff>(std::min<size_t>(k, idx.size()));
+    std::partial_sort(idx.begin(), idx.begin() + take, idx.end(),
                       [&f](uint32_t a, uint32_t b) { return f[a] > f[b]; });
-    out.assign(idx.begin(), idx.begin() + std::min<size_t>(k, idx.size()));
+    out.assign(idx.begin(), idx.begin() + take);
 
     predicted_ += out.size();
     last_prediction_ = out;
