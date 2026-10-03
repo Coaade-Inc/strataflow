@@ -1,6 +1,9 @@
 // Async block I/O for streaming expert weights off disk.
-// See docs/PLAN.md section 3.3. Phase 1 ships a portable synchronous fallback;
-// io_uring (Linux), IOCP (Windows) and F_NOCACHE+pread (macOS) land in Phase 3.
+// See docs/PLAN.md section 3.3 and docs/PHASE3_PLAN.md Task 4. The native
+// backends bypass the OS page cache so streamed experts don't evict the
+// resident trunk: O_DIRECT (+io_uring when built with liburing) on Linux,
+// FILE_FLAG_NO_BUFFERING (+IOCP) on Windows, and F_NOCACHE on macOS. Each
+// native path degrades cleanly to a portable synchronous fallback.
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
@@ -15,6 +18,16 @@ namespace sf {
 // the same code path works once O_DIRECT is enabled.
 class BlockFile {
 public:
+    // The I/O path actually selected at open() time. The native backend is an
+    // optimization that degrades to kSync when the kernel/filesystem rejects
+    // the direct-I/O flags (e.g. O_DIRECT with EINVAL inside a container).
+    enum class Backend {
+        kSync,       // portable buffered pread / CRT fread fallback
+        kDirect,     // O_DIRECT + pread (Linux) / F_NOCACHE + pread (macOS)
+        kIoUring,    // io_uring + O_DIRECT (Linux, when built with liburing)
+        kNoBuffering // FILE_FLAG_NO_BUFFERING (+ IOCP) on Windows
+    };
+
     BlockFile() = default;
     ~BlockFile();
     BlockFile(const BlockFile &) = delete;
@@ -28,20 +41,40 @@ public:
     uint64_t size() const { return size_; }
 
     // Synchronous read of `len` bytes at `offset` into `dst`.
-    // Returns bytes read, or -1 on error.
+    // Returns bytes read, or -1 on error. For direct-I/O backends unaligned
+    // requests are served through an aligned bounce buffer transparently.
     int64_t read_at(void *dst, size_t len, uint64_t offset) const;
 
-    // Asynchronous read; Phase 1 implements this on a thread pool, Phase 3
-    // swaps in the native async backend behind the same signature.
+    // Asynchronous read; wraps read_at on a thread so callers (the residency
+    // pass, Phase 4 prefetch) get a future that completes when the op does.
     std::future<int64_t> read_async(void *dst, size_t len, uint64_t offset) const;
 
-    // Reports which async backend is active ("sync", "io_uring", ...).
+    // The backend selected for this open file (valid while is_open()).
+    Backend backend() const { return backend_; }
+
+    // Human-readable name of the backend active on this handle. Falls back to
+    // the compiled platform default when no file is open.
+    const char *active_backend_name() const;
+
+    // Reports the platform's native async backend ("io_uring+O_DIRECT",
+    // "O_DIRECT+pread", "IOCP+no_buffering", "F_NOCACHE+pread", or the
+    // "sync (fallback)" when no native path is compiled in). Static so logs
+    // can report capability without an open handle.
     static const char *backend_name();
 
 private:
-    int   fd_ = -1;             // POSIX
-    void *handle_ = nullptr;    // reserved for Win32 HANDLE
+    // Direct-I/O read honoring the required alignment via an aligned bounce
+    // buffer. Returns bytes copied into `dst`, or -1 on error.
+    int64_t read_direct_aligned(void *dst, size_t len, uint64_t offset) const;
+
+    int   fd_ = -1;             // POSIX file descriptor
+    void *handle_ = nullptr;    // Win32 HANDLE (or CRT FILE* fallback)
     uint64_t size_ = 0;
+    size_t   alignment_ = 1;    // required I/O alignment for the active backend
+    Backend  backend_ = Backend::kSync;
+#if defined(STRATAFLOW_PLATFORM_windows)
+    bool     win_crt_ = false;  // Windows: handle_ is a FILE* (sync fallback)
+#endif
 };
 
 // Recommended read alignment for direct I/O.
