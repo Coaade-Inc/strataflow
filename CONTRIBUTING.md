@@ -1,6 +1,9 @@
 # Contributing to StrataFlow
 
-A Coaade Inc. project. Licensed under Apache-2.0.
+A Coaade Inc. project. Source-available under the Coaade Source-Available
+License, Version 1.0 (see [`LICENSE`](LICENSE)) — free for personal,
+non-commercial use. By contributing, you agree your contributions are licensed
+to Coaade Inc. under the same terms. Commercial licensing: contact@coaade.com.
 
 ## Build
 

@@ -6,7 +6,7 @@
 // and tests all run end to end before any real weights exist. When ggml is
 // vendored, GgmlModel implements this same interface and the dry-run model
 // stays as a test fixture.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
 #include "hw/profiler.h"

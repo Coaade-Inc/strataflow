@@ -3,7 +3,7 @@
 //
 // Phase 1 ships the statistical predictor (per-layer frequency + co-activation
 // counts). Hidden-state look-ahead and trained prerouter heads land later.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
 #include "tws/weight_store.h"

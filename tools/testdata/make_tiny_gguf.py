@@ -8,7 +8,7 @@
 #   python3 make_tiny_gguf.py /path/to/tiny.gguf
 #   STRATAFLOW_TEST_GGUF=/path/to/tiny.gguf ctest -R test_model_load
 #
-# Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 import sys
 
 import numpy as np

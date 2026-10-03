@@ -10,7 +10,7 @@
 //     uv run --with gguf --with numpy python3
 //         tools/testdata/make_tiny_moe_gguf.py /path/tiny_moe.gguf
 //     STRATAFLOW_TEST_MOE_GGUF=/path/tiny_moe.gguf ctest -R test_moe_stream
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "hw/profiler.h"
 #include "model/model.h"
 #include "plan/planner.h"
