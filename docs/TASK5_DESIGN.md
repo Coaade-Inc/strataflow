@@ -13,7 +13,7 @@ This is a design document. It does not implement the task. The build spec in §7
 
 ## 1. The pivotal question, resolved
 
-> Does `.strata` merely reorganize expert bytes on disk (aligned, contiguous per-`(layer,expert)` blobs = better/aligned streaming I/O, but at load time we still reassemble the FULL stacked expert tensor into the ggml buffer, so RAM is bounded per-LAYER as in Task 3) — OR can it enable TRUE per-expert sub-working-set residency (only the top-k active experts' bytes resident per token)?
+> Does `.strata` merely reorganize expert bytes on disk (aligned, contiguous per-`(layer,expert)` blobs = better/aligned streaming I/O, but at load time we still reassemble the FULL stacked expert tensor into the ggml buffer, so RAM is bounded per-LAYER as in Task 3), OR can it enable TRUE per-expert sub-working-set residency (only the top-k active experts' bytes resident per token)?
 
 **Answer, stated honestly:**
 
@@ -22,15 +22,15 @@ This is a design document. It does not implement the task. The build spec in §7
 
 Therefore **Task 5 delivers**:
 
-1. The `.strata` on-disk format: aligned, contiguous per-`(layer,expert)` blobs with gate+up+down bundled, a trunk block, and an index — giving **sequential, 4 KiB-aligned, direct-I/O-friendly reads** and the data layout that makes per-expert streaming *possible*.
-2. **Bounded bytes-streamed-per-token to the top-k active experts** via a per-op residency seam that is *safe to add* (§1.5) — this is the real SSD-bottleneck win and the honest "trillion-params in a tiny I/O budget" claim.
+1. The `.strata` on-disk format: aligned, contiguous per-`(layer,expert)` blobs with gate+up+down bundled, a trunk block, and an index, giving **sequential, 4 KiB-aligned, direct-I/O-friendly reads** and the data layout that makes per-expert streaming *possible*.
+2. **Bounded bytes-streamed-per-token to the top-k active experts** via a per-op residency seam that is *safe to add* (§1.5): this is the real SSD-bottleneck win and the honest "trillion-params in a tiny I/O budget" claim.
 3. The **trunk/cache memory dial** (`--trunk-gb` / `--cache-gb`), ABI-compatible.
 
 **Task 5 defers**: *exact* per-expert **RAM-resident-set** bounding **inside a single decode without any seam**. That is impossible given the in-graph router (§1.4). The two routes to it are (a) a Phase 4 **predictor** (previous-token / hidden-state routing) that makes per-expert residency *approximate* and is only exact when the prediction is right, or (b) the **per-op residency seam** this design specifies (§1.5), which makes per-expert *byte-streaming* exact but still needs the full-footprint virtual region to exist. True per-expert **RAM** bounding (not just I/O bounding) additionally needs a demand-paged virtual region (§1.6) and is marked a Phase 4 follow-up.
 
 The distinction the rest of this section nails down: **bounding RESIDENT RAM** vs **bounding BYTES-STREAMED-PER-TOKEN**. Task 5 delivers the second exactly and the first per-layer (Task 3's model) with a documented path to per-expert.
 
-### 1.1 The kernel reads only routed experts — plain path (source)
+### 1.1 The kernel reads only routed experts: plain path (source)
 
 `ggml/src/ggml-cpu/ggml-cpu.c`, `ggml_compute_forward_mul_mat_id` (the `GGML_OP_MUL_MAT_ID` op):
 
@@ -51,18 +51,18 @@ for (int cur_a = 0; cur_a < n_as; ++cur_a) {          // n_as == n_expert
 
 `matrix_row_counts` is built from the router's `ids` tensor earlier in the same op. An unrouted expert (`cne1 == 0`) is `continue`d **before** `src0->data + cur_a*nb02` is ever formed. The weight bytes of unrouted experts are never dereferenced. (`ggml-cpu.c` ~lines 1664–1730; the offset read is line 1683.)
 
-### 1.2 The kernel reads only routed experts — tiled path (source)
+### 1.2 The kernel reads only routed experts: tiled path (source)
 
 The tiled path is **not** a separate full-tensor scan. It is called **inside** the same `for cur_a` loop, **after** the `cne1 == 0` skip, once per *routed* expert. In `ggml/src/ggml-cpu/tiled/tiled.cpp`:
 
-- `ggml_compute_forward_mul_mat_id_tiled(...)` (entry ~line 1227) returns `false` on `use_ref`, on unsupported `src0/src1` types, or when `ggml_tiled_min_batch(cne1)` says the routed row count is below the tiling threshold — in which case the plain path (§1.1) runs for that expert. It is dispatched **per expert**, never over all `n_as`.
-- `ggml_compute_forward_mul_mat_id_tiled_one_expert<...>` (~line 838) computes `const char * src0_cur = (const char *) src0->data + cur_a * nb02;` — the **same** per-expert offset as the plain path (line 859). It touches only `src0_cur`'s `nb02`-sized slice.
+- `ggml_compute_forward_mul_mat_id_tiled(...)` (entry ~line 1227) returns `false` on `use_ref`, on unsupported `src0/src1` types, or when `ggml_tiled_min_batch(cne1)` says the routed row count is below the tiling threshold, in which case the plain path (§1.1) runs for that expert. It is dispatched **per expert**, never over all `n_as`.
+- `ggml_compute_forward_mul_mat_id_tiled_one_expert<...>` (~line 838) computes `const char * src0_cur = (const char *) src0->data + cur_a * nb02;`, the **same** per-expert offset as the plain path (line 859). It touches only `src0_cur`'s `nb02`-sized slice.
 
 So the tiled path **also** skips unrouted experts and reads the same single routed-expert slice. There is no code path in `MUL_MAT_ID` that scans all `n_expert` weight regions.
 
 ### 1.3 Empirical confirmation (spike, this task)
 
-Source reading is necessary but a page-fault probe is decisive. A throwaway spike (`spike/strata_residency/spike_touch.cpp`, `SPIKE — do not ship`, binary gitignored) owns the expert tensors with a custom ggml buffer type backed by a page-aligned `mmap` region, fills it with the real weights, then before each single-token decode `mprotect(PROT_NONE)`s **every** per-`(layer,expert)` slice and installs a `SIGSEGV` handler that records which slice first faults and re-enables it. Run on the tiny MoE fixture (2 layers × 8 experts, top-2, F32), single-threaded:
+Source reading is necessary but a page-fault probe is decisive. A throwaway spike (`spike/strata_residency/spike_touch.cpp`, `SPIKE - do not ship`, binary gitignored) owns the expert tensors with a custom ggml buffer type backed by a page-aligned `mmap` region, fills it with the real weights, then before each single-token decode `mprotect(PROT_NONE)`s **every** per-`(layer,expert)` slice and installs a `SIGSEGV` handler that records which slice first faults and re-enables it. Run on the tiny MoE fixture (2 layers x 8 experts, top-2, F32), single-threaded:
 
 ```
 expert stacked tensors: 48 slices (per-expert) across all stacked tensors   # 2 layers x 3 kinds x 8 experts
@@ -72,16 +72,16 @@ token=15  distinct expert-slices touched=12 : blk.0.ffn_{gate,down,up}_exps[e2,e
 token=121 distinct expert-slices touched=12 : blk.0.ffn_{gate,down,up}_exps[e3,e7] blk.1.ffn_{gate,down,up}_exps[e4,e5]
 ```
 
-Of 48 per-expert slices, **exactly 12** fault per token = 2 layers × 3 kinds × **top-2** experts. The remaining 36 slices stay `PROT_NONE` for the whole decode and the decode completes correctly, so **nothing else in a single `llama_decode` touches inactive-expert bytes** — not load (prompt decode ran before arming), not graph build, not the KV path, not any prefetch/validation. The decoded tokens (`38 12 15 121 …`) match the §8 baseline sequence in `PHASE3_PLAN.md`, so poisoning the inactive experts did not perturb output.
+Of 48 per-expert slices, **exactly 12** fault per token = 2 layers x 3 kinds x **top-2** experts. The remaining 36 slices stay `PROT_NONE` for the whole decode and the decode completes correctly, so **nothing else in a single `llama_decode` touches inactive-expert bytes**: not load (prompt decode ran before arming), not graph build, not the KV path, not any prefetch/validation. The decoded tokens (`38 12 15 121 ...`) match the §8 baseline sequence in `PHASE3_PLAN.md`, so poisoning the inactive experts did not perturb output.
 
 **Caveat (honest):** the fixture is F32, so at runtime it exercised the **plain** path (§1.1). The tiled path is confirmed for the K-quant types by source reading (§1.2); the design does not depend on it behaving differently, and the test plan (§6) adds a quantized-fixture variant so the tiled path is exercised in CI once Task 5 lands.
 
-### 1.4 The CPU_REPACK load-time question — resolved (does not touch all bytes for us)
+### 1.4 The CPU_REPACK load-time question, resolved (does not touch all bytes for us)
 
 The load log `"… cannot be used with preferred buffer type CPU_REPACK, using CPU instead"` raised the worry that llama repacks/validates expert weights at load (which would touch all expert bytes and defeat lazy residency). It does **not**, for our experts:
 
-- `ggml/src/ggml-cpu/repack.cpp`: `ggml_backend_cpu_repack_buffer_set_tensor` runs `tensor_traits->repack(tensor, data, size)` with `GGML_ASSERT(size == ggml_nbytes(tensor))` — i.e. CPU_REPACK **does** rewrite the *whole* tensor at load. If experts lived on CPU_REPACK, lazy residency would be defeated.
-- But experts **do not** live on CPU_REPACK. In `src/llama-model-loader.cpp` (~1235–1286), when a `tensor_buft_overrides` pattern matches and `overrides->buft != ggml_backend_cpu_buffer_type()`, the loader takes `buft = overrides->buft` **directly** and skips `select_weight_buft` (which is what picks CPU_REPACK). Our `strata_stream_buft` is not the plain CPU buft, so expert tensors are placed on **our** buffer type, whose `set_tensor` does a plain `memcpy` (and, in production, records the file range) — **no repack, no all-bytes touch**. The `n_tensors_moved` log fires precisely *because* experts were moved off the layer-default CPU_REPACK onto our buft; it is the signal that the override won, not a warning that bytes were rewritten.
+- `ggml/src/ggml-cpu/repack.cpp`: `ggml_backend_cpu_repack_buffer_set_tensor` runs `tensor_traits->repack(tensor, data, size)` with `GGML_ASSERT(size == ggml_nbytes(tensor))`, i.e. CPU_REPACK **does** rewrite the *whole* tensor at load. If experts lived on CPU_REPACK, lazy residency would be defeated.
+- But experts **do not** live on CPU_REPACK. In `src/llama-model-loader.cpp` (~1235-1286), when a `tensor_buft_overrides` pattern matches and `overrides->buft != ggml_backend_cpu_buffer_type()`, the loader takes `buft = overrides->buft` **directly** and skips `select_weight_buft` (which is what picks CPU_REPACK). Our `strata_stream_buft` is not the plain CPU buft, so expert tensors are placed on **our** buffer type, whose `set_tensor` does a plain `memcpy` (and, in production, records the file range): **no repack, no all-bytes touch**. The `n_tensors_moved` log fires precisely *because* experts were moved off the layer-default CPU_REPACK onto our buft; it is the signal that the override won, not a warning that bytes were rewritten.
 
 This is why the §8 feasibility spike already decoded byte-identically: the override path keeps expert bytes out of the repacker.
 
@@ -92,11 +92,11 @@ The kernel reads only top-k (§1.1–§1.3), but the router (`ffn_gate_inp`) tha
 Two consequences:
 
 - **For exact correctness with a pre-decode pre-pass only (Task 3's model):** every expert a decode *could* read must be resident. For `MUL_MAT_ID` that is the whole stacked tensor per `(layer, kind)` (so `cur_a*nb02` lands on valid bytes for whichever experts route). Resident RAM is bounded **per layer**, exactly, deterministically. This is what Task 2/3 ship and what Task 5 keeps as the always-correct fallback.
-- **For exact per-expert byte-streaming (the Task 5 I/O win):** add a **per-op residency seam** — a residency callback invoked at `MUL_MAT_ID` dispatch, *after* `matrix_row_counts` is known but *before* `src0_cur` is read, that ensures only the routed experts' `nb02` slices are present. Because the kernel skips `cne1 == 0` experts, the seam only needs to stream the top-k slices from the `.strata` per-expert blobs. This bounds **bytes-streamed-per-token** to top-k exactly, with no prediction and no correctness risk.
+- **For exact per-expert byte-streaming (the Task 5 I/O win):** add a **per-op residency seam**: a residency callback invoked at `MUL_MAT_ID` dispatch, *after* `matrix_row_counts` is known but *before* `src0_cur` is read, that ensures only the routed experts' `nb02` slices are present. Because the kernel skips `cne1 == 0` experts, the seam only needs to stream the top-k slices from the `.strata` per-expert blobs. This bounds **bytes-streamed-per-token** to top-k exactly, with no prediction and no correctness risk.
 
 The seam is the one place this design may carry a **minimal, clearly-marked upstream patch** (per `PHASE3_PLAN.md` §2.4/§5 risk 5): a single callback hook in the `MUL_MAT_ID` branch of `ggml_compute_forward`. It is behind a null-check (no-op when StrataFlow is not driving the buffer), lives at exactly one site, and is additive. **Task 5 specifies the seam but makes it optional** (see §7 scope): the format and dial land first and are correct with the pre-pass alone (per-layer bounding, I/O still improved by `.strata` locality); the seam upgrades I/O-per-token from per-layer to top-k and is gated behind a config flag so a seam-free build stays byte-identical.
 
-### 1.6 RESIDENT-RAM vs BYTES-STREAMED-PER-TOKEN — which exit criteria each satisfies
+### 1.6 RESIDENT-RAM vs BYTES-STREAMED-PER-TOKEN: which exit criteria each satisfies
 
 | Property | What bounds it | Exact? | Exit criterion served | Task 5? |
 |---|---|---|---|---|
@@ -161,7 +161,7 @@ Readers validate `magic`, `version`, `align == kIoAlignment`, and `header_crc32`
 
 ### 2.3 Embedded GGUF metadata
 
-The packer copies the source GGUF's header + KV + tensor-info section verbatim (the `no_alloc` metadata region: everything before the tensor data) into the metadata blob, so `read_shape_from_gguf` (in `src/model/ggml_model.cpp`, which uses `gguf_init_from_file` with `no_alloc=true`) can run **unchanged** against a `.strata` file by pointing it at `gguf_meta_offset`. This preserves arch, `expert_count`, `expert_used_count`, tensor shapes/types, and names — the packer never reinterprets weights.
+The packer copies the source GGUF's header + KV + tensor-info section verbatim (the `no_alloc` metadata region: everything before the tensor data) into the metadata blob, so `read_shape_from_gguf` (in `src/model/ggml_model.cpp`, which uses `gguf_init_from_file` with `no_alloc=true`) can run **unchanged** against a `.strata` file by pointing it at `gguf_meta_offset`. This preserves arch, `expert_count`, `expert_used_count`, tensor shapes/types, and names. The packer never reinterprets weights.
 
 ### 2.4 Expert index
 
@@ -186,7 +186,7 @@ All non-expert tensors (`token_embd`, `output`, per-layer `attn_*`, `ffn_norm`, 
 ### 2.6 What v1 does *not* do
 
 - No per-expert reordering by co-activation (writes natural order; Phase 4 adds a reordered variant using calibration tables, format already supports it via arbitrary `blob_offset`).
-- No sidecars (calibration stats, prerouter/EAGLE heads, recovery LoRA) — reserved via `flags` + a future trailer, out of Task 5 scope.
+- No sidecars (calibration stats, prerouter/EAGLE heads, recovery LoRA): reserved via `flags` + a future trailer, out of Task 5 scope.
 - No requantization (bytes are copied verbatim; byte-identical decode is the test gate, §6).
 
 ---
@@ -220,7 +220,7 @@ The three kinds for one `(layer,expert)` are bundled in one blob (one aligned, c
 
 ### 4.1 ABI additions (append-only)
 
-`include/strataflow/strataflow.h` — append at the **end** of `sf_context_params` (preserving ABI; `vram_budget`/`ram_budget` already exist and stay):
+`include/strataflow/strataflow.h`: append at the **end** of `sf_context_params` (preserving ABI; `vram_budget`/`ram_budget` already exist and stay):
 
 ```c
 typedef struct sf_context_params {
@@ -288,7 +288,7 @@ Build/verify: `cmake --preset debug && cmake --build build/debug && ctest --pres
 
 1. `tools/strata-pack/` packer per §5 (verbatim byte copy; trunk block; 4 KiB-aligned per-`(layer,expert)` gate+up+down bundles; GGUF metadata embedded; index).
 2. `src/tws/strata_file.{h,cpp}` `StrataReader` (superblock + index parse via `BlockFile`; `read_blob`).
-3. Wire `src/tws/stream_buft.cpp` `load_slot` + `src/tws/weight_store` to source expert bytes from `StrataReader` when a `.strata` is loaded, else keep the GGUF-direct/in-memory fallback (Task 2/3) unchanged. **Do not change** the buffer contract (`is_host`, committed region valid at compute time) or the pre-pass residency model — that stays Task 3's exact per-layer model.
+3. Wire `src/tws/stream_buft.cpp` `load_slot` + `src/tws/weight_store` to source expert bytes from `StrataReader` when a `.strata` is loaded, else keep the GGUF-direct/in-memory fallback (Task 2/3) unchanged. **Do not change** the buffer contract (`is_host`, committed region valid at compute time) or the pre-pass residency model: that stays Task 3's exact per-layer model.
 4. `src/model/ggml_model.cpp`: `.strata` magic detection in `read_shape_from_gguf`; parse embedded GGUF; everything downstream unchanged.
 5. ABI: append `trunk_bytes`, `cache_bytes`, `vram_cache_bytes` to `sf_context_params`; default them to `0` in `sf_context_default_params()`; wire the override into the planner (`expert_slots_ram`/trunk cap) only when non-zero.
 6. CLI: `--trunk-gb` / `--cache-gb`, `.strata` auto-detect.
@@ -300,9 +300,9 @@ Build/verify: `cmake --preset debug && cmake --build build/debug && ctest --pres
 
 **Explicitly deferred (do NOT attempt in Task 5):**
 
-- True per-expert **resident-RAM** shrinkage inside one decode (needs §1.5 seam **and** a demand-paged full-footprint virtual region with `madvise(DONTNEED)` eviction — §1.6).
+- True per-expert **resident-RAM** shrinkage inside one decode (needs §1.5 seam **and** a demand-paged full-footprint virtual region with `madvise(DONTNEED)` eviction, §1.6).
 - Co-activation reordering of expert blobs (Phase 4 calibration).
 - Sidecars (calibration/prerouter/EAGLE/LoRA), requantization presets (Phase 6).
-- Native async direct-I/O backends (Task 4) — `.strata` reads go through the existing `BlockFile` whose backend Task 4 upgrades independently.
+- Native async direct-I/O backends (Task 4): `.strata` reads go through the existing `BlockFile` whose backend Task 4 upgrades independently.
 
-**What Task 5 delivers vs defers (one line):** Task 5 delivers the aligned, contiguous, GGUF-compatible `.strata` format with gate+up+down bundling, a byte-identical streaming reader with a GGUF-direct fallback, and an ABI-compatible `--trunk-gb`/`--cache-gb` memory dial — bounding **bytes-streamed-per-token** (per-layer exactly without the seam; top-k exactly with the optional seam) and **resident RAM** (via the dial), both exact and deterministic. It **defers** true per-expert *resident-RAM* bounding inside a single decode, which the in-graph router makes impossible without a per-op seam plus demand-paged address space (Phase 4).
+**What Task 5 delivers vs defers (one line):** Task 5 delivers the aligned, contiguous, GGUF-compatible `.strata` format with gate+up+down bundling, a byte-identical streaming reader with a GGUF-direct fallback, and an ABI-compatible `--trunk-gb`/`--cache-gb` memory dial, bounding **bytes-streamed-per-token** (per-layer exactly without the seam; top-k exactly with the optional seam) and **resident RAM** (via the dial), both exact and deterministic. It **defers** true per-expert *resident-RAM* bounding inside a single decode, which the in-graph router makes impossible without a per-op seam plus demand-paged address space (Phase 4).
