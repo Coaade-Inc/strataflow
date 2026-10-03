@@ -38,8 +38,20 @@ public:
 };
 
 // Factory: inspects `path` and returns the right implementation.
-// Phase 1: always returns the dry-run model (and logs that real weights need
-// the ggml backend). Returns SF_OK with a model, or an error status.
+//   * An existing *.gguf file is loaded by the vendored llama.cpp backend
+//     (GgmlModel). On any load failure it falls back to the dry-run model.
+//   * Anything else (missing file, *.strata, unknown extension) falls back to
+//     the deterministic dry-run model with a logged warning.
+// Never crashes on a bad path: always yields a usable model and SF_OK.
 sf_status load_model(const std::string &path, std::unique_ptr<Model> &out);
+
+// Phase 1b llama.cpp backend. Loads a GGUF file via the llama.cpp C API and
+// implements the Model interface with real tokenize/detokenize and a real
+// greedy single-token forward pass. Defined in model/ggml_model.cpp.
+//
+// Returns SF_OK and sets `out` on success. On any failure (file missing,
+// unreadable GGUF, context allocation failure) it returns an error status and
+// leaves `out` untouched -- load_model() then substitutes the dry-run model.
+sf_status load_ggml_model(const std::string &path, std::unique_ptr<Model> &out);
 
 } // namespace sf
