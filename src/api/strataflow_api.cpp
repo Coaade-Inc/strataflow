@@ -1,6 +1,6 @@
 // C API implementation: wires the modules together behind the stable ABI
 // declared in include/strataflow/strataflow.h.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+// Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "strataflow/strataflow.h"
 
 #include "common/log.h"

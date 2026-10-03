@@ -1,7 +1,7 @@
 // StrataFlow CLI.
 // Phase 1: load a model (dry-run), print the hardware/placement plan, and
 // stream a generation. This is the smoke test for the whole engine wiring.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+// Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "strataflow/strataflow.h"
 
 #include <cstdio>

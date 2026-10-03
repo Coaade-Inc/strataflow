@@ -3,7 +3,7 @@
 // buffer type's end-to-end behaviour (allocation, init_tensor registration,
 // decode) is covered by the integration test in test_moe_stream.cpp, which
 // drives it through a real llama load.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+// Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "test_util.h"
 #include "tws/stream_buft.h"
 

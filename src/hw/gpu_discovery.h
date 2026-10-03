@@ -6,7 +6,7 @@
 // deliberately does NOT pull in the llama/ggml headers, so it calls this thin
 // bridge instead. The dependency direction stays clean: hw/ depends on a plain
 // declaration here; the implementation lives next to the backend.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+// Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
 #include "hw/profiler.h"
