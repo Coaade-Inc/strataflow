@@ -1,5 +1,9 @@
 # Build output
 /build/
+# Throwaway spike binaries (SPIKE -- do not ship; source is kept, binaries are not)
+/spike/**/spike_touch
+/spike/**/spike_stream
+/spike/**/spike_baseline
 /build-*/
 /out/
 *.o
