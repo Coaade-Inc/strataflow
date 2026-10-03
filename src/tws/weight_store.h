@@ -5,7 +5,7 @@
 // and LRU eviction, with an in-memory backing store so it is fully testable.
 // Phase 3 swaps the backing store for the async-IO SSD path and real device
 // buffers.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
 #include <cstdint>

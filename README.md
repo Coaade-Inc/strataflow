@@ -8,7 +8,7 @@ A local inference engine that streams trillion-scale Mixture-of-Experts models
 from disk, caches the hot parts in RAM and VRAM, and uses whatever GPU it finds
 to go faster — on Windows, Linux and macOS.
 
-*A Coaade Inc. project · Apache-2.0*
+*A Coaade Inc. project · Source-available · Free for personal, non-commercial use*
 
 </div>
 
@@ -66,6 +66,22 @@ See [`docs/PLAN.md §6`](docs/PLAN.md). In short: baseline benchmarks → fork +
 minimal engine → auto placement → **tiered weight store (the core)** → predictor
 + prefetch → speculative decoding → low-bit quant & kernels.
 
-## License
+## License & commercial use
 
-Apache-2.0. See [`LICENSE`](LICENSE). This repo contains **no model weights**.
+StrataFlow is **source-available**, under the **Coaade Source-Available License,
+Version 1.0** (see [`LICENSE`](LICENSE)). In short:
+
+- ✅ **Free for personal, non-commercial use** — read it, learn from it, run it,
+  modify it for yourself.
+- ❌ **Not** for commercial use, and **not** for reselling, rebranding,
+  white-labeling, hosting as a service, or building a competing product on it.
+- ❌ This is **not** an OSI open-source license, and it **does not** convert to
+  Apache/MIT over time.
+
+Companies, teams, and organizations — including for internal use — need a
+separate commercial license. **Want to use StrataFlow commercially, or discuss
+terms? Contact [contact@coaade.com](mailto:contact@coaade.com).**
+
+StrataFlow is built on [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
+(MIT), which remains under its own license — see [`NOTICE`](NOTICE). This repo
+contains **no model weights**.

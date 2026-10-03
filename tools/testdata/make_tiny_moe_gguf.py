@@ -14,7 +14,7 @@
 #   python3 make_tiny_moe_gguf.py /path/to/tiny_moe.gguf
 #   STRATAFLOW_TEST_MOE_GGUF=/path/to/tiny_moe.gguf ctest -R test_stream_buft
 #
-# Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 import sys
 
 import numpy as np

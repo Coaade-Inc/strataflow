@@ -13,7 +13,7 @@ See [RESEARCH.md](./RESEARCH.md) for the background and sources.
 - **Platforms:** ship for **Windows, Linux and macOS** from day one. This matches both llama.cpp and the kimi-k3-in-c reference, which already port `O_DIRECT`/`pread`/`posix_memalign` to all three.
 - **Primary target: run Coaade's own models.** StrataFlow is the inference runtime for Coaade Inc.'s models — not tied to any one external checkpoint. The Kimi work (K2 at 1T-A32B, the K3 line at 2.78T-A104B per the [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c) reference) is used only as a **public stand-in** to validate the trillion-scale streaming path until Coaade models are ready. Design must handle any large MoE whose experts live on disk, so the CPU+SSD streaming path is a **v1 must-have**.
   - *Implication:* Coaade controls the model architecture, so StrataFlow can **co-design the model and the runtime** — e.g. ship Coaade models in the streaming-friendly `.strata` layout natively, train prerouter/draft heads into the checkpoint, and pick expert counts/sizes that cache well. This is a real advantage external engines don't have.
-- **Reference to mirror and beat:** [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c) (Apache-2.0). It already runs a 2.78T model on 8.24 GB RAM, CPU-only, byte-identically across machine sizes. Strata's job is to reproduce that trunk/expert streaming result **and** add GPU tiers, routing-prediction prefetch, auto hardware tuning, and speculative decoding on top. License: **Apache-2.0** to stay compatible with both llama.cpp and the reference.
+- **Reference to mirror and beat:** [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c) (Apache-2.0). It already runs a 2.78T model on 8.24 GB RAM, CPU-only, byte-identically across machine sizes. Strata's job is to reproduce that trunk/expert streaming result **and** add GPU tiers, routing-prediction prefetch, auto hardware tuning, and speculative decoding on top. License: StrataFlow's own code ships under the **Coaade Source-Available License** (free for personal, non-commercial use; no reselling/rebranding/competing; no time-based conversion). The vendored llama.cpp/ggml stays under its own MIT license.
 
 ---
 
@@ -299,7 +299,7 @@ Each phase ends with a measurable exit criterion. **Benchmarks come first.**
 Resolved by the owner:
 - **Fork llama.cpp libs** (not a from-scratch engine). ✓
 - **All three OSes** (Windows/Linux/macOS) from v1. ✓
-- **Owner: Coaade Inc.**, license **Apache-2.0**. ✓
+- **Owner: Coaade Inc.**, license **Coaade Source-Available License v1.0** (source-available, free for personal/non-commercial use, no conversion; vendored llama.cpp stays MIT). ✓
 - **Primary validation: an ~800B Kimi MoE** with disk-streamed experts; CPU+SSD streaming is a v1 must-have. ✓
 
 Still open:

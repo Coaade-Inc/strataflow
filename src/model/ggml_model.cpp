@@ -9,7 +9,7 @@
 //
 // Only this translation unit touches llama.cpp; the rest of the engine sees
 // just the sf::Model interface, so the backend stays swappable.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "model/model.h"
 
 #include "common/log.h"

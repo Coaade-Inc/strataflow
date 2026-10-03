@@ -8,7 +8,7 @@
 // "put experts on CPU" into a buft pointer and a NULL-terminated override
 // array) happens in model/ggml_model.cpp, where the llama headers live.
 // See docs/PLAN.md section 3.2 and the user instruction for Phase 2.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
 #include "hw/profiler.h"

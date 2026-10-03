@@ -1,5 +1,5 @@
 // End-to-end test of the public C API against the dry-run model.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "strataflow/strataflow.h"
 #include "test_util.h"
 

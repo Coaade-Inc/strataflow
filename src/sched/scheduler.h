@@ -3,7 +3,7 @@
 //
 // Phase 1 defines the interface and a sequential driver. The pipelined,
 // double-buffered executor and CPU/GPU expert split land in Phase 4.
-// Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Coaade Inc. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
 #include "predict/predictor.h"
