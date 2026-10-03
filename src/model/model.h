@@ -9,9 +9,11 @@
 // Copyright 2026 Coaade Inc. SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "hw/profiler.h"
 #include "plan/planner.h"
 #include "strataflow/strataflow.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,15 +45,30 @@ public:
 //   * Anything else (missing file, *.strata, unknown extension) falls back to
 //     the deterministic dry-run model with a logged warning.
 // Never crashes on a bad path: always yields a usable model and SF_OK.
-sf_status load_model(const std::string &path, std::unique_ptr<Model> &out);
+//
+// `hw` and the budgets (0 = auto) feed the placement planner so the GGUF
+// backend can decide VRAM layer offload / expert placement BEFORE the heavy
+// tensor load. `out_plan`, when non-null, receives the plan the loader applied
+// (for the GGUF path) or an auto plan over the chosen model's shape (dry-run),
+// so the C API can describe exactly what was decided.
+sf_status load_model(const std::string &path, const HardwareProfile &hw,
+                     uint64_t vram_budget, uint64_t ram_budget,
+                     std::unique_ptr<Model> &out, PlacementPlan *out_plan);
 
-// Phase 1b llama.cpp backend. Loads a GGUF file via the llama.cpp C API and
+// Phase 1b/2 llama.cpp backend. Loads a GGUF file via the llama.cpp C API and
 // implements the Model interface with real tokenize/detokenize and a real
 // greedy single-token forward pass. Defined in model/ggml_model.cpp.
+//
+// Phase 2: reads the model's shape cheaply from GGUF metadata, builds a
+// PlacementPlan from `hw` + budgets, and applies it to the llama load params
+// (n_gpu_layers + an expert->CPU tensor override) BEFORE loading the tensors.
+// The applied plan is written to `out_plan` when non-null.
 //
 // Returns SF_OK and sets `out` on success. On any failure (file missing,
 // unreadable GGUF, context allocation failure) it returns an error status and
 // leaves `out` untouched -- load_model() then substitutes the dry-run model.
-sf_status load_ggml_model(const std::string &path, std::unique_ptr<Model> &out);
+sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
+                          uint64_t vram_budget, uint64_t ram_budget,
+                          std::unique_ptr<Model> &out, PlacementPlan *out_plan);
 
 } // namespace sf

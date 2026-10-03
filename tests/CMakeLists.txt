@@ -10,6 +10,7 @@ endfunction()
 
 sf_add_test(test_slot_pool)
 sf_add_test(test_planner)
+sf_add_test(test_llama_placement)
 sf_add_test(test_predictor)
 sf_add_test(test_api)
 sf_add_test(test_model_load)

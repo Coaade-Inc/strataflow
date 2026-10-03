@@ -12,6 +12,7 @@ set(STRATAFLOW_SOURCES
     common/status.cpp
     hw/profiler.cpp
     plan/planner.cpp
+    plan/llama_placement.cpp
     tws/async_io.cpp
     tws/weight_store.cpp
     predict/predictor.cpp

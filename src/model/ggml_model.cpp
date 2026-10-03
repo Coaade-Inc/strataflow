@@ -13,9 +13,16 @@
 #include "model/model.h"
 
 #include "common/log.h"
+#include "hw/gpu_discovery.h"
+#include "plan/llama_placement.h"
+#include "plan/planner.h"
 
+#include <ggml-backend.h>
+#include <gguf.h>
 #include <llama.h>
 
+#include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -241,15 +248,168 @@ ModelShape make_shape(llama_model *model) {
     return s;
 }
 
+// Map a ggml backend registry name to the public sf_backend enum. The reg name
+// is the backend family ("CUDA", "Vulkan", "Metal", "ROCm"/"HIP", "CPU", ...).
+sf_backend backend_from_reg_name(const char *reg_name) {
+    if (reg_name == nullptr) return SF_BACKEND_CPU;
+    std::string n(reg_name);
+    for (char &c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (n.find("cuda") != std::string::npos) return SF_BACKEND_CUDA;
+    if (n.find("vulkan") != std::string::npos) return SF_BACKEND_VULKAN;
+    if (n.find("metal") != std::string::npos) return SF_BACKEND_METAL;
+    if (n.find("hip") != std::string::npos || n.find("rocm") != std::string::npos)
+        return SF_BACKEND_HIP;
+    return SF_BACKEND_CPU;
+}
+
+// Read the few GGUF metadata values the planner needs (layer count, MoE expert
+// counts, total weight bytes) WITHOUT building any tensors. We use the light
+// gguf_* reader with no_alloc=true: it parses the header/kv/tensor-info only,
+// so this is cheap compared to the full llama_model_load_from_file tensor read.
+//
+// Tradeoff: this duplicates a little of make_shape()'s metadata logic, but it
+// lets us compute the placement plan and set llama_model_params BEFORE the
+// heavy load, avoiding a load-twice (which would double I/O for GPU configs).
+// After the real load we still call make_shape(model) for the authoritative
+// shape; the two agree, this pre-pass only drives the load params.
+bool read_shape_from_gguf(const std::string &path, ModelShape &s) {
+    gguf_init_params gp{};
+    gp.no_alloc = true;
+    gp.ctx = nullptr;
+    gguf_context *gc = gguf_init_from_file(path.c_str(), gp);
+    if (gc == nullptr) return false;
+
+    auto get_u32 = [&](const std::string &key, uint32_t fallback) -> uint32_t {
+        int64_t id = gguf_find_key(gc, key.c_str());
+        if (id < 0) return fallback;
+        // GGUF integer metadata is commonly stored as u32; be tolerant of the
+        // signed variant too.
+        return gguf_get_val_u32(gc, id);
+    };
+
+    std::string arch;
+    {
+        int64_t id = gguf_find_key(gc, "general.architecture");
+        if (id >= 0) {
+            const char *a = gguf_get_val_str(gc, id);
+            if (a != nullptr) arch = a;
+        }
+    }
+    {
+        int64_t id = gguf_find_key(gc, "general.name");
+        if (id >= 0) {
+            const char *nm = gguf_get_val_str(gc, id);
+            if (nm != nullptr) s.name = nm;
+        }
+    }
+    if (s.name.empty()) s.name = arch.empty() ? "gguf-model" : arch;
+
+    if (!arch.empty()) {
+        s.n_layers = get_u32(arch + ".block_count", 0);
+        s.n_experts = get_u32(arch + ".expert_count", 0);
+        s.n_experts_used = get_u32(arch + ".expert_used_count", 0);
+    }
+    s.is_moe = s.n_experts > 0;
+
+    // Total weight bytes: sum the on-disk tensor sizes. gguf exposes each
+    // tensor's byte size directly, so no tensor data is read.
+    uint64_t total = 0;
+    const int64_t n_tensors = gguf_get_n_tensors(gc);
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        total += gguf_get_tensor_size(gc, i);
+    }
+    s.total_bytes = total;
+
+    if (s.is_moe && s.n_experts > 0 && s.n_layers > 0) {
+        const uint64_t experts_total = s.total_bytes * 7 / 10;  // ~70% experts
+        s.expert_bytes =
+            experts_total / (static_cast<uint64_t>(s.n_experts) * s.n_layers);
+        s.trunk_bytes = s.total_bytes - experts_total;
+    } else {
+        s.trunk_bytes = s.total_bytes;
+        s.expert_bytes = 0;
+    }
+
+    gguf_free(gc);
+    return true;
+}
+
 } // namespace
 
-sf_status load_ggml_model(const std::string &path,
-                          std::unique_ptr<Model> &out) {
+// GPU discovery bridge (declared in hw/gpu_discovery.h). Enumerates ggml
+// backend devices and records every GPU-type device. CPU/accelerator devices
+// are skipped. No-op on a CPU-only machine; never throws.
+void enumerate_gpus(std::vector<GpuInfo> &out) {
+    ensure_backend();
+    const size_t n = ggml_backend_dev_count();
+    for (size_t i = 0; i < n; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (dev == nullptr) continue;
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;  // only count dedicated GPUs, not CPU/ACCEL/IGPU/META
+        }
+        GpuInfo g;
+        const char *desc = ggml_backend_dev_description(dev);
+        g.name = desc != nullptr ? desc : "gpu";
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+        g.vram_bytes = static_cast<uint64_t>(total_bytes);
+        g.backend = backend_from_reg_name(
+            ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)));
+        out.push_back(std::move(g));
+    }
+}
+
+sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
+                          uint64_t vram_budget, uint64_t ram_budget,
+                          std::unique_ptr<Model> &out, PlacementPlan *out_plan) {
     ensure_backend();
     llama_log_set(sf_llama_log_cb, nullptr);
 
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;  // CPU-only for this phase.
+    mp.n_gpu_layers = 0;  // CPU default; overridden below from the plan.
+
+    // Phase 2: plan placement from a cheap metadata-only pre-pass so the load
+    // params reflect the plan BEFORE the heavy tensor read. If the pre-pass
+    // fails for any reason we fall back to a plain CPU load (identical to the
+    // Phase 1b behaviour), which is always safe.
+    ModelShape pre_shape;
+    LlamaPlacement place;
+    PlacementPlan plan;
+    // The CPU/host buffer type for expert offload; must outlive the load call.
+    std::array<llama_model_tensor_buft_override, 2> overrides{};
+    if (read_shape_from_gguf(path, pre_shape)) {
+        plan = plan_placement(hw, pre_shape, vram_budget, ram_budget);
+        place = derive_llama_placement(plan, pre_shape, hw.gpus);
+
+        mp.n_gpu_layers = place.n_gpu_layers;
+
+        if (place.offload_experts_to_cpu) {
+            // Resolve "experts -> CPU" into a concrete host buffer type. This
+            // is the llama.cpp equivalent of --n-cpu-moe / -ot "exps=CPU":
+            // route the routed-expert FFN tensors to the CPU device's default
+            // buffer type via a NULL-terminated pattern override array.
+            ggml_backend_buffer_type_t cpu_buft = nullptr;
+            ggml_backend_dev_t cpu_dev =
+                ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu_dev != nullptr) {
+                cpu_buft = ggml_backend_dev_buffer_type(cpu_dev);
+            }
+            if (cpu_buft == nullptr) {
+                cpu_buft = ggml_backend_cpu_buffer_type();
+            }
+            overrides[0].pattern = place.expert_override_pattern.c_str();
+            overrides[0].buft = cpu_buft;
+            overrides[1].pattern = nullptr;  // NULL-terminates the array
+            overrides[1].buft = nullptr;
+            mp.tensor_buft_overrides = overrides.data();
+            log_info("GgmlModel: offloading MoE experts to CPU buffer (pattern '" +
+                     place.expert_override_pattern + "')");
+        }
+    } else {
+        log_warn("load_ggml_model: metadata pre-pass failed for '" + path +
+                 "'; loading CPU-only.");
+    }
 
     llama_model *model = llama_model_load_from_file(path.c_str(), mp);
     if (model == nullptr) {
@@ -278,6 +438,13 @@ sf_status load_ggml_model(const std::string &path,
                               std::to_string(shape.n_experts_used))
                            : std::string("dense")) +
              ", " + std::to_string(shape.total_bytes) + " bytes");
+
+    // Report the plan that was applied. Prefer re-planning from the loaded
+    // model's authoritative shape so the summary matches reality exactly; it
+    // agrees with the pre-pass plan used for the load params.
+    if (out_plan != nullptr) {
+        *out_plan = plan_placement(hw, shape, vram_budget, ram_budget);
+    }
 
     out = std::unique_ptr<Model>(new GgmlModel(model, ctx, shape, eos));
     return SF_OK;

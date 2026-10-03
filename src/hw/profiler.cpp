@@ -2,6 +2,7 @@
 #include "hw/profiler.h"
 
 #include "common/log.h"
+#include "hw/gpu_discovery.h"
 
 #include <chrono>
 #include <cstring>
@@ -104,7 +105,10 @@ HardwareProfile profile_hardware(const std::string &model_dir, bool quick) {
         p.ram_gbps = measure_ram_gbps();
     }
 
-    // GPU discovery is delegated to the ggml backends in Phase 1b; none yet.
+    // GPU discovery is delegated to the ggml backends (Phase 2). The thin
+    // bridge in model/ggml_model.cpp enumerates GGML_BACKEND_DEVICE_TYPE_GPU
+    // devices and fills p.gpus; on a CPU-only machine (CI) this finds none.
+    enumerate_gpus(p.gpus);
 
     log_info("hardware profile: " + p.to_summary());
     return p;
