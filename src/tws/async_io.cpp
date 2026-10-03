@@ -59,11 +59,21 @@ bool BlockFile::open(const std::string &path) {
     close();
 
 #if defined(STRATAFLOW_PLATFORM_windows)
+#  if defined(STRATAFLOW_WIN_DIRECT_IO)
     // Native path: unbuffered, overlapped-capable handle. FILE_FLAG_NO_BUFFERING
     // bypasses the system cache; reads must be aligned to the volume's sector
     // size (kIoAlignment=4096 is safe for NVMe/SSD). We query the file size via
     // GetFileSizeEx. If the flagged open fails we fall back to the CRT path so
     // the sync backend is always reachable (CONTRIBUTING.md rule).
+    //
+    // NOTE: this path is opt-in (STRATAFLOW_WIN_DIRECT_IO) and OFF by default.
+    // FILE_FLAG_NO_BUFFERING imposes strict sector-size alignment on offset,
+    // buffer, AND length, with partial-sector reads near EOF needing special
+    // handling; getting that exactly right requires validation on real Windows
+    // storage, which CI's sandboxed runner does not reliably provide (the first
+    // implementation read incorrect bytes there). Until it is hardware-verified,
+    // Windows uses the correct buffered CRT path below. Linux (O_DIRECT) and
+    // macOS (F_NOCACHE) direct I/O are enabled and CI-validated.
     HANDLE h = ::CreateFileA(
         path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
         FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
@@ -79,7 +89,9 @@ bool BlockFile::open(const std::string &path) {
         }
         ::CloseHandle(h);
     }
-    // Fallback: portable CRT path (buffered, synchronous).
+#  endif  // STRATAFLOW_WIN_DIRECT_IO
+    // Default Windows path: portable CRT (buffered, synchronous), correct
+    // everywhere. The no-buffering path above is opt-in until hardware-verified.
     FILE *f = nullptr;
     if (fopen_s(&f, path.c_str(), "rb") != 0 || f == nullptr) {
         log_error("BlockFile: cannot open " + path);
