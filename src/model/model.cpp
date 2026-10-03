@@ -3,8 +3,12 @@
 
 #include "common/log.h"
 
+#include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <sstream>
+#include <string>
+#include <system_error>
 
 namespace sf {
 namespace {
@@ -73,13 +77,42 @@ private:
     int32_t    eos_ = 2;
 };
 
+// Case-insensitive check for a trailing extension (e.g. ".gguf").
+bool ends_with_ci(const std::string &s, const std::string &suffix) {
+    if (s.size() < suffix.size()) return false;
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        const char a = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(s[s.size() - suffix.size() + i])));
+        const char b = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(suffix[i])));
+        if (a != b) return false;
+    }
+    return true;
+}
+
 } // namespace
 
 sf_status load_model(const std::string &path, std::unique_ptr<Model> &out) {
-    // Phase 1b will branch on the file type here and construct a GgmlModel for
-    // .gguf / .strata inputs. For now everything maps to the dry-run model.
-    log_warn("load_model: no ggml backend vendored yet; using dry-run model for '" +
-             path + "'. Real weights require the Phase 1b backend.");
+    // Real weights: an existing *.gguf file goes to the llama.cpp backend. Any
+    // failure there (unreadable file, bad GGUF) degrades to the dry-run model
+    // rather than failing the whole context -- load_model never crashes on a
+    // bad path (docs/PLAN.md "degrade smoothly").
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path, ec) && !ec;
+
+    if (exists && ends_with_ci(path, ".gguf")) {
+        sf_status st = load_ggml_model(path, out);
+        if (st == SF_OK && out) {
+            return SF_OK;
+        }
+        log_warn("load_model: GGUF load failed for '" + path +
+                 "'; falling back to dry-run model.");
+    } else {
+        // Missing file, or a format we don't load yet (.strata is Phase 2+).
+        log_warn("load_model: no real backend for '" + path +
+                 "' (missing file or unsupported format); using dry-run model.");
+    }
+
     out = std::make_unique<DryRunModel>(path);
     return SF_OK;
 }
