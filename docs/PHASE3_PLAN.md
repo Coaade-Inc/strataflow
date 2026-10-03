@@ -628,3 +628,42 @@ Tasks 4, 5, and 6 are independent of each other once Task 3 lands and may be
 built in parallel. The byte-identical guarantee is nailed down by Task 6's
 determinism test and re-checked by Task 5's pack round-trip; both run in CI on
 every matrix job.
+
+---
+
+## 8. Spike result (run before committing to Task 2) — ✅ PASS
+
+The §6 feasibility spike was built and run against the vendored llama.cpp
+(tag b11379) on a tiny Mixtral-style (`llama`-arch) MoE GGUF (2 layers, 8
+experts, top-2). Source lives in `spike/stream_decode/` (throwaway, gitignored
+build artifacts; `SPIKE — do not ship`).
+
+**Setup.** A custom `strata-stream` `ggml_backend_buffer_type` was registered at
+runtime and the Phase 2 expert override (`\.ffn_(up|down|gate|gate_up)_(ch|)exps`)
+was re-pointed at it — exactly the §2.2 design, **with zero edits to ggml or
+llama**. Expert bytes were held in a backing file and faulted into the tensor's
+address by a **residency pre-pass (insertion point A)** before every
+`llama_decode`.
+
+**Result — correctness confirmed:**
+
+| run | token sequence |
+|---|---|
+| plain llama.cpp (baseline) | `38 12 15 121 156 103 38 12` |
+| streamed through `strata-stream` | `38 12 15 121 156 103 38 12` |
+
+**Byte-identical.** `disk_reads=54` (6 expert tensors × 9 decode steps) confirms
+the experts were genuinely re-read on demand each step, not left statically
+resident. **Option (b)+(c) with insertion point (A) is validated; proceed to
+Task 2 with the pre-pass residency policy and no upstream ggml patch.**
+
+**One implementation note surfaced by the spike (feeds Task 2/3):** ggml's
+default (linear) tensor allocator places all tensors of a buffer at offsets
+within one contiguous `get_base()` region, so a naive "one small slot pool
+smaller than the region" fights the allocator at *load* time. The resolution
+for Task 2/3 is to size the buffer's region to the **bounded working set**
+(n_slots × slot_bytes) and have the residency pass map each needed expert into a
+slot within that region (updating `tensor->data` to the slot), rather than
+giving the allocator the full expert footprint. Correctness and the on-demand
+fault mechanism are both proven; bounded-memory is an allocator-integration
+detail for Task 2, not a feasibility risk. The #1 risk is retired.
