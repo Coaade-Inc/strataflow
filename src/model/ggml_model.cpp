@@ -153,6 +153,15 @@ public:
         llama_token tok = last_token;
         llama_batch batch = llama_batch_get_one(&tok, 1);
 
+        // Task 3 residency pass: before llama_decode runs the FULL graph for
+        // all layers in one call, make every stacked expert tensor it will read
+        // resident in its slot (loading bytes from the backing store on a cache
+        // miss, driving the SlotPool LRU). No-op when experts are not streaming.
+        // prefill=false: a single-token decode is the hot decode path, so it
+        // populates the cache normally (the prefill-bypass rule applies to
+        // multi-token micro-batches, PLAN 3.3).
+        stream_buft_ensure_decode_residency(/*prefill=*/false);
+
         const int32_t rc = llama_decode(ctx_, batch);
         if (rc != 0) {
             log_error("GgmlModel::forward: llama_decode failed (rc=" +
@@ -411,6 +420,18 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
         if (stream_experts) {
             ggml_backend_buffer_type_t stream_buft = strata_stream_buft();
             if (stream_buft != nullptr) {
+                // Task 3 memory-budget knob. The bounded SlotPool size is read
+                // from set_stream_buft_slots(); 0 means "auto": hold the whole
+                // expert-tensor working set (always correct — one llama_decode
+                // reads every stacked tensor in a single graph; the LRU/tiering
+                // win is across decodes, see stream_buft.h, Model A). The
+                // planner's expert_slots_* are PER-EXPERT cache counts whereas
+                // the stream buffer keys slots at whole-stacked-tensor
+                // granularity (n_layer * 3), so mapping them directly would
+                // over-allocate; the precise mapping lands with the .strata
+                // index (Task 5). Until then the production path uses the
+                // correct auto default and a test drives a small pool directly
+                // via set_stream_buft_slots().
                 // Reuse the EXISTING Phase 2 regex so the same tensors are
                 // selected; only the destination buft changes.
                 expert_pattern = expert_ffn_regex();

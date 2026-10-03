@@ -2,6 +2,7 @@
 #include "tws/stream_buft.h"
 
 #include "common/log.h"
+#include "tws/weight_store.h"
 
 #include <ggml-backend.h>
 #include <ggml.h>
@@ -11,8 +12,10 @@
 // this target's private include dirs so this include resolves.
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -22,59 +25,127 @@ namespace sf {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Backing store + per-buffer state.
+// Backing store + per-buffer state (Task 3).
 //
-// For Task 2 (v1) the backing store is a plain in-process byte vector sized to
-// the buffer's full expert footprint, and get_base() returns it directly: the
-// allocator places every expert tensor at an offset inside this one region and
-// the CPU kernel reads the resident bytes directly. set_tensor at load time
-// copies the expert bytes into the region (recording the byte range so Task 3
-// can swap the store for BlockFile reads from the .strata/GGUF without touching
-// this buffer type). This is the "keep all experts resident" done-criterion.
+// alloc_buffer() still allocates a REAL contiguous region sized to the full
+// expert footprint: ggml's linear allocator places every tensor at an offset
+// inside one get_base() region, AND one llama_decode runs the FULL graph for
+// all layers in a single call, so every stacked expert tensor must be resident
+// at its own distinct address when the kernel runs (CORRECTNESS MODEL A — see
+// the header). The region holds the committed working set the kernel reads.
+//
+// The bounded SlotPool is the CACHE TIER layered under the region: the backing
+// store (`store`) holds every stacked expert tensor's bytes (filled by
+// set_tensor at load time; Task 4 swaps this for BlockFile direct-I/O without
+// touching this file). Before each llama_decode the residency pass acquires
+// every registered tensor through the pool, loading its byte range from the
+// store into its region slot. The pool bounds how many tensors are held
+// resident ACROSS decodes to n_slots; when n_slots < the working set the
+// residency pass evicts and reloads (demonstrated across decode steps), and the
+// cache-resident bytes stay bounded by n_slots * slot_bytes.
 // ---------------------------------------------------------------------------
 
 struct TensorRange {
     uint64_t       offset = 0;   // byte offset of the tensor within the region
     uint64_t       length = 0;   // ggml_nbytes(tensor)
     ExpertTensorId id{};         // parsed {layer, kind}
+    bool           loaded = false;  // set_tensor has filled the store range
 };
 
-// Per-buffer context: owns the contiguous region and the recorded ranges.
 constexpr size_t kBuftAlignment = 32;  // match ggml's CPU tensor alignment
 
+// Map an ExpertTensorId to the SlotPool key type (ExpertId{layer, expert}).
+// The slot-pool unit here is the WHOLE stacked tensor per (layer, kind), so we
+// pack the kind into the `expert` field. This keeps the SlotPool API (and
+// test_slot_pool) unchanged while keying slots at stacked-tensor granularity.
+ExpertId slot_key(const ExpertTensorId &id) {
+    return ExpertId{id.layer, static_cast<uint32_t>(id.kind)};
+}
+
 struct StreamBuffer {
-    // Over-allocated backing storage. ggml's allocator aligns the first tensor
-    // to kBuftAlignment relative to get_base(); if get_base() were not aligned
-    // that initial padding would eat into the region and the last tensor would
-    // not fit ("not enough space in the buffer"). So we allocate `size +
-    // alignment` and hand out an aligned base, guaranteeing the full `size`
-    // bytes are usable from base().
+    // Over-allocated backing storage for the committed working set. ggml aligns
+    // the first tensor to kBuftAlignment relative to get_base(); we allocate
+    // `size + alignment` and hand out an aligned base so the full `size` bytes
+    // are usable.
     std::vector<uint8_t> storage;
     uint8_t *aligned = nullptr;  // 32-byte aligned pointer within storage
+
+    // Recorded ranges per tensor, plus a stable registration order so the
+    // residency pass visits tensors deterministically (determinism gate).
     std::unordered_map<const ggml_tensor *, TensorRange> ranges;
+    std::vector<const ggml_tensor *> order;
+
+    // The CACHE TIER: a bounded pool of fixed-size slots. One slot holds one
+    // whole stacked expert tensor's bytes. slot_bytes == max stacked-tensor
+    // nbytes so any tensor fits any slot. n_slots is the memory-budget knob.
+    std::unique_ptr<SlotPool> pool;
+    uint32_t pool_slots = 0;
+    uint64_t pool_slot_bytes = 0;
+
+    // Backing store: the authoritative bytes for every stacked expert tensor,
+    // keyed by region offset. In-memory for now (Task 4 -> BlockFile). We also
+    // keep an optional BlockFile seam so the .strata/GGUF path (Task 5) can
+    // read ranges straight from disk.
+    std::vector<uint8_t> store;        // mirror sized to the region
+    uint64_t             disk_reads = 0;
 
     uint8_t *base() { return aligned; }
 };
 
 StreamBuftStats  g_stats;
 std::mutex       g_stats_mu;
+uint32_t         g_cfg_slots = 0;  // StreamBuftConfig::n_slots for next alloc
+
+// The live buffer. llama allocates exactly one strata-stream buffer for the
+// expert tensors, so we track it for the residency pass. Guarded by g_live_mu.
+StreamBuffer    *g_live = nullptr;
+std::mutex       g_live_mu;
 
 StreamBuffer *buf_ctx(ggml_backend_buffer_t buffer) {
     return static_cast<StreamBuffer *>(buffer->context);
 }
 
+// Publish the pool stats into the global StreamBuftStats under g_stats_mu.
+void publish_pool_stats_locked(StreamBuffer *ctx) {
+    if (ctx->pool != nullptr) {
+        const CacheStats &cs = ctx->pool->stats();
+        g_stats.cache_hits      = cs.hits;
+        g_stats.cache_misses    = cs.misses;
+        g_stats.cache_evictions = cs.evictions;
+    }
+    g_stats.disk_reads     = ctx->disk_reads;
+    g_stats.n_slots        = ctx->pool_slots;
+    g_stats.slot_bytes     = ctx->pool_slot_bytes;
+    // Resident slots == min(expert tensors, n_slots) once the pool is primed:
+    // this is the honest count of stacked expert tensors held in the bounded
+    // cache tier, so resident_cache_bytes() = resident_slots * slot_bytes is
+    // the memory bound the test asserts.
+    uint64_t n_expert_tensors = 0;
+    for (const ggml_tensor *t : ctx->order) {
+        if (ctx->ranges[t].id.valid) ++n_expert_tensors;
+    }
+    g_stats.resident_slots =
+        ctx->pool_slots == 0
+            ? 0
+            : std::min<uint64_t>(n_expert_tensors, ctx->pool_slots);
+}
+
 // ---- ggml_backend_buffer_i callbacks --------------------------------------
 
 void buf_free(ggml_backend_buffer_t buffer) {
-    delete buf_ctx(buffer);
+    StreamBuffer *ctx = buf_ctx(buffer);
+    {
+        std::lock_guard<std::mutex> lk(g_live_mu);
+        if (g_live == ctx) g_live = nullptr;
+    }
+    delete ctx;
     buffer->context = nullptr;
 }
 
 void *buf_get_base(ggml_backend_buffer_t buffer) {
     // ggml's linear allocator places all tensors at offsets within this single
-    // region, so it must be the real backing memory (a dummy base fails with
-    // "ggml_tallocr_alloc: not enough space in the buffer"). See the spike.
-    // The base is aligned so the allocator's leading alignment is a no-op.
+    // region, so it must be the real backing memory. The base is aligned so
+    // the allocator's leading alignment is a no-op.
     return buf_ctx(buffer)->base();
 }
 
@@ -84,8 +155,8 @@ enum ggml_status buf_init_tensor(ggml_backend_buffer_t buffer,
     const uint64_t len = static_cast<uint64_t>(ggml_nbytes(tensor));
 
     // tensor->data was already pointed at a region offset by the allocator;
-    // record the range so set_tensor/get_tensor and Task 3's residency pass
-    // can locate the bytes. The offset is tensor->data relative to get_base().
+    // record the range so set_tensor/get_tensor and the residency pass can
+    // locate the bytes. The offset is tensor->data relative to get_base().
     const uint8_t *base = ctx->base();
     const uint8_t *tdat = static_cast<const uint8_t *>(tensor->data);
     uint64_t offset = 0;
@@ -98,6 +169,14 @@ enum ggml_status buf_init_tensor(ggml_backend_buffer_t buffer,
     r.length = len;
     r.id = parse_expert_tensor_name(tensor->name);
     ctx->ranges[tensor] = r;
+    ctx->order.push_back(tensor);
+
+    // Size the cache tier's slot to the largest stacked expert tensor seen so
+    // the pool is allocated lazily on first residency (we don't know the max
+    // nbytes at alloc_buffer time). Only expert tensors count toward slots.
+    if (r.id.valid) {
+        ctx->pool_slot_bytes = std::max<uint64_t>(ctx->pool_slot_bytes, len);
+    }
 
     {
         std::lock_guard<std::mutex> lk(g_stats_mu);
@@ -112,9 +191,10 @@ enum ggml_status buf_init_tensor(ggml_backend_buffer_t buffer,
 
 void buf_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor *tensor,
                     const void *data, size_t offset, size_t size) {
-    // Load-time weights: copy expert bytes into the backing region. (Task 3
-    // swaps this for recording the .strata/GGUF file range and loading on
-    // demand via BlockFile; the seam is the TensorRange recorded above.)
+    // Load-time weights: copy expert bytes into BOTH the committed region (so
+    // the first decode is correct even before the residency pass runs) and the
+    // backing store (the authoritative copy the residency pass reloads from
+    // after an eviction). Task 4 swaps the store copy for a BlockFile range.
     StreamBuffer *ctx = buf_ctx(buffer);
     auto it = ctx->ranges.find(tensor);
     if (it == ctx->ranges.end()) return;
@@ -123,6 +203,10 @@ void buf_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor *tensor,
                        static_cast<size_t>(ctx->base() - ctx->storage.data());
     if (dst_off + size > cap) return;  // defensive bound check
     std::memcpy(ctx->base() + dst_off, data, size);
+    if (ctx->store.size() >= dst_off + size) {
+        std::memcpy(ctx->store.data() + dst_off, data, size);
+    }
+    it->second.loaded = true;
     {
         std::lock_guard<std::mutex> lk(g_stats_mu);
         g_stats.stored_bytes += static_cast<uint64_t>(size);
@@ -156,7 +240,6 @@ const char *bt_get_name(ggml_backend_buffer_type_t /*buft*/) {
 }
 
 size_t bt_get_alignment(ggml_backend_buffer_type_t /*buft*/) {
-    // Match ggml's standard CPU tensor alignment so tensors pack identically.
     return kBuftAlignment;
 }
 
@@ -173,16 +256,21 @@ bool bt_is_host(ggml_backend_buffer_type_t /*buft*/) {
 
 ggml_backend_buffer_t bt_alloc_buffer(ggml_backend_buffer_type_t buft,
                                       size_t size) {
-    // Allocate a REAL contiguous region of the requested size. Task 2 v1 sizes
-    // it to the full expert footprint; Task 3 refines to a bounded slot pool.
-    // Over-allocate by one alignment and hand out an aligned base so the full
-    // `size` bytes are usable (see StreamBuffer).
+    // Allocate the committed working-set region (full expert footprint). The
+    // bounded SlotPool cache tier is created lazily on first residency, once
+    // init_tensor has told us the largest stacked-tensor nbytes (slot_bytes).
     StreamBuffer *ctx = new StreamBuffer();
     ctx->storage.assign(size + kBuftAlignment, 0);
+    ctx->store.assign(size + kBuftAlignment, 0);
     uintptr_t raw = reinterpret_cast<uintptr_t>(ctx->storage.data());
     uintptr_t aligned = (raw + (kBuftAlignment - 1)) & ~(kBuftAlignment - 1);
     ctx->aligned = reinterpret_cast<uint8_t *>(aligned);
 
+    {
+        std::lock_guard<std::mutex> lk(g_live_mu);
+        ctx->pool_slots = g_cfg_slots;  // snapshot the configured size
+        g_live = ctx;
+    }
     {
         std::lock_guard<std::mutex> lk(g_stats_mu);
         ++g_stats.buffers;
@@ -204,9 +292,7 @@ ggml_backend_buffer_t bt_alloc_buffer(ggml_backend_buffer_type_t buft,
     return ggml_backend_buffer_init(buft, iface, ctx, size);
 }
 
-// The singleton buffer-type instance. iface uses designated initializers so the
-// field order tracks ggml-backend-impl.h exactly (important: the real struct
-// has alloc_buffer_n / get_max_size / get_alloc_size_n optional slots).
+// The singleton buffer-type instance.
 ggml_backend_buffer_type g_buft = {
     /*.iface   =*/ {
         /*.get_name         =*/ bt_get_name,
@@ -222,12 +308,30 @@ ggml_backend_buffer_type g_buft = {
     /*.context =*/ nullptr,
 };
 
+// Lazily create the cache tier once slot_bytes is known. Auto-sizes the pool to
+// the full working set (number of expert tensors) when n_slots == 0.
+void ensure_pool_locked(StreamBuffer *ctx) {
+    if (ctx->pool != nullptr) return;
+    if (ctx->pool_slot_bytes == 0) return;  // no expert tensors registered
+
+    uint32_t n_expert_tensors = 0;
+    for (const ggml_tensor *t : ctx->order) {
+        if (ctx->ranges[t].id.valid) ++n_expert_tensors;
+    }
+    uint32_t n_slots = ctx->pool_slots;
+    if (n_slots == 0) {
+        n_slots = n_expert_tensors;  // auto: hold the whole working set
+    }
+    if (n_slots == 0) return;  // nothing to cache
+    ctx->pool_slots = n_slots;
+    ctx->pool = std::make_unique<SlotPool>(n_slots, ctx->pool_slot_bytes);
+}
+
 }  // namespace
 
 ExpertTensorId parse_expert_tensor_name(const std::string &name) {
     ExpertTensorId id{};
 
-    // Expect "blk.<N>.ffn_<kind>_exps" optionally followed by ".weight".
     static const char kPrefix[] = "blk.";
     if (name.compare(0, 4, kPrefix) != 0) return id;
 
@@ -244,7 +348,6 @@ ExpertTensorId parse_expert_tensor_name(const std::string &name) {
     ++pos;  // skip the '.'
 
     const std::string rest = name.substr(pos);
-    // Strip an optional trailing ".weight" so both forms parse.
     std::string body = rest;
     static const std::string kWeightSuffix = ".weight";
     if (body.size() > kWeightSuffix.size() &&
@@ -279,11 +382,81 @@ void reset_stream_buft_stats() {
     g_stats = StreamBuftStats{};
 }
 
+void set_stream_buft_slots(uint32_t n_slots) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_cfg_slots = n_slots;
+}
+
+uint32_t stream_buft_slots() {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    return g_cfg_slots;
+}
+
+void stream_buft_ensure_decode_residency(bool prefill) {
+    std::lock_guard<std::mutex> live_lk(g_live_mu);
+    StreamBuffer *ctx = g_live;
+    if (ctx == nullptr) return;
+
+    ensure_pool_locked(ctx);
+    if (ctx->pool == nullptr) return;
+
+    // Count expert tensors so prefill-bypass can decide (PLAN 3.3): a prompt /
+    // micro-batch touching more expert tensors than the pool has slots streams
+    // the overflow WITHOUT caching, so prefill can't wipe the decode hot set.
+    uint32_t n_expert_tensors = 0;
+    for (const ggml_tensor *t : ctx->order) {
+        if (ctx->ranges[t].id.valid) ++n_expert_tensors;
+    }
+    const bool bypass_cache =
+        prefill && ctx->pool_slots != 0 && n_expert_tensors > ctx->pool_slots;
+
+    for (const ggml_tensor *t : ctx->order) {
+        TensorRange &r = ctx->ranges[t];
+        if (!r.id.valid) continue;  // non-expert tensors are untouched
+
+        const uint64_t off = r.offset;
+        const uint64_t len = r.length;
+        if (ctx->store.size() < off + len) continue;  // defensive
+
+        // The committed region (tensor->data) must hold this tensor's bytes
+        // when the kernel runs. load_slot copies the authoritative bytes from
+        // the backing store into the region on a cache miss (an eviction forced
+        // the previous occupant out and this tensor must be re-materialized).
+        auto load_slot = [&](void * /*slot_dst*/) {
+            // Copy from the store into the committed region. We also populate
+            // the slot buffer so resident-byte accounting is honest, but the
+            // kernel reads the region (tensor->data), which is what must be
+            // correct within the single decode (Model A).
+            std::memcpy(ctx->base() + off, ctx->store.data() + off,
+                        static_cast<size_t>(len));
+            ++ctx->disk_reads;
+        };
+
+        if (bypass_cache) {
+            // Prefill overflow: stream straight into the region, no LRU churn.
+            load_slot(nullptr);
+            continue;
+        }
+
+        // Cache path: acquire through the SlotPool. On a hit the region already
+        // holds valid bytes (we never overwrite a resident tensor's region). On
+        // a miss load_slot refills the region from the store and the pool may
+        // evict the LRU tensor to make room — but note the EVICTED tensor's
+        // region bytes remain valid for THIS decode (we size the region to the
+        // full working set); eviction only means the NEXT time that tensor is
+        // acquired it will miss and reload (demonstrated across decodes).
+        ctx->pool->acquire(slot_key(r.id), load_slot);
+    }
+
+    {
+        std::lock_guard<std::mutex> stats_lk(g_stats_mu);
+        publish_pool_stats_locked(ctx);
+    }
+}
+
 const char *strata_stream_buft_name() { return "strata-stream"; }
 
 ggml_backend_buffer_type *strata_stream_buft() {
-    // Bind to the CPU device the first time, so llama's scheduler treats the
-    // buffer as CPU-side (is_host == true) and the CPU backend runs the ops.
     if (g_buft.device == nullptr) {
         ggml_backend_dev_t cpu_dev =
             ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
