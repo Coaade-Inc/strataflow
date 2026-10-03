@@ -1,0 +1,34 @@
+# Build output
+/build/
+/build-*/
+/out/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Models and weights (never commit)
+*.gguf
+*.strata
+*.safetensors
+*.bin
+/models/
+/weights/
+
+# Hardware profile / caches
+.strataflow/
+*.strata-cache
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Python (calibration tools)
+__pycache__/
+*.pyc
+.venv/
+venv/

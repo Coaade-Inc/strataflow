@@ -1,0 +1,12 @@
+StrataFlow
+Copyright 2026 Coaade Inc.
+
+This product includes software developed at Coaade Inc.
+
+StrataFlow is a fork of llama.cpp (https://github.com/ggml-org/llama.cpp),
+which is distributed under the MIT License. The ggml library and its backends
+are reused under their original terms. Vendored third-party components and the
+modifications made to them are declared alongside the code once the fork is
+imported.
+
+This repository contains no model weights.
