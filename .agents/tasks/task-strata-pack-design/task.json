@@ -1,0 +1,14 @@
+{
+  "task_id": "task-strata-pack-design",
+  "task_description": "Design + feasibility for Phase 3 Task 5: the .strata packed on-disk format and the trunk/cache memory dial. Resolve the pivotal per-expert-residency question with kernel/load-path evidence and a page-fault spike, then hand back an implementation-ready build spec in docs/TASK5_DESIGN.md on branch phase-3/task-5-design (not pushed). This task is design-only; it does NOT implement Task 5.",
+  "status": "completed",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null,
+  "verification": {
+    "build": "n/a-design-task",
+    "tests": "n/a-design-task",
+    "test_quality": "n/a-design-task",
+    "docker_build": "skipped",
+    "summary": "Design + feasibility deliverable. Pivotal question resolved with (a) source evidence from both plain and tiled mul_mat_id paths, (b) the CPU_REPACK override-bypass proof, and (c) an mprotect(PROT_NONE)+SIGSEGV page-fault spike empirically showing exactly top-k (12 of 48) per-expert slices faulted per token on the tiny MoE. Spike built with the documented -fopenmp pattern and ran clean. docs/TASK5_DESIGN.md written and committed on phase-3/task-5-design; not pushed. No production code implemented, per task scope."
+  }
+}

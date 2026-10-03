@@ -135,6 +135,22 @@ struct StreamBuftConfig {
 void     set_stream_buft_slots(uint32_t n_slots);
 uint32_t stream_buft_slots();
 
+// Task 5: configure a .strata byte source for the streaming buffer. When set
+// BEFORE the model is loaded, the residency pass sources each stacked expert
+// tensor's bytes from the .strata expert region (one aligned read per
+// {layer,expert,kind} slice, reassembled into the stacked tensor at its
+// per-expert nb02 offsets) instead of the in-memory store filled by set_tensor.
+// This only changes the PROVENANCE of the bytes (aligned .strata blob vs the
+// scattered GGUF range), not their values, so decode stays byte-identical.
+//
+// The pointer is borrowed; the caller (load_ggml_model) owns the StrataReader
+// and must keep it alive for the model's lifetime. Pass nullptr to clear
+// (restoring the GGUF-direct / in-memory fallback). Forward-declared so this
+// header stays ggml/llama-free.
+class StrataReader;
+void          set_stream_buft_strata_reader(StrataReader *reader);
+StrataReader *stream_buft_strata_reader();
+
 // Residency pass: ensure every registered expert tensor is resident in its
 // region before llama_decode runs the graph. Call this immediately before each
 // llama_decode (and before the prompt decode). Loads each stacked expert

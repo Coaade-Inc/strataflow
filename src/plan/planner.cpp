@@ -23,7 +23,9 @@ uint64_t auto_ram_budget(const HardwareProfile &hw) {
 PlacementPlan plan_placement(const HardwareProfile &hw,
                              const ModelShape &model,
                              uint64_t vram_budget,
-                             uint64_t ram_budget) {
+                             uint64_t ram_budget,
+                             uint64_t trunk_bytes,
+                             uint64_t cache_bytes) {
     PlacementPlan plan;
 
     uint64_t vram = vram_budget;
@@ -34,6 +36,13 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
 
     const uint64_t per_layer_trunk =
         model.n_layers ? model.trunk_bytes / model.n_layers : 0;
+
+    // Task 5 dial: an explicit trunk_bytes cap limits the RAM available to the
+    // resident trunk (the VRAM tier still fills first; this bounds the RAM
+    // spill). 0 = auto (no cap). Applied before the trunk-fill loop below.
+    if (trunk_bytes != 0 && trunk_bytes < ram) {
+        ram = trunk_bytes;
+    }
 
     // Rule 1: always-active trunk goes on the fastest device first (VRAM, then
     // RAM). This is the KTransformers / llama.cpp-offload insight.
@@ -59,6 +68,13 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
             static_cast<uint32_t>(vram_left / model.expert_bytes);
         plan.expert_slots_ram =
             static_cast<uint32_t>(ram / model.expert_bytes);
+
+        // Task 5 dial: an explicit cache_bytes cap OVERRIDES the auto-derived
+        // RAM expert-cache size. 0 = auto (keep the budget-derived value).
+        if (cache_bytes != 0) {
+            plan.expert_slots_ram =
+                static_cast<uint32_t>(cache_bytes / model.expert_bytes);
+        }
 
         const uint64_t total_experts =
             uint64_t(model.n_experts) * model.n_layers;

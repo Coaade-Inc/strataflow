@@ -39,9 +39,18 @@ struct PlacementPlan {
 };
 
 // Build a plan from the hardware profile, model shape, and budgets (0 = auto).
+//
+// Task 5 memory dial: `trunk_bytes` and `cache_bytes` are explicit caps in
+// BYTES (0 = auto, the existing behavior). When non-zero they OVERRIDE the
+// auto-derived split: `cache_bytes` caps the RAM expert cache (expert_slots_ram
+// = cache_bytes / expert_bytes), and `trunk_bytes` caps how many trunk layers
+// the plan keeps resident. Both default to 0 so every existing caller keeps its
+// current behavior and the override is a strict, additive extension.
 PlacementPlan plan_placement(const HardwareProfile &hw,
                              const ModelShape &model,
                              uint64_t vram_budget,
-                             uint64_t ram_budget);
+                             uint64_t ram_budget,
+                             uint64_t trunk_bytes = 0,
+                             uint64_t cache_bytes = 0);
 
 } // namespace sf

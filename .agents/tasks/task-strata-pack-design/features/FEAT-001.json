@@ -1,0 +1,28 @@
+{
+  "id": "FEAT-001",
+  "type": "docs",
+  "description": "Produce docs/TASK5_DESIGN.md: resolve the pivotal per-expert-residency question with evidence from the real kernel/load paths and a throwaway page-fault spike, then specify the .strata on-disk format, the reader integration + GGUF fallback, the ABI/CLI memory dial, the test plan, and an explicit scope line. Design-only; no Task 5 implementation.",
+  "status": "completed",
+  "steps": [
+    "Read docs/PHASE3_PLAN.md (Task 5, Tasks 2/3, section 8 spike), docs/PLAN.md section 3.10, and the strata_stream_buft/weight_store/async_io/ggml_model code.",
+    "Verify the pivotal claim in third_party/llama.cpp: plain mul_mat_id skips cne1==0 experts before reading src0->data+cur_a*nb02 (ggml-cpu.c ~1664-1730); tiled path is called per routed expert after the skip and reads the same per-expert slice (tiled.cpp ~838,1227).",
+    "Confirm CPU_REPACK does not touch all expert bytes for overridden experts: repack set_tensor rewrites the whole tensor (repack.cpp ~5146) but the loader takes buft=overrides->buft directly for non-CPU overrides, skipping select_weight_buft (llama-model-loader.cpp ~1235-1286); the n_tensors_moved log is the override winning.",
+    "Build and run a throwaway mprotect(PROT_NONE)+SIGSEGV page-fault spike (spike/strata_residency/spike_touch.cpp) proving exactly top-k per-expert slices (12 of 48) fault per token on the tiny MoE; gitignore the binary; keep source.",
+    "Create branch phase-3/task-5-design.",
+    "Write docs/TASK5_DESIGN.md: (1) pivotal answer + evidence + RAM-vs-IO distinction; (2) .strata format (superblock, embedded GGUF meta, index, trunk, aligned per-(layer,expert) gate+up+down blobs); (3) reader + GGUF fallback; (4) ABI-compatible sf_context_params trunk/cache fields + CLI; (5) test plan; (6) scope line.",
+    "Commit the doc on the branch; do NOT push."
+  ],
+  "acceptance_criteria": [
+    "docs/TASK5_DESIGN.md exists on branch phase-3/task-5-design and is committed (not pushed).",
+    "The pivotal question is answered with both source citations (plain + tiled paths, CPU_REPACK bypass) and empirical spike output (top-k byte-touch).",
+    "The doc honestly separates bytes-streamed-per-token (delivered) from per-expert resident-RAM inside one decode (deferred), with the per-op-seam reasoning.",
+    "The .strata format, reader+fallback, ABI append-only additions + CLI, and a CI test plan are all specified concretely with real file paths.",
+    "A scope line tells the coder exactly what to implement vs defer."
+  ],
+  "verification": [
+    "git log on phase-3/task-5-design shows the TASK5_DESIGN.md commit and the branch is not pushed.",
+    "The spike compiled with the documented -fopenmp flag and printed 12 touched slices per token across 4 tokens."
+  ],
+  "blocked_reason": null,
+  "findings": "Pivotal question RESOLVED. (1) Both mul_mat_id paths read only routed experts: plain path skips cne1==0 before src0->data+cur_a*nb02 (ggml-cpu.c:1674,1683); tiled path (tiled.cpp:859,1227) is invoked per-routed-expert inside the same loop after the skip and reads the same nb02 slice, returning false to the plain path when unsupported/unprofitable. (2) CPU_REPACK does NOT defeat lazy residency: it rewrites whole tensors at load (repack.cpp:5146 GGML_ASSERT size==nbytes) but experts routed to a non-CPU override buft bypass select_weight_buft entirely (llama-model-loader.cpp:1248 else-branch), so experts never land on CPU_REPACK; the 'cannot be used with preferred buffer type CPU_REPACK' log is just the override winning. (3) EMPIRICAL: page-fault spike mprotect(PROT_NONE)'d all 48 per-expert slices and recorded exactly 12 faults/token (2 layers x 3 kinds x top-2) with correct byte-identical tokens 38/12/15/121; the other 36 slices stayed protected through the whole decode => nothing else in one llama_decode touches inactive expert bytes. Caveat: fixture is F32 => plain path at runtime; tiled path confirmed by source only (test plan adds a K-quant fixture). CONCLUSION: .strata CAN bound bytes-streamed-per-token to top-k (I/O win, needs an optional per-op seam for exactness since the router runs in-graph), but true per-expert resident-RAM inside one decode is deferred to Phase 4 (needs the seam + demand-paged full-footprint virtual region). Task 5 = format + reader + GGUF fallback + ABI/CLI dial, exact per-layer bounding + bounded-RAM dial, byte-identical."
+}

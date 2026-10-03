@@ -41,6 +41,9 @@ sf_context_params sf_context_default_params(void) {
     p.n_ctx             = 0;
     p.auto_plan         = 1;
     p.preferred_backend = SF_BACKEND_CPU;
+    p.trunk_bytes       = 0;  // 0 = derive from budgets/plan (Task 5 dial)
+    p.cache_bytes       = 0;
+    p.vram_cache_bytes  = 0;
     return p;
 }
 
@@ -69,7 +72,8 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
     // offload). An explicit budget of 0 means "auto from the profile".
     sf_status st = sf::load_model(params->model_path, ctx->hw,
                                   params->vram_budget, params->ram_budget,
-                                  ctx->model, &ctx->plan);
+                                  ctx->model, &ctx->plan,
+                                  params->trunk_bytes, params->cache_bytes);
     if (st != SF_OK) return st;
 
     *out_ctx = ctx.release();

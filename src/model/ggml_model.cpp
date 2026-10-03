@@ -16,11 +16,14 @@
 #include "hw/gpu_discovery.h"
 #include "plan/llama_placement.h"
 #include "plan/planner.h"
+#include "tws/strata_file.h"
 #include "tws/stream_buft.h"
 
 #include <ggml-backend.h>
 #include <gguf.h>
 #include <llama.h>
+
+#include <memory>
 
 #include <array>
 #include <cctype>
@@ -76,16 +79,22 @@ void sf_llama_log_cb(ggml_log_level level, const char *text, void * /*user*/) {
 
 class GgmlModel final : public Model {
 public:
-    // Takes ownership of a loaded model + context. Private; use create().
+    // Takes ownership of a loaded model + context (and, for a .strata load, the
+    // StrataReader that is the streaming byte source). Private; use create().
     GgmlModel(llama_model *model, llama_context *ctx, const ModelShape &shape,
-              llama_token eos)
+              llama_token eos, std::unique_ptr<StrataReader> strata)
         : model_(model), ctx_(ctx), vocab_(llama_model_get_vocab(model)),
-          shape_(shape), eos_(eos) {}
+          shape_(shape), eos_(eos), strata_(std::move(strata)) {}
 
     GgmlModel(const GgmlModel &) = delete;
     GgmlModel &operator=(const GgmlModel &) = delete;
 
     ~GgmlModel() override {
+        // Clear the global streaming byte source before the StrataReader we own
+        // is destroyed, so the borrowed pointer in stream_buft never dangles.
+        if (strata_ != nullptr && stream_buft_strata_reader() == strata_.get()) {
+            set_stream_buft_strata_reader(nullptr);
+        }
         if (ctx_ != nullptr) llama_free(ctx_);
         if (model_ != nullptr) llama_model_free(model_);
     }
@@ -197,6 +206,9 @@ private:
     ModelShape           shape_{};
     llama_token          eos_    = 0;
     int32_t              n_past_ = 0;
+    // Owned .strata streaming byte source (null for a plain GGUF load). Kept
+    // alive for the model's lifetime because stream_buft borrows it.
+    std::unique_ptr<StrataReader> strata_;
 };
 
 // Read a GGUF uint32 metadata value by key; returns `fallback` if absent or
@@ -293,13 +305,9 @@ sf_backend backend_from_reg_name(const char *reg_name) {
 // heavy load, avoiding a load-twice (which would double I/O for GPU configs).
 // After the real load we still call make_shape(model) for the authoritative
 // shape; the two agree, this pre-pass only drives the load params.
-bool read_shape_from_gguf(const std::string &path, ModelShape &s) {
-    gguf_init_params gp{};
-    gp.no_alloc = true;
-    gp.ctx = nullptr;
-    gguf_context *gc = gguf_init_from_file(path.c_str(), gp);
-    if (gc == nullptr) return false;
-
+// Fill a ModelShape from an already-parsed gguf_context (shared by the plain
+// GGUF path and the .strata embedded-metadata path). Does not free `gc`.
+bool shape_from_gguf_ctx(gguf_context *gc, ModelShape &s) {
     auto get_u32 = [&](const std::string &key, uint32_t fallback) -> uint32_t {
         int64_t id = gguf_find_key(gc, key.c_str());
         if (id < 0) return fallback;
@@ -351,8 +359,49 @@ bool read_shape_from_gguf(const std::string &path, ModelShape &s) {
         s.expert_bytes = 0;
     }
 
-    gguf_free(gc);
     return true;
+}
+
+// Read the planner's ModelShape from either a plain GGUF file or a .strata
+// file. For a .strata the embedded GGUF metadata blob (verbatim header+KV+
+// tensor-info) is parsed via gguf_init_from_buffer, so the shape derivation is
+// identical to the plain-GGUF path (docs/TASK5_DESIGN.md section 2.3). When
+// `reader_out` is non-null and the file is a .strata, it is opened into
+// *reader_out so the caller can wire the streaming byte source.
+bool read_shape_from_gguf(const std::string &path, ModelShape &s,
+                          std::unique_ptr<StrataReader> *reader_out = nullptr) {
+    if (is_strata_file(path)) {
+        auto reader = std::make_unique<StrataReader>();
+        if (!reader->open(path)) {
+            log_warn("read_shape_from_gguf: failed to open .strata '" + path +
+                     "'");
+            return false;
+        }
+        gguf_init_params gp{};
+        gp.no_alloc = true;
+        gp.ctx = nullptr;
+        gguf_context *gc = gguf_init_from_buffer(
+            reader->metadata(), static_cast<size_t>(reader->metadata_size()),
+            gp);
+        if (gc == nullptr) {
+            log_warn("read_shape_from_gguf: failed to parse embedded GGUF "
+                     "metadata from '" + path + "'");
+            return false;
+        }
+        const bool ok = shape_from_gguf_ctx(gc, s);
+        gguf_free(gc);
+        if (ok && reader_out != nullptr) *reader_out = std::move(reader);
+        return ok;
+    }
+
+    gguf_init_params gp{};
+    gp.no_alloc = true;
+    gp.ctx = nullptr;
+    gguf_context *gc = gguf_init_from_file(path.c_str(), gp);
+    if (gc == nullptr) return false;
+    const bool ok = shape_from_gguf_ctx(gc, s);
+    gguf_free(gc);
+    return ok;
 }
 
 } // namespace
@@ -383,7 +432,8 @@ void enumerate_gpus(std::vector<GpuInfo> &out) {
 
 sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
                           uint64_t vram_budget, uint64_t ram_budget,
-                          std::unique_ptr<Model> &out, PlacementPlan *out_plan) {
+                          std::unique_ptr<Model> &out, PlacementPlan *out_plan,
+                          uint64_t trunk_bytes, uint64_t cache_bytes) {
     ensure_backend();
     llama_log_set(sf_llama_log_cb, nullptr);
 
@@ -403,8 +453,13 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
     // Phase 2 CPU-offload path and the Phase 3 streaming path point an override
     // entry's pattern at its c_str().
     std::string expert_pattern;
-    if (read_shape_from_gguf(path, pre_shape)) {
-        plan = plan_placement(hw, pre_shape, vram_budget, ram_budget);
+    // For a .strata load, read_shape_from_gguf opens the StrataReader (parsing
+    // the embedded GGUF metadata) and hands it back here so we can wire it as
+    // the streaming byte source. Null for a plain GGUF.
+    std::unique_ptr<StrataReader> strata_reader;
+    if (read_shape_from_gguf(path, pre_shape, &strata_reader)) {
+        plan = plan_placement(hw, pre_shape, vram_budget, ram_budget,
+                              trunk_bytes, cache_bytes);
         place = derive_llama_placement(plan, pre_shape, hw.gpus);
 
         mp.n_gpu_layers = place.n_gpu_layers;
@@ -509,10 +564,19 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
     // model's authoritative shape so the summary matches reality exactly; it
     // agrees with the pre-pass plan used for the load params.
     if (out_plan != nullptr) {
-        *out_plan = plan_placement(hw, shape, vram_budget, ram_budget);
+        *out_plan = plan_placement(hw, shape, vram_budget, ram_budget,
+                                   trunk_bytes, cache_bytes);
     }
 
-    out = std::unique_ptr<Model>(new GgmlModel(model, ctx, shape, eos));
+    // For a .strata load, make the reader the live streaming byte source so the
+    // residency pass reads aligned per-expert blobs from it. The GgmlModel owns
+    // the reader and clears the global pointer in its dtor.
+    if (strata_reader != nullptr) {
+        set_stream_buft_strata_reader(strata_reader.get());
+    }
+
+    out = std::unique_ptr<Model>(
+        new GgmlModel(model, ctx, shape, eos, std::move(strata_reader)));
     return SF_OK;
 }
 

@@ -2,6 +2,7 @@
 #include "tws/stream_buft.h"
 
 #include "common/log.h"
+#include "tws/strata_file.h"
 #include "tws/weight_store.h"
 
 #include <ggml-backend.h>
@@ -95,6 +96,11 @@ struct StreamBuffer {
 StreamBuftStats  g_stats;
 std::mutex       g_stats_mu;
 uint32_t         g_cfg_slots = 0;  // StreamBuftConfig::n_slots for next alloc
+
+// Task 5 .strata byte source (borrowed; owned by load_ggml_model). When
+// non-null the residency pass reads expert bytes from the .strata expert region
+// instead of the in-memory store. Guarded by g_live_mu (set before load).
+StrataReader    *g_strata_reader = nullptr;
 
 // The live buffer. llama allocates exactly one strata-stream buffer for the
 // expert tensors, so we track it for the residency pass. Guarded by g_live_mu.
@@ -392,6 +398,16 @@ uint32_t stream_buft_slots() {
     return g_cfg_slots;
 }
 
+void set_stream_buft_strata_reader(StrataReader *reader) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_strata_reader = reader;
+}
+
+StrataReader *stream_buft_strata_reader() {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    return g_strata_reader;
+}
+
 void stream_buft_ensure_decode_residency(bool prefill) {
     std::lock_guard<std::mutex> live_lk(g_live_mu);
     StreamBuffer *ctx = g_live;
@@ -419,14 +435,43 @@ void stream_buft_ensure_decode_residency(bool prefill) {
         if (ctx->store.size() < off + len) continue;  // defensive
 
         // The committed region (tensor->data) must hold this tensor's bytes
-        // when the kernel runs. load_slot copies the authoritative bytes from
-        // the backing store into the region on a cache miss (an eviction forced
-        // the previous occupant out and this tensor must be re-materialized).
+        // when the kernel runs. load_slot copies the authoritative bytes into
+        // the region on a cache miss (an eviction forced the previous occupant
+        // out and this tensor must be re-materialized).
+        //
+        // PROVENANCE (Task 5): when a .strata reader is configured, the bytes
+        // come from the aligned .strata expert region — one read per
+        // {layer,expert,kind} slice, reassembled into the stacked tensor at its
+        // per-expert nb02 offsets (expert e at e*nb02). This is byte-identical
+        // to the GGUF stacked tensor (same bytes, same order), so decode output
+        // is unchanged; only WHERE the bytes are read from differs. Without a
+        // reader we fall back to the in-memory store (Task 2/3), unchanged.
         auto load_slot = [&](void * /*slot_dst*/) {
-            // Copy from the store into the committed region. We also populate
-            // the slot buffer so resident-byte accounting is honest, but the
-            // kernel reads the region (tensor->data), which is what must be
-            // correct within the single decode (Model A).
+            if (g_strata_reader != nullptr && g_strata_reader->is_open() &&
+                r.id.valid) {
+                const uint32_t n_experts =
+                    g_strata_reader->superblock().n_experts;
+                if (n_experts > 0 && len % n_experts == 0) {
+                    const uint64_t nb02 = len / n_experts;
+                    uint8_t *dst = ctx->base() + off;
+                    bool ok = true;
+                    for (uint32_t e = 0; e < n_experts; ++e) {
+                        const int64_t got = g_strata_reader->read_blob(
+                            r.id.layer, e, r.id.kind,
+                            dst + static_cast<uint64_t>(e) * nb02);
+                        if (got != static_cast<int64_t>(nb02)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ++ctx->disk_reads;
+                    if (ok) return;
+                    // On any short/failed read fall through to the store copy
+                    // so the decode still has valid bytes (defensive).
+                }
+            }
+            // Fallback: copy from the in-memory store (filled by set_tensor at
+            // load time) into the committed region.
             std::memcpy(ctx->base() + off, ctx->store.data() + off,
                         static_cast<size_t>(len));
             ++ctx->disk_reads;

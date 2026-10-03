@@ -14,6 +14,7 @@ set(STRATAFLOW_SOURCES
     plan/planner.cpp
     plan/llama_placement.cpp
     tws/async_io.cpp
+    tws/strata_file.cpp
     tws/stream_buft.cpp
     tws/weight_store.cpp
     predict/predictor.cpp

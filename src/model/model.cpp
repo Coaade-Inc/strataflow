@@ -95,21 +95,24 @@ bool ends_with_ci(const std::string &s, const std::string &suffix) {
 
 sf_status load_model(const std::string &path, const HardwareProfile &hw,
                      uint64_t vram_budget, uint64_t ram_budget,
-                     std::unique_ptr<Model> &out, PlacementPlan *out_plan) {
-    // Real weights: an existing *.gguf file goes to the llama.cpp backend. Any
-    // failure there (unreadable file, bad GGUF) degrades to the dry-run model
-    // rather than failing the whole context -- load_model never crashes on a
-    // bad path (docs/PLAN.md "degrade smoothly").
+                     std::unique_ptr<Model> &out, PlacementPlan *out_plan,
+                     uint64_t trunk_bytes, uint64_t cache_bytes) {
+    // Real weights: an existing *.gguf OR *.strata file goes to the llama.cpp
+    // backend (the GGUF path detects the STRATA01 magic and parses the embedded
+    // metadata; see src/model/ggml_model.cpp read_shape_from_gguf). Any failure
+    // there (unreadable file, bad GGUF) degrades to the dry-run model rather
+    // than failing the whole context -- load_model never crashes on a bad path
+    // (docs/PLAN.md "degrade smoothly").
     std::error_code ec;
     const bool exists = std::filesystem::exists(path, ec) && !ec;
 
-    if (exists && ends_with_ci(path, ".gguf")) {
-        sf_status st =
-            load_ggml_model(path, hw, vram_budget, ram_budget, out, out_plan);
+    if (exists && (ends_with_ci(path, ".gguf") || ends_with_ci(path, ".strata"))) {
+        sf_status st = load_ggml_model(path, hw, vram_budget, ram_budget, out,
+                                       out_plan, trunk_bytes, cache_bytes);
         if (st == SF_OK && out) {
             return SF_OK;
         }
-        log_warn("load_model: GGUF load failed for '" + path +
+        log_warn("load_model: model load failed for '" + path +
                  "'; falling back to dry-run model.");
     } else {
         // Missing file, or a format we don't load yet (.strata is Phase 2+).

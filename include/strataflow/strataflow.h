@@ -95,6 +95,15 @@ typedef struct sf_context_params {
     int32_t  auto_plan;
 
     sf_backend preferred_backend; /* ignored if the backend is unavailable */
+
+    /* ---- Task 5 memory dial (appended; ABI-compatible) ----------------
+     * Explicit trunk/cache split in BYTES. 0 = derive from ram_budget /
+     * vram_budget + the plan (back-compatible: old callers that memset the
+     * struct or use sf_context_default_params get 0 => existing behavior).
+     * These are append-only: do not reorder or remove the fields above. */
+    uint64_t trunk_bytes;        /* always-resident trunk cap (RAM tier)      */
+    uint64_t cache_bytes;        /* streamed-expert cache cap (RAM tier)      */
+    uint64_t vram_cache_bytes;   /* hot-expert cache cap (VRAM tier); 0=auto  */
 } sf_context_params;
 
 /* Returns params filled with safe defaults (auto_plan on, CPU backend). */
