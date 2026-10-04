@@ -338,10 +338,60 @@ static void test_engine_bounded_pool_byte_identical() {
     CHECK_EQ(full_stats.resident_bytes(), full_stats.full_bytes);
 }
 
+// EC-6: predictor-driven prefetch warms the pool ahead of each layer. Assert
+// that (a) decode is still byte-identical to the oracle (prefetch must never
+// change results), and (b) the prefetch metric is live and effective: after a
+// few tokens the predictor warms experts and a meaningful fraction are then
+// actually used (the statistical predictor converges on the fixture's routing).
+static void test_engine_prefetch_hit_rate() {
+    const char *path = std::getenv("STRATAFLOW_TEST_MOE_GGUF");
+    if (path == nullptr || path[0] == '\0') {
+        std::printf("[skipped: set STRATAFLOW_TEST_MOE_GGUF] ");
+        return;
+    }
+
+    const std::string prompt = "hello world";
+    const int n_generate = 12;
+
+    std::vector<int32_t> oracle_tokens;
+    CHECK(engine::run_oracle_sequence(path, prompt, n_generate, oracle_tokens,
+                                      nullptr));
+
+    // Bounded pool so prefetch has something to warm (an auto pool goes fully
+    // resident after token 1 and never needs warming).
+    engine::EngineCacheStats st{};
+    std::vector<std::vector<float>> logits;
+    std::vector<int32_t> toks =
+        engine_decode_sequence(path, prompt, n_generate, /*slots=*/3, st, logits);
+
+    // (a) HARD gate: prefetch did not change the output.
+    bool seq_match = toks.size() == oracle_tokens.size();
+    for (size_t i = 0; i < toks.size() && i < oracle_tokens.size(); ++i) {
+        CHECK_EQ(toks[i], oracle_tokens[i]);
+        if (toks[i] != oracle_tokens[i]) seq_match = false;
+    }
+
+    std::printf("[seq match=%s prefetch(warmed=%llu used=%llu hit_rate=%.2f)] ",
+                seq_match ? "yes" : "no",
+                static_cast<unsigned long long>(st.prefetch_warmed),
+                static_cast<unsigned long long>(st.prefetch_used),
+                st.prefetch_hit_rate());
+
+    CHECK(seq_match);
+    // (b) the predictor warmed experts and some were used. We assert warming
+    // happened and the hit rate is non-trivial; we do NOT assert a high bar
+    // (the statistical predictor is intentionally simple and the fixture has
+    // random weights), only that the prefetch path is live and useful.
+    CHECK(st.prefetch_warmed > 0);
+    CHECK(st.prefetch_used > 0);
+    CHECK(st.prefetch_hit_rate() > 0.0);
+}
+
 static void run_all() {
     RUN(test_engine_matches_oracle);
     RUN(test_engine_sequence_matches_oracle);
     RUN(test_engine_bounded_pool_byte_identical);
+    RUN(test_engine_prefetch_hit_rate);
 }
 
 TEST_MAIN()

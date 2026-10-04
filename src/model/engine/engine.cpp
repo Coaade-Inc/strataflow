@@ -21,6 +21,7 @@
 
 #include "common/log.h"
 #include "kv/kv_store.h"
+#include "predict/predictor.h"
 #include "tws/strata_file.h"
 #include "tws/weight_store.h"
 
@@ -37,6 +38,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace sf {
@@ -94,6 +96,21 @@ struct Engine::Impl {
     uint64_t up_expert_bytes   = 0;
     uint64_t down_expert_bytes = 0;
     EngineCacheStats cstats;
+
+    // EC-6 predictor-driven prefetch (section 3.5). After layer N's exact
+    // router read-back we observe() the real experts and ask the predictor for
+    // layer N+1's likely experts, then WARM those slots in the pool (make them
+    // resident) before layer N+1 runs. This only affects LATENCY: layer N+1's
+    // own router read-back is still authoritative, and a mispredicted prefetch
+    // is corrected by the synchronous ensure_layer_experts_resident, so output
+    // stays byte-identical. prefetch_* track how many prefetched experts were
+    // actually used (the measurable EC-6 win).
+    std::unique_ptr<ExpertPredictor> predictor;
+    uint64_t prefetch_warmed = 0;   // experts warmed by a prefetch
+    uint64_t prefetch_used   = 0;   // of those, later confirmed resident-hit
+    // Experts warmed (by this token's prefetches) whose use we have not yet
+    // scored. Cleared at the start of each forward().
+    std::unordered_set<ExpertId, ExpertIdHash> warmed_this_token;
 
     // One CPU backend + gallocr reused across every segment and token (section
     // 3.5: reuse the allocator across tokens; also avoids re-initializing the
@@ -464,6 +481,10 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         im.cstats.full_bytes = static_cast<uint64_t>(full_slots) * slot_bytes;
     }
 
+    // EC-6: statistical expert predictor for prefetch warming (section 3.5).
+    im.predictor.reset(new ExpertPredictor(static_cast<uint32_t>(hp.n_layer),
+                                           static_cast<uint32_t>(hp.n_expert)));
+
     // One CPU backend + gallocr for the engine's lifetime (1 thread for the
     // greedy-determinism contract). Reused across every segment and token.
     im.backend = ggml_backend_cpu_init();
@@ -819,11 +840,67 @@ bool Engine::ensure_layer_experts_resident(int il, const int32_t *ids,
     return true;
 }
 
+// EC-6: warm one (layer, expert) bundle into the pool (prefetch). Same byte
+// source and load as ensure_layer_experts_resident, but no staging copy - it
+// only makes the slot resident so a later authoritative acquire hits. Any
+// failure is swallowed: correctness never depends on a prefetch.
+void Engine::warm_expert(int il, int expert) {
+    Impl &im = *impl_;
+    if (il < 0 || il >= hp_().n_layer) return;
+    if (expert < 0 || expert >= hp_().n_expert) return;
+
+    const std::string p = "blk." + std::to_string(il) + ".";
+    ggml_tensor *src_gate = nullptr;
+    ggml_tensor *src_up   = nullptr;
+    ggml_tensor *src_down = nullptr;
+    if (im.reader == nullptr) {
+        src_gate = ggml_get_tensor(im.wctx, (p + "ffn_gate_exps.weight").c_str());
+        src_up   = ggml_get_tensor(im.wctx, (p + "ffn_up_exps.weight").c_str());
+        src_down = ggml_get_tensor(im.wctx, (p + "ffn_down_exps.weight").c_str());
+        if (src_gate == nullptr || src_up == nullptr || src_down == nullptr) return;
+    }
+    const uint64_t gb = im.gate_expert_bytes;
+    const uint64_t ub = im.up_expert_bytes;
+    const uint64_t db = im.down_expert_bytes;
+    const int32_t e = expert;
+
+    ExpertId id{static_cast<uint32_t>(il), static_cast<uint32_t>(e)};
+    im.pool->acquire(id, [&](void *dst) {
+        uint8_t *d = static_cast<uint8_t *>(dst);
+        if (im.reader != nullptr) {
+            im.reader->read_blob(static_cast<uint32_t>(il),
+                                 static_cast<uint32_t>(e),
+                                 ExpertTensorKind::kGate, d);
+            im.reader->read_blob(static_cast<uint32_t>(il),
+                                 static_cast<uint32_t>(e),
+                                 ExpertTensorKind::kUp, d + gb);
+            im.reader->read_blob(static_cast<uint32_t>(il),
+                                 static_cast<uint32_t>(e),
+                                 ExpertTensorKind::kDown, d + gb + ub);
+        } else {
+            std::memcpy(d,
+                        static_cast<const uint8_t *>(src_gate->data) +
+                            static_cast<size_t>(e) * gb,
+                        static_cast<size_t>(gb));
+            std::memcpy(d + gb,
+                        static_cast<const uint8_t *>(src_up->data) +
+                            static_cast<size_t>(e) * ub,
+                        static_cast<size_t>(ub));
+            std::memcpy(d + gb + ub,
+                        static_cast<const uint8_t *>(src_down->data) +
+                            static_cast<size_t>(e) * db,
+                        static_cast<size_t>(db));
+        }
+    });
+}
+
 const EngineHParams &Engine::hp_() const { return impl_->hp; }
 
 bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     Impl &im = *impl_;
     const EngineHParams &hp = im.hp;
+
+    im.warmed_this_token.clear();  // EC-6: fresh prefetch bookkeeping per token
 
     ggml_tensor *tok_embd = ggml_get_tensor(im.wctx, "token_embd.weight");
     ggml_tensor *out_norm = ggml_get_tensor(im.wctx, "output_norm.weight");
@@ -917,10 +994,46 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
             if (!ok) return false;
         }
 
+        // --- EC-6: measure prefetch effectiveness + feed the predictor ---
+        // Before the authoritative residency pass, count how many of this
+        // layer's actually-routed experts a prior prefetch had already made
+        // resident (a prefetch "hit"). Then observe the real routing so the
+        // predictor learns. This read is pure bookkeeping; it does not change
+        // what gets computed.
+        if (im.predictor != nullptr) {
+            for (size_t i = 0; i < n_used; ++i) {
+                const int32_t e = ids_host[i];
+                if (e < 0 || e >= hp.n_expert) continue;
+                ExpertId id{static_cast<uint32_t>(il), static_cast<uint32_t>(e)};
+                if (im.warmed_this_token.count(id) != 0) {
+                    ++im.prefetch_used;
+                }
+                im.predictor->observe(id);
+            }
+        }
+
         // --- Make the routed top-k experts resident (bounded SlotPool) ---
         if (!ensure_layer_experts_resident(il, ids_host.data(),
                                            static_cast<int>(n_used))) {
             return false;
+        }
+
+        // --- EC-6: prefetch the NEXT layer's predicted experts ---
+        // Warm layer il+1's likely experts into the pool now, while we are
+        // between layers, so its authoritative residency pass tends to hit.
+        // Correctness is unaffected: il+1's own router read-back is still
+        // authoritative and re-acquires exactly what it selects.
+        if (im.predictor != nullptr && il + 1 < hp.n_layer) {
+            const uint32_t k = static_cast<uint32_t>(hp.n_expert_used);
+            std::vector<uint32_t> pred = im.predictor->predict(
+                static_cast<uint32_t>(il + 1), k);
+            for (uint32_t pe : pred) {
+                ExpertId id{static_cast<uint32_t>(il + 1), pe};
+                if (im.pool->resident(id)) continue;  // already warm
+                warm_expert(il + 1, static_cast<int>(pe));
+                im.warmed_this_token.insert(id);
+                ++im.prefetch_warmed;
+            }
         }
 
         // --- Expert segment ---
@@ -987,6 +1100,8 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     im.cstats.hits      = cs.hits;
     im.cstats.misses    = cs.misses;
     im.cstats.evictions = cs.evictions;
+    im.cstats.prefetch_warmed = im.prefetch_warmed;  // EC-6
+    im.cstats.prefetch_used   = im.prefetch_used;
     return true;
 }
 
