@@ -21,6 +21,7 @@ set(STRATAFLOW_SOURCES
     kv/kv_store.cpp
     model/model.cpp
     model/ggml_model.cpp
+    model/engine/engine.cpp
     api/strataflow_api.cpp
 )
 
