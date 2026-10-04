@@ -12,9 +12,46 @@
 #include "predict/predictor.h"
 #include "sched/scheduler.h"
 
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+
+#if defined(_WIN32)
+#  include <windows.h>
+#  include <psapi.h>
+#elif defined(__APPLE__)
+#  include <mach/mach.h>
+#else
+#  include <sys/resource.h>
+#endif
+
+namespace {
+// Best-effort process peak resident set size (peak RAM) in bytes; 0 if the
+// platform cannot report it.
+uint64_t query_peak_rss_bytes() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return static_cast<uint64_t>(pmc.PeakWorkingSetSize);
+    }
+    return 0;
+#elif defined(__APPLE__)
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        return static_cast<uint64_t>(ru.ru_maxrss);  // bytes on macOS
+    }
+    return 0;
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        return static_cast<uint64_t>(ru.ru_maxrss) * 1024ull;  // KiB on Linux
+    }
+    return 0;
+#endif
+}
+} // namespace
 
 // ---- opaque types ---------------------------------------------------------
 struct sf_context {
@@ -41,6 +78,7 @@ sf_context_params sf_context_default_params(void) {
     p.n_ctx             = 0;
     p.auto_plan         = 1;
     p.preferred_backend = SF_BACKEND_CPU;
+    p.expert_slots      = 0;   // auto (hold the whole expert working set)
     return p;
 }
 
@@ -61,6 +99,19 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
 
     auto ctx = std::make_unique<sf_context>();
     ctx->params = *params;
+
+    // Honor an explicit expert-slot budget by routing it to the engine via the
+    // same env the engine already reads (STRATAFLOW_ENGINE_EXPERT_SLOTS). This
+    // keeps load_model's signature stable while making the CLI flag effective.
+    // A caller-set env var still wins if the param is left at auto (0).
+    if (params->expert_slots != 0) {
+        const std::string v = std::to_string(params->expert_slots);
+#if defined(_WIN32)
+        _putenv_s("STRATAFLOW_ENGINE_EXPERT_SLOTS", v.c_str());
+#else
+        setenv("STRATAFLOW_ENGINE_EXPERT_SLOTS", v.c_str(), /*overwrite=*/1);
+#endif
+    }
 
     ctx->hw = sf::profile_hardware(params->model_path, /*quick=*/false);
 
@@ -124,6 +175,16 @@ sf_status sf_generate(sf_session *session, const char *prompt,
         std::string piece = model.detokenize(token);
         if (cb(piece.c_str(), user_data) != 0) break;  // caller asked to stop
     }
+    return SF_OK;
+}
+
+sf_status sf_session_stats(sf_session *session, sf_runtime_stats *out) {
+    if (session == nullptr || out == nullptr) return SF_ERR_INVALID_ARGUMENT;
+    out->resident_weight_bytes =
+        session->ctx != nullptr && session->ctx->model != nullptr
+            ? session->ctx->model->resident_weight_bytes()
+            : 0;
+    out->peak_rss_bytes = query_peak_rss_bytes();
     return SF_OK;
 }
 
