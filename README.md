@@ -7,9 +7,9 @@
 A local inference engine that streams trillion-scale Mixture-of-Experts models
 from disk - quantized or full-precision - caches the hot parts in RAM and VRAM,
 and uses whatever GPU it finds to go faster, on Windows, Linux and macOS.
-(Quantized weights now run and are validated against the reference on a Q8_0
-MoE; running an actual downloaded pretrained model is the next proof point -
-see [`docs/ROADMAP.md`](docs/ROADMAP.md).)
+(Quantized weights now run and are validated against the reference on Q8_0 and
+the K-quant families Q4_K/Q6_K; running an actual downloaded pretrained model is
+the next proof point - see [`docs/ROADMAP.md`](docs/ROADMAP.md).)
 
 *A Coaade Inc. project. Source-available. Free for personal, non-commercial use.*
 

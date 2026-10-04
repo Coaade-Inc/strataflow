@@ -11,6 +11,14 @@ grouped by the pull request that merged them.
 
 ### Engine core (StrataFlow runs its own forward pass over ggml)
 
+- K-quant families (Q4_K/Q6_K) validated against the libllama oracle through the
+  engine and the `.strata` streaming path. The engine greedy token sequence is
+  byte-identical to the oracle for both Q4_K and Q6_K, and K-quant experts stream
+  through `.strata` with bounded `--expert-slots`. Added a C++ ggml-based
+  test-fixture generator (`make_kquant_moe_gguf`, built on `ggml_quantize_chunk`
+  because the Python `gguf` library cannot emit K-quants) and a guarded
+  `test_engine_kquant_matches_oracle` sub-test
+  (`STRATAFLOW_TEST_KQUANT_MOE_GGUF` / `STRATAFLOW_TEST_Q6K_MOE_GGUF`).
 - Hold only the trunk resident on the `.strata` path; the full expert footprint
   is never allocated in RAM. Proven by test (trunk resident vs experts not
   resident). This is the core bounded-RAM, no-GPU capability. (#21)
