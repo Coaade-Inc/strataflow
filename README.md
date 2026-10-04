@@ -106,14 +106,22 @@ and Windows (MSVC):
 - **Two architectures**: the llama-arch MoE and dense llama, each gated on
   reproducing the oracle.
 
-In progress / next:
+In progress / next (see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full,
+honest list of what is done and what is open):
 
-- GPU and multi-backend execution (CPU plus a GPU buffer type via
-  `ggml_backend_sched`); the engine already runs on a swappable ggml backend.
-- More architectures (shared-expert and grouped-gating MoE families), each a new
-  oracle-gated graph builder.
-- Asynchronous prefetch overlap (background I/O loading while compute runs) and
-  per-layer graph-build reuse across tokens.
+- **Run a real, large MoE end to end** - everything so far is verified on a
+  2-layer toy fixture; the mission is not *proven* until an actual multi-GB MoE
+  runs end to end in a bounded RAM budget on a real machine.
+- **Memory-budget CLI + peak-RSS reporting** - so a user can say "run this model
+  in 8 GB" and see the result.
+- **Benchmark harness** with real tok/s and RAM numbers against the exit criteria.
+- GPU / multi-backend execution (optional accelerator; needs GPU hardware to
+  validate), more architectures, and async prefetch overlap.
+
+> **Honest status:** the engine works and the bounded-RAM mechanism is
+> unit-proven, but it has not yet been run on a real large model, and there is
+> no user-facing memory-budget CLI or benchmark yet. See
+> [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`CHANGELOG.md`](CHANGELOG.md).
 
 See [`docs/ENGINE_CORE_DESIGN.md`](docs/ENGINE_CORE_DESIGN.md) for the engine
 design and the EC-1..EC-7 breakdown, and [`docs/PLAN.md`](docs/PLAN.md) for the
