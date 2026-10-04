@@ -180,11 +180,17 @@ sf_status sf_generate(sf_session *session, const char *prompt,
 
 sf_status sf_session_stats(sf_session *session, sf_runtime_stats *out) {
     if (session == nullptr || out == nullptr) return SF_ERR_INVALID_ARGUMENT;
+    const bool have_model =
+        session->ctx != nullptr && session->ctx->model != nullptr;
     out->resident_weight_bytes =
-        session->ctx != nullptr && session->ctx->model != nullptr
-            ? session->ctx->model->resident_weight_bytes()
-            : 0;
+        have_model ? session->ctx->model->resident_weight_bytes() : 0;
     out->peak_rss_bytes = query_peak_rss_bytes();
+    // Expert bytes streamed from disk (ground truth from the engine); 0 on the
+    // plain-GGUF/dry-run paths. TTFT is measured by the CLI around sf_generate
+    // (the engine/ABI do not time it), so zero-init it here; keeping the field
+    // in the struct documents it for any future programmatic caller.
+    out->streamed_bytes = have_model ? session->ctx->model->streamed_bytes() : 0;
+    out->ttft_us = 0;
     return SF_OK;
 }
 

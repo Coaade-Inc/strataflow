@@ -193,6 +193,68 @@ cell on a large-enough runtime. Nothing in the sandbox or CI executes this cell
 (both are offline), so the real-downloaded-MoE result is Colab-demonstrated
 here, not proven by an in-sandbox/CI run.
 
+### Cell 9 - benchmark harness (real numbers, free-tier sized)
+
+```bash
+%%bash
+cd /content/strataflow
+# Runs a MATRIX of generated-F32 MoE configs (two model sizes x three
+# --expert-slots settings), measures real numbers per run, prints a results
+# table, and writes strataflow_bench.json + strataflow_bench.csv under the
+# workdir for download. CPU-only, offline, free-tier sized, finishes in a few
+# minutes. Grow it with --layers-list / --experts-list / --slots-list /
+# --max-tokens.
+python3 colab/strataflow_bench.py --workdir /content
+```
+
+The table has one row per `(model size x expert-slots)` config, with columns:
+
+- `on-disk MiB` - size of the packed `.strata` file.
+- `slots` - `--expert-slots` for the run (`auto` = 0, fully resident).
+- `gen tok/s` - END-TO-END generate throughput (`max-tokens / full sf_generate
+  wall-clock`). This INCLUDES prompt processing and the first-token latency, so
+  it is not steady-state decode.
+- `decode tok/s` - STEADY-STATE decode throughput with the first token and its
+  TTFT removed (`(max-tokens - 1) / (wall-clock - TTFT)`). This is the figure
+  the harness targets; it is only reported when the CLI gives TTFT and
+  `max-tokens > 1`.
+- `TTFT ms` - time-to-first-token.
+- `resident MiB` / `peak RSS MiB` - RAM held by the run.
+- `streamed MiB` / `bytes/tok` - SSD bytes streamed through `StrataReader`.
+  `bytes/tok` is exact: it comes from the raw `streamed_bytes` uint64 the CLI
+  reports, not the 1-decimal `streamed MiB` display value.
+
+Each row is a SINGLE run (no warmup or repeat), so `gen tok/s`, `decode tok/s`
+and `TTFT ms` are single noisy samples; treat them as indicative, not
+statistically tight.
+
+What the generated numbers prove and do not prove: the **bounded-RAM**
+property is real - with `--expert-slots` set below the expert count, peak RSS
+and resident weights stay far below the on-disk size and move with the slot
+count (the Phase 3 "big model, small RAM" exit criterion). The absolute
+**decode tok/s** is only a MECHANISM proxy: the generated model has random
+weights and tiny dimensions, so its throughput is NOT comparable to the PLAN.md
+section 2 ladder, which is for large real models on NVMe. The harness says so
+and does not fabricate a comparison. For real throughput, run Cell 10 (or a
+Mixtral quant on a larger runtime). The JSON/CSV artifacts are written for
+download so you can keep the measured numbers.
+
+### Cell 10 (optional) - include the real downloaded TinyLlama row
+
+```bash
+%%bash
+cd /content/strataflow
+# Appends ONE real downloaded TinyLlama (dense llama Q4_K_M) row to the matrix.
+# This row needs network + disk (Colab), and is cleanly SKIPPED (not a crash)
+# when offline; the generated rows still produce a full table either way.
+python3 colab/strataflow_bench.py --workdir /content --real-model
+```
+
+The real-model row reuses the same download + disk guard + pack + bounded-run
+logic as Cell 7, so its tok/s and TTFT are measured on real weights with the
+real tokenizer. In the offline sandbox and in CI the row is skipped with a
+clear message; only Cell 10 on a networked Colab produces that row.
+
 ## What this does and does not prove
 
 - **Proves:** StrataFlow builds and runs on a real CPU-only Linux box, decodes
@@ -210,5 +272,16 @@ here, not proven by an in-sandbox/CI run.
   bounded-RAM mechanism. Running a real llama-arch **MoE** (Mixtral) needs a
   larger runtime (Cell 8). Qwen2-MoE / DeepSeek-MoE are different architectures
   and are not yet implemented. See [`../docs/ROADMAP.md`](../docs/ROADMAP.md).
-- **Not yet:** published tok/s benchmarks against the exit criteria, and the
+- **Benchmark harness (Cells 9-10).** A benchmark harness now exists
+  (`colab/strataflow_bench.py`) and emits measured numbers - tok/s, TTFT, peak
+  RSS, resident weights, on-disk size, SSD streamed MiB and bytes/token - as a
+  table plus JSON/CSV across a config matrix. The generated-F32 path (offline,
+  sandbox/CI-verified) proves the MECHANISM and the bounded-RAM property; the
+  absolute tok/s ladder in PLAN.md section 2 is for large real models on NVMe,
+  so the generated toy's throughput is a proxy only. Measure real throughput
+  with the optional real-model row (Cell 10) or a Mixtral quant on a larger
+  runtime.
+- **Not yet:** published tok/s benchmarks against the section 2 ladder on large
+  real models (the harness measures them; the large-model numbers themselves
+  are Colab/HW-demonstrated, not proven in the offline sandbox/CI), and the
   non-llama MoE architectures above.

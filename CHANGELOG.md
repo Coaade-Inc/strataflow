@@ -9,6 +9,37 @@ grouped by the pull request that merged them.
 
 ## Unreleased
 
+### Benchmarking and instrumentation
+
+- Benchmark harness `colab/strataflow_bench.py`: runs a config MATRIX (model
+  size x `--expert-slots`) over the generated-F32 MoE, measures per run both
+  end-to-end generate throughput (`gen tok/s` = max-tokens / full wall-clock)
+  and steady-state decode throughput (`decode tok/s` = (max-tokens-1) /
+  (wall-clock - TTFT), first token removed), plus TTFT, resident model weights,
+  peak RSS, on-disk `.strata` size, SSD streamed MiB and an EXACT bytes/token
+  (from the raw `streamed_bytes` uint64, not the rounded MiB display value),
+  prints a fixed-width results table with an honest exit-criteria report, and
+  writes
+  machine-readable JSON + CSV artifacts (schema-versioned). The default matrix
+  is CPU-only, offline, and free-Colab-tier sized (finishes in a few minutes);
+  `--layers-list` / `--experts-list` / `--slots-list` / `--max-tokens` grow it.
+  An optional `--real-model` row downloads one real TinyLlama (dense llama)
+  through the same path and is cleanly SKIPPED (not a crash) when offline. Wired
+  into Colab as Cells 9-10 in `colab/README.md`. The generated-F32 path proves
+  the MECHANISM and the Phase 3 "big model, small RAM" bounded-RAM property;
+  the absolute tok/s ladder in `PLAN.md` section 2 is for large real models on
+  NVMe and the generated toy is a mechanism proxy only (stated, not fabricated).
+- Two newly-instrumented metrics surfaced on the CLI `stats:` line and in
+  `sf_runtime_stats`: TTFT (time-to-first-token, timed in the CLI around the
+  first `on_token` callback) and SSD streamed bytes/token (counted at the
+  `StrataReader` disk-read seam). The new `sf_runtime_stats` fields are APPENDED
+  at the end of the struct for ABI backward-compatibility, and the existing
+  `resident model weights = X MiB, peak RSS = Y MiB` wording is unchanged so the
+  Python parser keeps working. The CLI additionally prints the exact
+  `streamed_bytes = N` uint64 alongside the human-readable `streamed = W MiB`
+  so the harness computes an exact (not display-rounded) bytes/token. The oracle
+  correctness gate is preserved (the timing/counting seams add no engine math).
+
 ### Engine core (StrataFlow runs its own forward pass over ggml)
 
 - K-quant families (Q4_K/Q6_K) validated against the libllama oracle through the

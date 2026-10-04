@@ -119,6 +119,13 @@ public:
     // staging tensors, or the SlotPool (those are separately bounded).
     uint64_t resident_weight_bytes() const;
 
+    // Total EXPERT bytes streamed from the .strata/disk via StrataReader since
+    // load() (per-token expert streaming). On the plain-GGUF path there is no
+    // StrataReader (experts are resident), so this reports 0. Mirrors the
+    // resident_weight_bytes() accessor; does not include the one-time trunk
+    // load. Lets the benchmark harness report bytes-streamed-per-token.
+    uint64_t streamed_bytes() const;
+
     // Top-k residency cache stats accumulated across all forward() calls since
     // load() (EC-3). Lets the oracle test assert hits/misses/evictions and the
     // bounded resident-byte footprint.
