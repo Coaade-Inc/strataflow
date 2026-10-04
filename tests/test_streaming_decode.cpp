@@ -1,40 +1,52 @@
-// Integration test (CI-proxy, CPU-only): Task 3 bounded residency.
+// Integration test (CI-proxy, CPU-only): EC-5 streaming determinism on the
+// DEFAULT inference path.
 //
-// Loads the tiny Mixtral-style MoE GGUF twice with STRATAFLOW_FORCE_STREAM_
-// EXPERTS=1 — once with a full-size slot pool and once with a deliberately
-// SMALL pool (fewer slots than the n_layer*3 stacked expert tensors) — and
-// asserts the hard Phase 3 guarantees:
-//   (a) forward() returns valid in-vocabulary tokens;
-//   (b) the greedy token sequence is BYTE-IDENTICAL between the full and the
-//       small pool (the determinism gate — streaming must never change output);
-//   (c) with the small pool the SlotPool shows hits AND misses AND non-zero
-//       evictions, and a tensor evicted on one decode is reloaded on the next
-//       (eviction+reload across decodes — bounded cross-decode residency);
-//   (d) resident cache bytes stay bounded by n_slots * slot_bytes across many
-//       decode steps.
+// Historical note: this test was written in Phase 3 to assert the llama_decode
+// -era streaming-buffer (strata_stream_buft) cache stats via an end-to-end
+// decode under STRATAFLOW_FORCE_STREAM_EXPERTS. EC-5 made OUR engine the
+// default and ONLY inference path (docs/ENGINE_CORE_DESIGN.md section 8 EC-5):
+// llama_decode no longer runs the model, so stream_buft is no longer on the
+// inference path and its decode-time residency pass no longer runs during
+// forward(). This test is therefore RETARGETED (resolution option (a)) to the
+// engine's EC-3 top-k expert residency -- the modern equivalent of the Phase 3
+// streaming cache -- driven through the public sf::Model seam, which is what
+// the CLI/server actually use.
 //
-// CORRECTNESS MODEL A (see src/tws/stream_buft.h): one llama_decode runs the
-// FULL graph for all layers, and the MoE kernel reads each stacked expert
-// tensor directly from its tensor->data base (ggml-cpu.c mul_mat_id:
-// src0->data + cur_a*nb02), with no per-op residency hook. So every stacked
-// tensor must be resident at its own address within a decode; the pool bounds
-// how many are held across decodes and drives LRU eviction/reload. A
-// smaller-than-working-set pool is therefore demonstrated via cross-decode
-// eviction, exactly the fallback the task allows.
+// It asserts the hard streaming guarantees on the real inference path:
+//   (a) forward() returns valid in-vocabulary tokens (both pools);
+//   (b) the greedy token sequence is BYTE-IDENTICAL between an auto (full
+//       working set) pool and a deliberately SMALL pool (fewer slots than the
+//       fixture's experts/layer) -- the determinism gate: bounded streaming
+//       must never change the output;
+//   (c) with the small pool the engine's bounded SlotPool shows hits AND misses
+//       AND non-zero evictions (experts streamed/evicted/reloaded across
+//       layers/tokens), proving the cache was actually exercised; and
+//   (d) resident expert bytes stay bounded by n_slots * slot_bytes and strictly
+//       below the full-resident footprint across a multi-step decode.
+//
+// The pool size is driven by STRATAFLOW_ENGINE_EXPERT_SLOTS (the EC-3 knob that
+// GgmlModel::forward_engine reads), so (a)/(b) exercise the exact default
+// inference path a user hits. For (c)/(d) we read the engine's EngineCacheStats
+// via the engine API on an equivalently-configured engine (the stats are not
+// surfaced through sf::Model, by design -- the seam is backend-agnostic). The
+// byte-identity + eviction guarantee is ALSO covered directly against the
+// oracle in test_engine_oracle (EC-3 bounded-pool case); this test adds the
+// end-to-end proof through the production sf::Model seam.
 //
 // Guarded on STRATAFLOW_TEST_MOE_GGUF (skip cleanly if unset), same pattern as
-// test_moe_stream. Generate + run:
+// test_moe_stream / test_engine_oracle. Generate + run:
 //     uv run --with gguf --with numpy python3
 //         tools/testdata/make_tiny_moe_gguf.py /path/tiny_moe.gguf
 //     STRATAFLOW_TEST_MOE_GGUF=/path/tiny_moe.gguf ctest -R test_streaming_decode
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "hw/profiler.h"
+#include "model/engine/engine.h"
 #include "model/model.h"
 #include "plan/planner.h"
 #include "test_util.h"
-#include "tws/stream_buft.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -49,45 +61,97 @@ static HardwareProfile cpu_profile() {
     return hw;
 }
 
-static void set_force_stream(bool on) {
+// Portable set/unset for the EC-3 pool-size knob the engine reads.
+static void set_expert_slots(uint32_t n_slots) {
 #if defined(_WIN32)
-    _putenv_s("STRATAFLOW_FORCE_STREAM_EXPERTS", on ? "1" : "");
+    if (n_slots == 0) {
+        _putenv_s("STRATAFLOW_ENGINE_EXPERT_SLOTS", "");
+    } else {
+        _putenv_s("STRATAFLOW_ENGINE_EXPERT_SLOTS",
+                  std::to_string(n_slots).c_str());
+    }
 #else
-    if (on) setenv("STRATAFLOW_FORCE_STREAM_EXPERTS", "1", 1);
-    else    unsetenv("STRATAFLOW_FORCE_STREAM_EXPERTS");
+    if (n_slots == 0) {
+        unsetenv("STRATAFLOW_ENGINE_EXPERT_SLOTS");
+    } else {
+        setenv("STRATAFLOW_ENGINE_EXPERT_SLOTS",
+               std::to_string(n_slots).c_str(), 1);
+    }
 #endif
 }
 
-// Decode `n_steps` greedy tokens from a fresh model loaded with the given slot
-// pool size. Records the max resident cache bytes observed across the run.
+// Decode `n_steps` greedy tokens through the DEFAULT sf::Model inference path
+// (the engine, EC-5) from a fresh model, with the engine's expert-residency
+// pool sized by STRATAFLOW_ENGINE_EXPERT_SLOTS. Returns the token sequence.
 static std::vector<int32_t> decode_sequence(const char *path, uint32_t n_slots,
-                                            int n_steps,
-                                            uint64_t *max_resident_bytes_out) {
-    reset_stream_buft_stats();
-    set_stream_buft_slots(n_slots);  // 0 == auto (full working set)
+                                            int n_steps) {
+    set_expert_slots(n_slots);  // 0 == auto (full working set)
 
     std::unique_ptr<Model> m;
     PlacementPlan plan;
     std::vector<int32_t> out;
-    if (load_model(path, cpu_profile(), 0, 0, m, &plan) != SF_OK || m == nullptr) {
+    if (load_model(path, cpu_profile(), 0, 0, m, &plan) != SF_OK ||
+        m == nullptr) {
+        set_expert_slots(0);
         return out;
     }
 
     auto ids = m->tokenize("hello world");
     int32_t tok = ids.empty() ? 1 : ids.back();
-    uint64_t max_resident = 0;
     for (int i = 0; i < n_steps; ++i) {
         tok = m->forward(tok);
         out.push_back(tok);
-        const StreamBuftStats &s = stream_buft_stats();
-        const uint64_t resident = s.resident_cache_bytes();
-        if (resident > max_resident) max_resident = resident;
     }
-    if (max_resident_bytes_out != nullptr) *max_resident_bytes_out = max_resident;
 
-    // Reset the knob for subsequent loads/tests.
-    set_stream_buft_slots(0);
+    set_expert_slots(0);  // reset the knob for subsequent loads/tests
     return out;
+}
+
+// Drive the engine directly (same prompt, same slot budget) to read the
+// EngineCacheStats the sf::Model seam does not surface. Mirrors the decode the
+// sf::Model path performs (prefill the prompt tokens, then greedy decode).
+static engine::EngineCacheStats engine_stats_for(const char *path,
+                                                 uint32_t slots, int n_steps,
+                                                 std::vector<int32_t> *out_seq) {
+    engine::EngineCacheStats stats{};
+    std::vector<int32_t> prompt_ids;
+    if (!engine::vocab_tokenize(path, "hello world", prompt_ids) ||
+        prompt_ids.empty()) {
+        return stats;
+    }
+
+    std::unique_ptr<engine::Engine> eng = engine::Engine::load(path, slots);
+    if (eng == nullptr) return stats;
+    eng->reset_kv();
+
+    int32_t pos = 0;
+    std::vector<float> logits;
+    for (size_t i = 0; i < prompt_ids.size(); ++i) {
+        if (!eng->forward(prompt_ids[i], pos, logits)) return stats;
+        ++pos;
+    }
+    // The sf::Model path seeds decode from the LAST prompt token's argmax; here
+    // we only need to exercise the cache over n_steps decodes to read stats, so
+    // feed back the greedy argmax exactly as GgmlModel::forward does.
+    int32_t best = 0;
+    {
+        float best_v = logits.empty() ? 0.0f : logits[0];
+        for (size_t i = 0; i < logits.size(); ++i) {
+            if (logits[i] > best_v) { best_v = logits[i]; best = static_cast<int32_t>(i); }
+        }
+    }
+    for (int i = 0; i < n_steps; ++i) {
+        if (out_seq != nullptr) out_seq->push_back(best);
+        if (!eng->forward(best, pos, logits)) break;
+        ++pos;
+        float best_v = logits.empty() ? 0.0f : logits[0];
+        best = 0;
+        for (size_t j = 0; j < logits.size(); ++j) {
+            if (logits[j] > best_v) { best_v = logits[j]; best = static_cast<int32_t>(j); }
+        }
+    }
+    stats = eng->cache_stats();
+    return stats;
 }
 
 static void test_streaming_bounded_and_deterministic() {
@@ -99,78 +163,62 @@ static void test_streaming_bounded_and_deterministic() {
 
     const int n_steps = 12;
 
-    // --- Baseline: experts NOT streamed (plain CPU-resident path). This is the
-    //     "full-resident" reference the streamed output must match byte-for-
-    //     byte (the hard gate: streaming changes WHEN/WHERE bytes are resident,
-    //     never their VALUES or the ops). ---------------------------------------
-    set_force_stream(false);
-    std::vector<int32_t> baseline_seq =
-        decode_sequence(path, /*n_slots=*/0, n_steps, nullptr);
-    CHECK(!baseline_seq.empty());
-
-    set_force_stream(true);
-
-    // --- Full-pool streamed run (auto: holds the whole working set). ----------
-    uint64_t full_resident = 0;
+    // --- Auto pool (holds the whole expert working set, no eviction) through
+    //     the DEFAULT sf::Model inference path. This is the reference the
+    //     bounded run must match byte-for-byte. --------------------------------
     std::vector<int32_t> full_seq =
-        decode_sequence(path, /*n_slots=*/0, n_steps, &full_resident);
+        decode_sequence(path, /*n_slots=*/0, n_steps);
     CHECK(!full_seq.empty());
     for (int32_t t : full_seq) CHECK(t >= 0);  // (a) valid tokens
 
-    // Streamed (full pool) == non-streamed baseline, byte-for-byte.
-    CHECK(full_seq == baseline_seq);
-
-    // The tiny MoE is 2 layers x {gate,down,up} = 6 stacked expert tensors.
-    // With the auto pool the whole set stays resident: decode 1 loads all 6
-    // (misses), every later decode's residency pass is served from the slots
-    // (hits), and nothing is ever evicted. This proves the cache serves
-    // resident tensors across decodes without touching the backing store.
-    const StreamBuftStats full_stats = stream_buft_stats();
-    CHECK(full_stats.n_slots >= 1u);
-    CHECK(full_stats.cache_misses > 0u);  // the initial cold load
-    CHECK(full_stats.cache_hits > 0u);    // every warm decode after step 1
-    CHECK_EQ(full_stats.cache_evictions, 0u);
-
-    // --- Small-pool run: fewer slots than the 6 stacked expert tensors so the
-    //     residency pass must evict and reload across decodes. -----------------
-    uint64_t small_resident = 0;
-    const uint32_t small_slots = 2;  // << 6 expert tensors
-    std::vector<int32_t> small_seq =
-        decode_sequence(path, small_slots, n_steps, &small_resident);
+    // --- Small-pool run: fewer slots than the fixture's 8 experts/layer so the
+    //     per-layer top-k residency must evict and reload across layers/tokens.
+    //     3 slots >= n_expert_used (2) so a single layer's top-k always fits. --
+    const uint32_t small_slots = 3;
+    std::vector<int32_t> small_seq = decode_sequence(path, small_slots, n_steps);
     CHECK(!small_seq.empty());
     for (int32_t t : small_seq) CHECK(t >= 0);  // (a) valid tokens
 
-    // (b) BYTE-IDENTICAL determinism gate: streaming through a tiny pool must
-    //     produce exactly the same tokens as the full-resident pool.
+    // (b) BYTE-IDENTICAL determinism gate: bounded streaming through the engine
+    //     must produce exactly the same tokens as the auto (full) pool, on the
+    //     real inference path.
     CHECK(full_seq.size() == small_seq.size());
     CHECK(full_seq == small_seq);
 
-    // (c) With the small pool (fewer slots than the 6 stacked expert tensors)
-    //     the per-decode residency scan is larger than the cache, so each pass
-    //     misses and evicts, and a tensor evicted on decode N is reloaded on
-    //     decode N+1 — the eviction+reload-across-decodes guarantee the task
-    //     accepts for Model A. We assert both misses and non-zero evictions,
-    //     and that disk_reads keeps growing (re-materialization every step).
-    const StreamBuftStats small_stats = stream_buft_stats();
-    CHECK_EQ(small_stats.n_slots, small_slots);
-    CHECK(small_stats.cache_misses > full_stats.cache_misses);  // churns
-    CHECK(small_stats.cache_evictions > 0u);
-    // 6 tensors re-materialized every one of n_steps decodes with a 2-slot
-    // pool => many disk reads (eviction + reload proven across decodes). With
-    // the full pool the 6 tensors load exactly once, so the small pool reads
-    // the store far more often.
-    CHECK(small_stats.disk_reads > full_stats.disk_reads);
-    CHECK(small_stats.disk_reads >= static_cast<uint64_t>(n_steps));
+    // (c)/(d) Read the engine's bounded SlotPool stats (not surfaced through
+    //     sf::Model) via the engine API with the SAME budget. The auto pool
+    //     never evicts; the small pool must show hits, misses, and evictions,
+    //     and a resident footprint bounded below the full working set.
+    engine::EngineCacheStats full_stats =
+        engine_stats_for(path, /*slots=*/0, n_steps, nullptr);
+    engine::EngineCacheStats small_stats =
+        engine_stats_for(path, small_slots, n_steps, nullptr);
 
-    // (d) Resident cache bytes bounded by n_slots * slot_bytes, and strictly
-    //     smaller than the full-pool residency (bounded-memory proxy).
+    std::printf("[seq==%s auto(evict=%llu resident=%lluB) "
+                "small(hits=%llu miss=%llu evict=%llu resident=%lluB full=%lluB)] ",
+                (full_seq == small_seq) ? "yes" : "no",
+                static_cast<unsigned long long>(full_stats.evictions),
+                static_cast<unsigned long long>(full_stats.resident_bytes()),
+                static_cast<unsigned long long>(small_stats.hits),
+                static_cast<unsigned long long>(small_stats.misses),
+                static_cast<unsigned long long>(small_stats.evictions),
+                static_cast<unsigned long long>(small_stats.resident_bytes()),
+                static_cast<unsigned long long>(small_stats.full_bytes));
+
+    // (c) the bounded pool was exercised: hits AND misses AND evictions.
+    CHECK(small_stats.hits > 0u);
+    CHECK(small_stats.misses > 0u);
+    CHECK(small_stats.evictions > 0u);
+    // The auto pool holds the whole working set and never evicts.
+    CHECK_EQ(full_stats.evictions, static_cast<uint64_t>(0));
+
+    // (d) resident expert bytes bounded by n_slots * slot_bytes, and strictly
+    //     smaller than the full-resident footprint (bounded-memory proxy).
     CHECK(small_stats.slot_bytes > 0u);
-    const uint64_t bound =
-        static_cast<uint64_t>(small_slots) * small_stats.slot_bytes;
-    CHECK(small_resident <= bound);
-    CHECK(small_resident < full_resident);
-
-    set_force_stream(false);
+    CHECK_EQ(small_stats.resident_bytes(),
+             small_stats.n_slots * small_stats.slot_bytes);
+    CHECK(small_stats.resident_bytes() < small_stats.full_bytes);
+    CHECK(small_stats.resident_bytes() < full_stats.resident_bytes());
 }
 
 static void run_all() {
