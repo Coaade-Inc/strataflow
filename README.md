@@ -94,12 +94,20 @@ and Windows (MSVC):
 - **`.strata` single-file loader**: our loader reads the trunk and streams
   experts directly; decode is byte-identical to the source GGUF.
 - **The engine is the default and only inference path.**
+- **Predictor-driven prefetch**: the router read-back feeds a predictor that
+  warms the next layer's likely experts into the cache ahead of use, raising the
+  cache hit rate without changing results.
+- **Two architectures**: the llama-arch MoE and dense llama, each gated on
+  reproducing the oracle.
 
 In progress / next:
 
-- Per-token scheduler with predictor-driven prefetch overlap (hide disk latency
-  behind compute).
-- A second architecture (dense llama, then more MoE families) and GPU backends.
+- GPU and multi-backend execution (CPU plus a GPU buffer type via
+  `ggml_backend_sched`); the engine already runs on a swappable ggml backend.
+- More architectures (shared-expert and grouped-gating MoE families), each a new
+  oracle-gated graph builder.
+- Asynchronous prefetch overlap (background I/O loading while compute runs) and
+  per-layer graph-build reuse across tokens.
 
 See [`docs/ENGINE_CORE_DESIGN.md`](docs/ENGINE_CORE_DESIGN.md) for the engine
 design and the EC-1..EC-7 breakdown, and [`docs/PLAN.md`](docs/PLAN.md) for the
