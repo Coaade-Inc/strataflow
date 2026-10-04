@@ -2,6 +2,18 @@
 
 **Owner: Coaade Inc.**
 
+> **Status note (current):** this is the original master plan. The project has
+> since evolved past the "fork llama.cpp's libraries and drive `llama_decode`"
+> framing below: StrataFlow now runs **its own forward pass over ggml** and
+> `llama.cpp` is no longer in the inference path (it is kept only for the
+> tokenizer and as a test oracle). That decision, its rationale, and the
+> EC-1..EC-7 engine-core breakdown live in
+> [`ENGINE_CORE_DESIGN.md`](./ENGINE_CORE_DESIGN.md). Phases 1-3 below are done
+> and merged; the tiered-store / predictor / scheduler goals they describe are
+> now being delivered inside the engine core (EC-3 top-k residency, EC-6
+> scheduler + prefetch). Read this file for the overall goals and research
+> grounding, and `ENGINE_CORE_DESIGN.md` for how the engine actually works today.
+
 Goal: one local inference engine that does two things:
 1. Runs **very large MoE models (100B up to 800B+, trillion-scale) on a low-RAM PC with no GPU** at usable speed, streaming experts from disk.
 2. **Automatically uses any GPU it finds** (NVIDIA, AMD, Intel, Apple, iGPU) to go faster.
@@ -9,7 +21,7 @@ Goal: one local inference engine that does two things:
 See [RESEARCH.md](./RESEARCH.md) for the background and sources.
 
 ### Confirmed decisions (from the project owner)
-- **Base:** fork llama.cpp's libraries (ggml + llama) and build the tiered runtime on top. We take the kernels/backends and the GGUF/model code; the scheduler, tiered weight store, predictor and `.strata` format are ours.
+- **Base:** vendor llama.cpp and reuse **ggml** (kernels/backends + GGUF reader); build the tiered runtime on top. The scheduler, tiered weight store, predictor and `.strata` format are ours. *(Evolved since: as of the engine core (EC-5), StrataFlow also builds and runs the compute graph itself and no longer uses `libllama`'s `llama_decode` for inference - see the status note above and `ENGINE_CORE_DESIGN.md`.)*
 - **Platforms:** ship for **Windows, Linux and macOS** from day one. This matches both llama.cpp and the kimi-k3-in-c reference, which already port `O_DIRECT`/`pread`/`posix_memalign` to all three.
 - **Primary target: run Coaade's own models.** StrataFlow is the inference runtime for Coaade Inc.'s models — not tied to any one external checkpoint. The Kimi work (K2 at 1T-A32B, the K3 line at 2.78T-A104B per the [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c) reference) is used only as a **public stand-in** to validate the trillion-scale streaming path until Coaade models are ready. Design must handle any large MoE whose experts live on disk, so the CPU+SSD streaming path is a **v1 must-have**.
   - *Implication:* Coaade controls the model architecture, so StrataFlow can **co-design the model and the runtime** — e.g. ship Coaade models in the streaming-friendly `.strata` layout natively, train prerouter/draft heads into the checkpoint, and pick expert counts/sizes that cache well. This is a real advantage external engines don't have.
