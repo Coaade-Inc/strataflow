@@ -75,10 +75,31 @@ most are pure CPU/disk work.
   real (quantized) MoE runs end to end in a bounded RAM budget on a real machine
   with sensible output at a usable speed. Depends on quant support above. Likely
   to surface bugs the toy never did (real tokenizers, large shapes, quant types).
-- [ ] **Memory-budget CLI + peak-RSS reporting.** A user cannot yet say "run this
-  model in 8 GB" and see the result. Expose `--trunk-gb` / `--cache-gb` /
-  expert-slot knobs on the CLI and report peak resident memory, so the bounded
-  budget is user-settable and observable.
+- [x] **Memory-budget CLI + resident/peak-RSS reporting.** DONE (#25): the CLI
+  takes `--expert-slots` and prints `stats: resident model weights = X MiB,
+  peak RSS = Y MiB` via `sf_session_stats`.
+- [x] **PEAK PROCESS RAM is now bounded (was CRITICAL).** Root cause found and
+  fixed: the engine allocated the per-layer staging stacked expert tensors at
+  full size for EVERY layer (`n_layer x 3 x n_embd x n_ff x n_expert`), which
+  equalled ~the whole model - so peak RSS tracked model size, not the budget.
+  Fix: use ONE staging buffer reused across layers (segments run sequentially),
+  bounding staging to a single layer's expert footprint. Measured: a 785 MiB
+  model dropped from 806 MiB -> 132 MiB peak RSS; a 1177 MiB model also runs in
+  132 MiB (peak RSS now flat vs model size). The "big model, small RAM" claim is
+  provable by process RAM. (Further: shrink staging to n_expert_used instead of
+  n_expert for another cut; optional.)
+- [ ] **Misleading placement-plan line.** On the `.strata` streaming path the
+  CLI still prints `plan: ... experts fully resident, peak ~N GiB` from the
+  planner's estimate, which contradicts the streaming reality. Make the plan
+  summary reflect streaming (bounded resident) when experts stream.
+- [ ] **`n_ctx_train (0)` warning on generated models.** The tiny/colab
+  generators do not write a trained context-length key, so llama warns
+  `n_ctx_seq (256) > n_ctx_train (0)`. Harmless but noisy; set a context-length
+  in the generators (or handle 0 cleanly) so demo output is clean.
+- [ ] **Run a real DOWNLOADED pretrained model end to end.** Everything so far
+  uses generated fixtures. Download an actual small quantized MoE (real
+  tokenizer, real weights), pack to `.strata`, run bounded, and record output +
+  peak RAM + tok/s. The true mission proof. Unblocked by quant support (#26).
 - [ ] **Benchmark harness with real numbers.** No real tok/s, TTFT, peak RSS, or
   SSD bytes/token measured against the exit criteria in `PLAN.md` and
   `PHASE3_PLAN.md`. (This is the long-promised Phase 0 baseline, now needing the

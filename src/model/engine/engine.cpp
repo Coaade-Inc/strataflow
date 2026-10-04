@@ -89,9 +89,13 @@ struct Engine::Impl {
     // full wctx expert tensors are the backing store the pool loads from.
     ggml_context *estctx = nullptr;
     ggml_backend_buffer_t estbuf = nullptr;
-    std::vector<ggml_tensor *> stage_gate;      // per layer, ne = ffn_gate_exps
-    std::vector<ggml_tensor *> stage_up;        // per layer, ne = ffn_up_exps
-    std::vector<ggml_tensor *> stage_down;      // per layer, ne = ffn_down_exps
+    // ONE staging buffer reused across all layers (segments run sequentially,
+    // so only the current layer's experts are ever live). This bounds staging
+    // RAM to a single layer's expert footprint instead of n_layer x it - the
+    // key to peak-RSS staying near the budget, not the model size.
+    ggml_tensor *stage_gate = nullptr;          // ne = ffn_gate_exps (one layer)
+    ggml_tensor *stage_up   = nullptr;          // ne = ffn_up_exps
+    ggml_tensor *stage_down = nullptr;          // ne = ffn_down_exps
     std::unique_ptr<SlotPool> pool;
     uint64_t gate_expert_bytes = 0;             // bytes of one expert's gate slice
     uint64_t up_expert_bytes   = 0;
@@ -493,25 +497,18 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
             log_warn("engine: staging context init failed; libllama path");
             return nullptr;
         }
-        im.stage_gate.resize(static_cast<size_t>(hp.n_layer));
-        im.stage_up.resize(static_cast<size_t>(hp.n_layer));
-        im.stage_down.resize(static_cast<size_t>(hp.n_layer));
-        for (int il = 0; il < hp.n_layer; ++il) {
-            const size_t u = static_cast<size_t>(il);
-            // Use the SOURCE expert tensor's real ggml type (F32 or a quant
-            // type like Q4_K/Q6_K/Q8_0): ggml_mul_mat_id handles quantized
-            // weights natively, and the slot/nb[2] sizing already comes from the
-            // real tensors, so quantized experts stream and compute unchanged.
-            im.stage_gate[u] = ggml_new_tensor_3d(im.estctx, g0->type,
-                                                  g0->ne[0], g0->ne[1], g0->ne[2]);
-            im.stage_up[u]   = ggml_new_tensor_3d(im.estctx, u0->type,
-                                                  u0->ne[0], u0->ne[1], u0->ne[2]);
-            im.stage_down[u] = ggml_new_tensor_3d(im.estctx, d0->type,
-                                                  d0->ne[0], d0->ne[1], d0->ne[2]);
-            ggml_set_name(im.stage_gate[u], ("stg_gate." + std::to_string(il)).c_str());
-            ggml_set_name(im.stage_up[u],   ("stg_up."   + std::to_string(il)).c_str());
-            ggml_set_name(im.stage_down[u], ("stg_down." + std::to_string(il)).c_str());
-        }
+        // One layer's worth of staging, reused every layer. Use the SOURCE
+        // expert tensor's real ggml type (F32 or a quant type like
+        // Q4_K/Q6_K/Q8_0): ggml_mul_mat_id handles quantized weights natively.
+        im.stage_gate = ggml_new_tensor_3d(im.estctx, g0->type,
+                                           g0->ne[0], g0->ne[1], g0->ne[2]);
+        im.stage_up   = ggml_new_tensor_3d(im.estctx, u0->type,
+                                           u0->ne[0], u0->ne[1], u0->ne[2]);
+        im.stage_down = ggml_new_tensor_3d(im.estctx, d0->type,
+                                           d0->ne[0], d0->ne[1], d0->ne[2]);
+        ggml_set_name(im.stage_gate, "stg_gate");
+        ggml_set_name(im.stage_up,   "stg_up");
+        ggml_set_name(im.stage_down, "stg_down");
         im.estbuf = ggml_backend_alloc_ctx_tensors_from_buft(
             im.estctx, ggml_backend_cpu_buffer_type());
         if (im.estbuf == nullptr) {
@@ -521,12 +518,9 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         // Zero the staging buffer so non-routed expert slices are well-defined
         // (the kernel skips cne1==0 experts, but defined zeros avoid any inf/nan
         // in uninitialized memory leaking into an assert on debug builds).
-        for (int il = 0; il < hp.n_layer; ++il) {
-            const size_t u = static_cast<size_t>(il);
-            std::memset(im.stage_gate[u]->data, 0, ggml_nbytes(im.stage_gate[u]));
-            std::memset(im.stage_up[u]->data,   0, ggml_nbytes(im.stage_up[u]));
-            std::memset(im.stage_down[u]->data, 0, ggml_nbytes(im.stage_down[u]));
-        }
+        std::memset(im.stage_gate->data, 0, ggml_nbytes(im.stage_gate));
+        std::memset(im.stage_up->data,   0, ggml_nbytes(im.stage_up));
+        std::memset(im.stage_down->data, 0, ggml_nbytes(im.stage_down));
 
         // Pool size: auto (0) holds the whole working set (n_layer*n_expert, no
         // eviction); a positive request is clamped up to n_expert_used so a
@@ -908,10 +902,9 @@ bool Engine::ensure_layer_experts_resident(int il, const int32_t *ids,
             return false;
         }
     }
-    const size_t u = static_cast<size_t>(il);
-    ggml_tensor *dst_gate = im.stage_gate[u];
-    ggml_tensor *dst_up   = im.stage_up[u];
-    ggml_tensor *dst_down = im.stage_down[u];
+    ggml_tensor *dst_gate = im.stage_gate;
+    ggml_tensor *dst_up   = im.stage_up;
+    ggml_tensor *dst_down = im.stage_down;
 
     const uint64_t gb = im.gate_expert_bytes;
     const uint64_t ub = im.up_expert_bytes;
@@ -1243,10 +1236,9 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
             ggml_tensor *w_in = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, hp.n_expert_used);
             ggml_set_input(w_in);
 
-            const size_t lu = static_cast<size_t>(il);
             ggml_tensor *layer_out = build_expert_segment(
-                gctx, hp, cur_in, ffn_in, ids_in, w_in, im.stage_gate[lu],
-                im.stage_up[lu], im.stage_down[lu]);
+                gctx, hp, cur_in, ffn_in, ids_in, w_in, im.stage_gate,
+                im.stage_up, im.stage_down);
 
             const bool ok = run_segment(im.backend, im.galloc, gctx, {layer_out}, [&]() {
                 ggml_backend_tensor_set(cur_in, cur_host.data(), 0, embd * sizeof(float));
