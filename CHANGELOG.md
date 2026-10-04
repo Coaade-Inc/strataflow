@@ -1,0 +1,57 @@
+# Changelog
+
+All notable changes to StrataFlow. This project has not yet cut a versioned
+release; everything below is pre-release work on `main`. See
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for what is done and what is open.
+
+The format is loosely based on Keep a Changelog. Dates are omitted; entries are
+grouped by the pull request that merged them.
+
+## Unreleased
+
+### Engine core (StrataFlow runs its own forward pass over ggml)
+
+- Hold only the trunk resident on the `.strata` path; the full expert footprint
+  is never allocated in RAM. Proven by test (trunk resident vs experts not
+  resident). This is the core bounded-RAM, no-GPU capability. (#21)
+- EC-7: second architecture - dense llama (plain gate/up/down FFN), oracle-gated. (#19)
+- EC-6: predictor-driven expert prefetch - warm the next layer's likely experts
+  into the cache ahead of use; correctness-neutral, measurable hit rate. (#18)
+- EC-5: the engine is the default and only inference path; `llama_decode` is no
+  longer on the inference path. libllama kept for the tokenizer and the test
+  oracle only. (#16)
+- EC-4: `.strata` single-file loader through our own loader (no
+  `llama_model_load_from_file` on a `.strata`); byte-identical to the source
+  GGUF. Closes the Task 5 blocker. (#15)
+- EC-3: per-layer segmented execution with top-k expert residency via a bounded
+  SlotPool; byte-identical to the fully-resident run. (#14)
+- EC-2: engine-owned KV cache + multi-token greedy decode matching the oracle
+  sequence. (#13)
+- EC-1: StrataFlow's own ggml graph builder for the llama-arch MoE, single-token
+  forward, matching the libllama oracle (argmax + logits within tolerance). (#12)
+- Engine core design (Option D: own the forward pass over ggml) + feasibility
+  spike proving a hand-built ggml graph reproduces llama's math. (#11)
+
+### Tiered weight store and streaming format (Phase 3)
+
+- `.strata` format design + per-expert residency feasibility spike. (#10, #4)
+- Phase 3 Tasks 1-4: tiny MoE fixture + forced-streaming proxy + SSD profiling;
+  `strata_stream_buft`; bounded SlotPool residency; native direct-I/O backends
+  (io_uring / IOCP / F_NOCACHE with portable fallback). (#5, #8, #9)
+
+### Placement and base engine (Phases 1-2)
+
+- Phase 2: hardware profiler + placement planner that drive llama.cpp load
+  params (auto `n_gpu_layers` / expert offload). (#3)
+- Phase 1b: vendored llama.cpp + GgmlModel real-weights backend. (#2)
+- Phase 1: engine scaffold - modules, build system, CLI, tests; cross-platform
+  CI on Linux (GCC+Clang), macOS, Windows. (#1)
+
+### Project / licensing / docs
+
+- Documentation: ROADMAP + CHANGELOG added; README and PLAN kept current with
+  the working engine. (#17, #20, and this change)
+- Relicensed to the Coaade Source-Available License, Version 1.0 (free for
+  personal, non-commercial use; no reselling/rebranding/competing; no time-based
+  conversion). Licensor identified as Coaade Inc., a Delaware C corporation.
+  Vendored llama.cpp/ggml remains under its own MIT license. (#6, #7)
