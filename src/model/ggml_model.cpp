@@ -227,7 +227,17 @@ private:
     // then appends `last_token` at n_past_ and attends over 0..n_past_.
     int32_t forward_engine(int32_t last_token) {
         if (engine_ == nullptr) {
-            engine_ = engine::Engine::load(path_);
+            // EC-3: STRATAFLOW_ENGINE_EXPERT_SLOTS bounds the top-k residency
+            // SlotPool (expert bundles). 0/unset = auto (full working set, no
+            // eviction). A value below the expert count forces bounded
+            // streaming with LRU eviction/reload. The default path leaves this
+            // auto; only an operator/test opting into a budget sets it.
+            uint32_t slots = 0;
+            const char *s = std::getenv("STRATAFLOW_ENGINE_EXPERT_SLOTS");
+            if (s != nullptr && s[0] != '\0') {
+                slots = static_cast<uint32_t>(std::strtoul(s, nullptr, 10));
+            }
+            engine_ = engine::Engine::load(path_, slots);
             if (engine_ == nullptr) return -1;  // arch unsupported / load failed
         }
         if (n_past_ == 0) engine_->reset_kv();

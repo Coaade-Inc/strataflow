@@ -7,13 +7,18 @@
 // that GgmlModel and the oracle test sit on. The implementation
 // (model/engine/engine.cpp) is the only engine TU that includes ggml.
 //
-// EC-2 scope: a prefill-then-decode forward over an engine-owned KV cache
-// (section 3.4). Each forward() processes one query token at its position,
-// appends that layer's post-rope K and V to a per-layer KV store, and attends
-// over all cached positions 0..pos (causal mask through ggml_soft_max_ext).
-// Still ALL expert weights resident (no streaming - that is EC-3), one
-// architecture only (the llama-arch MoE fixture - the arch-descriptor table is
-// EC-7). The engine path is opt-in behind GgmlModel.
+// EC-3 scope: per-layer SEGMENTED execution with top-k expert residency
+// (sections 3.2, 3.3, 3.5). Each layer is split into a ROUTER segment (attn +
+// ffn_norm + router + argsort top-k, computed and then read back to the host)
+// and an EXPERT segment (mul_mat_id over the now-resident experts). Because the
+// engine reads the router output BEFORE building the expert matmul, it makes
+// resident EXACTLY the top-k routed experts per layer via a bounded SlotPool
+// (src/tws/weight_store.h), bounding resident expert RAM to top-k per layer.
+// EC-2's engine-owned KV cache and the exact math (section 6.3) are unchanged,
+// so output stays byte-identical to EC-1/EC-2. The in-memory GGUF source is the
+// backing store for the pool (the .strata source is EC-4). The engine path is
+// opt-in behind GgmlModel; one architecture only (the llama-arch MoE fixture;
+// the arch-descriptor table is EC-7).
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
@@ -43,9 +48,27 @@ struct EngineHParams {
     float freq_scale    = 1.0f;
 };
 
+// Top-k expert residency accounting (EC-3), surfaced from the engine's bounded
+// SlotPool so a test can prove bounded, cache-driven residency. The hits/misses
+// /evictions mirror src/tws/weight_store.h CacheStats; resident_bytes is the
+// hard upper bound on resident expert working-copy RAM (n_slots * slot_bytes).
+struct EngineCacheStats {
+    uint64_t hits        = 0;   // routed expert served from a resident slot
+    uint64_t misses      = 0;   // routed expert required a load from the source
+    uint64_t evictions   = 0;   // LRU evictions forced by the pool budget
+    uint64_t n_slots     = 0;   // configured pool size (expert bundles)
+    uint64_t slot_bytes  = 0;   // bytes per slot (gate+up+down for one expert)
+    uint64_t full_bytes  = 0;   // all-experts-resident footprint, for comparison
+    // Resident expert RAM upper bound; bounded by top-k per layer when the pool
+    // is sized below the expert count.
+    uint64_t resident_bytes() const { return n_slots * slot_bytes; }
+};
+
 // Owns the model's weight tensors (read resident from a GGUF) and runs OUR OWN
-// ggml graph for a single-token forward on the ggml CPU backend. One instance
-// per model; forward() is not thread-safe (single-token greedy decode path).
+// ggml graph forward on the ggml CPU backend. EC-3 executes each layer in a
+// router segment and an expert segment, making only the top-k routed experts
+// resident through a bounded SlotPool. One instance per model; forward() is not
+// thread-safe (single-token greedy decode path).
 class Engine {
 public:
     ~Engine();
@@ -56,9 +79,23 @@ public:
     // Load the llama-arch MoE weights from `path` (plain GGUF) resident in a
     // ggml context. Returns nullptr on any failure (bad file, unexpected arch,
     // missing tensors); the caller then stays on the libllama path.
-    static std::unique_ptr<Engine> load(const std::string &path);
+    //
+    // `expert_slots` bounds the top-k residency SlotPool (EC-3): the number of
+    // expert bundles (gate+up+down for one (layer,expert)) that may be resident
+    // at once. 0 means "auto": size the pool to the full expert working set
+    // (n_layer * n_expert, no eviction). A positive value smaller than
+    // n_expert forces streaming with LRU eviction/reload so a test can prove
+    // bounded residency. Must be >= n_expert_used so a single layer's top-k
+    // always fits; load() clamps up to that minimum.
+    static std::unique_ptr<Engine> load(const std::string &path,
+                                        uint32_t expert_slots = 0);
 
     const EngineHParams &hparams() const;
+
+    // Top-k residency cache stats accumulated across all forward() calls since
+    // load() (EC-3). Lets the oracle test assert hits/misses/evictions and the
+    // bounded resident-byte footprint.
+    const EngineCacheStats &cache_stats() const;
 
     // Run a forward for `token` at `pos`, writing the full logit vector (length
     // n_vocab) to `out`. `token` is appended to the engine-owned KV cache at
@@ -75,6 +112,13 @@ public:
 
 private:
     Engine();
+
+    // EC-3: load the routed top-k experts of layer `il` into the staging
+    // stacked tensors via the bounded SlotPool. `ids` holds `n_ids` selected
+    // expert ids read back from the router segment. Returns false on failure.
+    bool ensure_layer_experts_resident(int il, const int32_t *ids, int n_ids);
+    const EngineHParams &hp_() const;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
