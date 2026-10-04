@@ -68,6 +68,15 @@ struct EngineCacheStats {
     uint64_t n_slots     = 0;   // configured pool size (expert bundles)
     uint64_t slot_bytes  = 0;   // bytes per slot (gate+up+down for one expert)
     uint64_t full_bytes  = 0;   // all-experts-resident footprint, for comparison
+    // EC-6 predictor-driven prefetch (section 3.5): experts warmed into the pool
+    // ahead of a layer, and how many that layer's exact routing then used. The
+    // hit rate is the measurable EC-6 win; prefetch never affects correctness
+    // (the exact router read-back is authoritative).
+    uint64_t prefetch_warmed = 0;
+    uint64_t prefetch_used   = 0;
+    double prefetch_hit_rate() const {
+        return prefetch_warmed ? double(prefetch_used) / double(prefetch_warmed) : 0.0;
+    }
     // Resident expert RAM upper bound; bounded by top-k per layer when the pool
     // is sized below the expert count.
     uint64_t resident_bytes() const { return n_slots * slot_bytes; }
@@ -129,6 +138,14 @@ private:
     // stacked tensors via the bounded SlotPool. `ids` holds `n_ids` selected
     // expert ids read back from the router segment. Returns false on failure.
     bool ensure_layer_experts_resident(int il, const int32_t *ids, int n_ids);
+
+    // EC-6: warm one (layer, expert) bundle into the SlotPool WITHOUT copying it
+    // to the staging tensors - a speculative prefetch. Loads the slot on a miss
+    // using the same byte source as ensure_layer_experts_resident, so a later
+    // authoritative acquire of the same id becomes a cache hit. Best-effort: a
+    // failed/out-of-range warm is ignored (correctness is unaffected because the
+    // authoritative residency pass re-acquires exactly what the router selects).
+    void warm_expert(int il, int expert);
     const EngineHParams &hp_() const;
 
     // EC-4: open a .strata single file, parse its embedded GGUF metadata into
