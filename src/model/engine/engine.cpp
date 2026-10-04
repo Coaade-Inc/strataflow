@@ -498,11 +498,15 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         im.stage_down.resize(static_cast<size_t>(hp.n_layer));
         for (int il = 0; il < hp.n_layer; ++il) {
             const size_t u = static_cast<size_t>(il);
-            im.stage_gate[u] = ggml_new_tensor_3d(im.estctx, GGML_TYPE_F32,
+            // Use the SOURCE expert tensor's real ggml type (F32 or a quant
+            // type like Q4_K/Q6_K/Q8_0): ggml_mul_mat_id handles quantized
+            // weights natively, and the slot/nb[2] sizing already comes from the
+            // real tensors, so quantized experts stream and compute unchanged.
+            im.stage_gate[u] = ggml_new_tensor_3d(im.estctx, g0->type,
                                                   g0->ne[0], g0->ne[1], g0->ne[2]);
-            im.stage_up[u]   = ggml_new_tensor_3d(im.estctx, GGML_TYPE_F32,
+            im.stage_up[u]   = ggml_new_tensor_3d(im.estctx, u0->type,
                                                   u0->ne[0], u0->ne[1], u0->ne[2]);
-            im.stage_down[u] = ggml_new_tensor_3d(im.estctx, GGML_TYPE_F32,
+            im.stage_down[u] = ggml_new_tensor_3d(im.estctx, d0->type,
                                                   d0->ne[0], d0->ne[1], d0->ne[2]);
             ggml_set_name(im.stage_gate[u], ("stg_gate." + std::to_string(il)).c_str());
             ggml_set_name(im.stage_up[u],   ("stg_up."   + std::to_string(il)).c_str());
