@@ -67,10 +67,24 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
         plan.stream_experts = cacheable < total_experts;
     }
 
-    // Peak estimate: pinned trunk + both expert caches.
-    plan.planned_peak_bytes =
-        uint64_t(plan.trunk_layers_in_vram + plan.trunk_layers_in_ram) * per_layer_trunk +
-        uint64_t(plan.expert_slots_vram + plan.expert_slots_ram) * model.expert_bytes;
+    // Peak estimate. When experts stream, the engine does NOT hold the full
+    // expert cache resident - it keeps the trunk plus a bounded per-layer
+    // staging footprint (one layer's experts), so estimate that, not the whole
+    // cache. The authoritative resident figure is reported at runtime by
+    // sf_session_stats (the CLI 'stats:' line).
+    const uint64_t trunk_bytes =
+        uint64_t(plan.trunk_layers_in_vram + plan.trunk_layers_in_ram) * per_layer_trunk;
+    if (plan.stream_experts) {
+        const uint64_t per_layer_experts =
+            model.n_experts > 0
+                ? uint64_t(model.n_experts) * model.expert_bytes  // one layer, streamed
+                : 0;
+        plan.planned_peak_bytes = trunk_bytes + per_layer_experts;
+    } else {
+        plan.planned_peak_bytes =
+            trunk_bytes +
+            uint64_t(plan.expert_slots_vram + plan.expert_slots_ram) * model.expert_bytes;
+    }
 
     log_info("placement plan: " + plan.to_summary());
     return plan;
@@ -82,8 +96,9 @@ std::string PlacementPlan::to_summary() const {
        << " ram=" << trunk_layers_in_ram << " layers], "
        << "experts[vram=" << expert_slots_vram
        << " ram=" << expert_slots_ram << " slots], "
-       << (stream_experts ? "streaming from SSD" : "fully resident")
-       << ", peak ~" << (planned_peak_bytes / kGiB) << " GiB";
+       << (stream_experts ? "experts STREAMED (bounded resident)"
+                          : "experts fully resident")
+       << ", est. peak ~" << (planned_peak_bytes / kGiB) << " GiB";
     return os.str();
 }
 
