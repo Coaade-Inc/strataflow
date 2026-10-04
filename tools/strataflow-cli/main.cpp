@@ -169,8 +169,14 @@ int main(int argc, char **argv) {
                         static_cast<double>(timing.ttft_us) / 1000.0);
         }
         if (rs.streamed_bytes > 0) {
+            // Human-readable MiB (unchanged wording) AND the exact uint64 byte
+            // count so a harness can compute bytes/token without the 1-decimal
+            // MiB rounding error. The raw field is additive: the existing
+            // 'streamed = W MiB' field above is kept verbatim.
             std::printf(", streamed = %.1f MiB",
                         static_cast<double>(rs.streamed_bytes) / mib);
+            std::printf(", streamed_bytes = %llu",
+                        static_cast<unsigned long long>(rs.streamed_bytes));
         }
         std::printf("\n");
     }

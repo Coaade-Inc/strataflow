@@ -211,21 +211,33 @@ The table has one row per `(model size x expert-slots)` config, with columns:
 
 - `on-disk MiB` - size of the packed `.strata` file.
 - `slots` - `--expert-slots` for the run (`auto` = 0, fully resident).
-- `tok/s` - steady-state decode throughput (`max-tokens / decode wall-clock`).
+- `gen tok/s` - END-TO-END generate throughput (`max-tokens / full sf_generate
+  wall-clock`). This INCLUDES prompt processing and the first-token latency, so
+  it is not steady-state decode.
+- `decode tok/s` - STEADY-STATE decode throughput with the first token and its
+  TTFT removed (`(max-tokens - 1) / (wall-clock - TTFT)`). This is the figure
+  the harness targets; it is only reported when the CLI gives TTFT and
+  `max-tokens > 1`.
 - `TTFT ms` - time-to-first-token.
 - `resident MiB` / `peak RSS MiB` - RAM held by the run.
 - `streamed MiB` / `bytes/tok` - SSD bytes streamed through `StrataReader`.
+  `bytes/tok` is exact: it comes from the raw `streamed_bytes` uint64 the CLI
+  reports, not the 1-decimal `streamed MiB` display value.
+
+Each row is a SINGLE run (no warmup or repeat), so `gen tok/s`, `decode tok/s`
+and `TTFT ms` are single noisy samples; treat them as indicative, not
+statistically tight.
 
 What the generated numbers prove and do not prove: the **bounded-RAM**
 property is real - with `--expert-slots` set below the expert count, peak RSS
 and resident weights stay far below the on-disk size and move with the slot
 count (the Phase 3 "big model, small RAM" exit criterion). The absolute
-**tok/s** is only a MECHANISM proxy: the generated model has random weights and
-tiny dimensions, so its throughput is NOT comparable to the PLAN.md section 2
-ladder, which is for large real models on NVMe. The harness says so and does
-not fabricate a comparison. For real throughput, run Cell 10 (or a Mixtral
-quant on a larger runtime). The JSON/CSV artifacts are written for download so
-you can keep the measured numbers.
+**decode tok/s** is only a MECHANISM proxy: the generated model has random
+weights and tiny dimensions, so its throughput is NOT comparable to the PLAN.md
+section 2 ladder, which is for large real models on NVMe. The harness says so
+and does not fabricate a comparison. For real throughput, run Cell 10 (or a
+Mixtral quant on a larger runtime). The JSON/CSV artifacts are written for
+download so you can keep the measured numbers.
 
 ### Cell 10 (optional) - include the real downloaded TinyLlama row
 

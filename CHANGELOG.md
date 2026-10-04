@@ -12,10 +12,14 @@ grouped by the pull request that merged them.
 ### Benchmarking and instrumentation
 
 - Benchmark harness `colab/strataflow_bench.py`: runs a config MATRIX (model
-  size x `--expert-slots`) over the generated-F32 MoE, measures per run
-  tokens/sec (steady-state decode wall-clock), TTFT, resident model weights,
-  peak RSS, on-disk `.strata` size, SSD streamed MiB and bytes/token, prints a
-  fixed-width results table with an honest exit-criteria report, and writes
+  size x `--expert-slots`) over the generated-F32 MoE, measures per run both
+  end-to-end generate throughput (`gen tok/s` = max-tokens / full wall-clock)
+  and steady-state decode throughput (`decode tok/s` = (max-tokens-1) /
+  (wall-clock - TTFT), first token removed), plus TTFT, resident model weights,
+  peak RSS, on-disk `.strata` size, SSD streamed MiB and an EXACT bytes/token
+  (from the raw `streamed_bytes` uint64, not the rounded MiB display value),
+  prints a fixed-width results table with an honest exit-criteria report, and
+  writes
   machine-readable JSON + CSV artifacts (schema-versioned). The default matrix
   is CPU-only, offline, and free-Colab-tier sized (finishes in a few minutes);
   `--layers-list` / `--experts-list` / `--slots-list` / `--max-tokens` grow it.
@@ -31,8 +35,10 @@ grouped by the pull request that merged them.
   `StrataReader` disk-read seam). The new `sf_runtime_stats` fields are APPENDED
   at the end of the struct for ABI backward-compatibility, and the existing
   `resident model weights = X MiB, peak RSS = Y MiB` wording is unchanged so the
-  Python parser keeps working. The oracle correctness gate is preserved (the
-  timing/counting seams add no engine math).
+  Python parser keeps working. The CLI additionally prints the exact
+  `streamed_bytes = N` uint64 alongside the human-readable `streamed = W MiB`
+  so the harness computes an exact (not display-rounded) bytes/token. The oracle
+  correctness gate is preserved (the timing/counting seams add no engine math).
 
 ### Engine core (StrataFlow runs its own forward pass over ggml)
 

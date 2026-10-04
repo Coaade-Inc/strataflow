@@ -107,6 +107,11 @@ def parse_cli_stats(captured):
                      only printed when a first token was produced).
       streamed_mib - SSD streamed bytes (MiB), or None if absent (FEAT-002:
                      only printed on the streaming .strata path, when > 0).
+      streamed_bytes - SSD streamed bytes as the EXACT uint64 the engine holds,
+                     or None if absent. Printed alongside streamed_mib on new
+                     CLI builds; use it for an exact bytes/token (streamed_mib
+                     is the 1-decimal rounded display value and is kept only as
+                     a fallback for old CLI builds).
 
     The resident/peak fields keep the exact wording from before FEAT-002, and
     the TTFT/streamed fields are optional, so this parser works against both
@@ -118,6 +123,7 @@ def parse_cli_stats(captured):
         "peak_mib": None,
         "ttft_ms": None,
         "streamed_mib": None,
+        "streamed_bytes": None,
     }
     for line in captured.splitlines():
         if line.startswith("output:"):
@@ -136,6 +142,11 @@ def parse_cli_stats(captured):
         m = re.search(r"streamed = ([0-9.]+) MiB", line)
         if m:
             stats["streamed_mib"] = float(m.group(1))
+        # Exact uint64 byte count (new CLI builds only). Parsed separately from
+        # the MiB display value so bytes/token is exact when present.
+        m = re.search(r"streamed_bytes = ([0-9]+)", line)
+        if m:
+            stats["streamed_bytes"] = int(m.group(1))
     return stats
 
 

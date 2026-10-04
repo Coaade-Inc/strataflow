@@ -3,14 +3,22 @@
 # measured numbers as a human-readable table plus machine-readable JSON + CSV.
 #
 # What this measures, per run (one (model-size x expert-slots) config):
-#   - tokens/sec   : steady-state decode throughput = max_tokens / decode
-#                    wall-clock of the single sf_generate CLI call.
+#   - gen tok/s    : END-TO-END generate throughput = max_tokens / full
+#                    sf_generate wall-clock. This INCLUDES prompt processing
+#                    and the first-token latency, so it is NOT steady-state
+#                    decode. Reported honestly as end-to-end generate rate.
+#   - decode tok/s : STEADY-STATE decode throughput with the first token (and
+#                    its TTFT) removed: (max_tokens - 1) / (wall-clock - TTFT).
+#                    This is the figure the harness actually targets; it is
+#                    only computable when the CLI reports TTFT and max_tokens>1.
 #   - TTFT (ms)    : time-to-first-token, reported by the CLI (FEAT-002).
 #   - resident MiB : resident model weights held in RAM (sf_runtime_stats).
 #   - peak RSS MiB : peak process RSS during the run.
 #   - on-disk MiB  : size of the packed .strata file.
 #   - streamed MiB : SSD bytes streamed through StrataReader (FEAT-002).
-#   - bytes/token  : streamed_bytes / max_tokens.
+#   - bytes/token  : exact streamed_bytes / max_tokens. Uses the raw uint64
+#                    streamed_bytes the CLI reports (not the 1-decimal MiB
+#                    display value), so the integer is exact, not quantized.
 #
 # DEFAULT matrix: a small GENERATED-F32 MoE swept across model sizes and
 # --expert-slots. It is CPU-only, offline, fits the free Colab tier (~12 GB
@@ -27,8 +35,9 @@
 #     is the Phase 3 "big model, small RAM" exit criterion (PHASE3_PLAN.md).
 #   - They do NOT prove the absolute tokens/sec ladder in PLAN.md section 2:
 #     that ladder is for LARGE REAL models on NVMe. The generated toy has
-#     random weights and tiny dimensions, so its tok/s is only a mechanism
-#     proxy, not a comparable throughput figure. We say so and do not fabricate
+#     random weights and tiny dimensions, so its decode tok/s is only a
+#     mechanism proxy, not a comparable throughput figure. We say so and do not
+#     fabricate
 #     a comparison where no target applies.
 #
 # Usage:
@@ -99,14 +108,36 @@ def ensure_strata(args, gguf_path, cfg):
     return strata_path
 
 
+def _decode_tok_per_sec(max_tokens, elapsed, ttft_ms):
+    """Steady-state decode throughput: first token (and its TTFT) removed.
+
+    (max_tokens - 1) / (elapsed_seconds - ttft_seconds). Returns None when it
+    cannot be computed honestly: no TTFT reported (old CLI build / no token),
+    max_tokens <= 1, or a non-positive post-TTFT window. This is the figure the
+    harness actually targets; the end-to-end 'gen tok/s' folds in prompt
+    processing + TTFT and is reported separately.
+    """
+    if ttft_ms is None or max_tokens <= 1 or elapsed is None:
+        return None
+    decode_window = elapsed - ttft_ms / 1000.0
+    if decode_window <= 0:
+        return None
+    return round((max_tokens - 1) / decode_window, 2)
+
+
 def run_one(args, cfg, slots):
     """Run ONE generated-MoE config and return a result record (dict).
 
     Steps: generate GGUF (if needed) -> pack to .strata (if needed) -> run the
-    CLI capturing stdout, timing the decode wall-clock -> parse the stats line.
-    A missing 'output:' line is a HARD error for that run: the row is marked
-    failed rather than emitting a fabricated measurement (mirrors
+    CLI capturing stdout, timing the full sf_generate wall-clock -> parse the
+    stats line. A missing 'output:' line is a HARD error for that run: the row
+    is marked failed rather than emitting a fabricated measurement (mirrors
     run_real_model's guard in strataflow_colab.py).
+
+    Throughput is reported two honest ways: 'gen tok/s' is end-to-end
+    (max_tokens / full wall-clock, includes prompt + TTFT) and 'decode tok/s'
+    is steady-state ((max_tokens - 1) / (wall-clock - TTFT), first token
+    removed) when TTFT is available.
     """
     label = model_label(cfg)
     gguf_path = ensure_gguf(args, cfg)
@@ -135,12 +166,14 @@ def run_one(args, cfg, slots):
         "expert_slots": slots,
         "max_tokens": args.max_tokens,
         "on_disk_mib": round(on_disk_mib, 1),
-        "decode_seconds": round(elapsed, 3),
-        "tokens_per_sec": None,
+        "wall_seconds": round(elapsed, 3),
+        "gen_tokens_per_sec": None,
+        "decode_tokens_per_sec": None,
         "ttft_ms": stats["ttft_ms"],
         "resident_mib": stats["resident_mib"],
         "peak_rss_mib": stats["peak_mib"],
         "streamed_mib": stats["streamed_mib"],
+        "streamed_bytes": stats["streamed_bytes"],
         "bytes_per_token": None,
         "ok": False,
         "error": None,
@@ -157,13 +190,32 @@ def run_one(args, cfg, slots):
         print(f"  FAILED: {record['error']}")
         return record
 
-    record["tokens_per_sec"] = (round(args.max_tokens / elapsed, 2)
-                                if elapsed > 0 else None)
-    if stats["streamed_mib"] is not None:
-        streamed_bytes = stats["streamed_mib"] * 1024 * 1024
-        record["bytes_per_token"] = round(streamed_bytes / args.max_tokens, 1)
+    _fill_throughput_and_bytes(record, args.max_tokens, elapsed, stats)
     record["ok"] = True
     return record
+
+
+def _fill_throughput_and_bytes(record, max_tokens, elapsed, stats):
+    """Populate the end-to-end + decode throughput and the EXACT bytes/token.
+
+    gen tok/s is end-to-end (max_tokens / wall-clock). decode tok/s removes the
+    first token + its TTFT. bytes/token uses the raw uint64 streamed_bytes when
+    the CLI reports it (exact), falling back to the 1-decimal MiB display value
+    only for old CLI builds that do not print streamed_bytes.
+    """
+    record["gen_tokens_per_sec"] = (round(max_tokens / elapsed, 2)
+                                    if elapsed > 0 else None)
+    record["decode_tokens_per_sec"] = _decode_tok_per_sec(
+        max_tokens, elapsed, stats["ttft_ms"])
+    if stats.get("streamed_bytes") is not None:
+        # Exact: raw uint64 byte count straight from sf_runtime_stats.
+        record["bytes_per_token"] = round(
+            stats["streamed_bytes"] / max_tokens, 1)
+    elif stats["streamed_mib"] is not None:
+        # Fallback for old CLI builds: derived from the rounded MiB string, so
+        # only approximate (quantized to ~0.05 MiB by the display rounding).
+        streamed_bytes = stats["streamed_mib"] * 1024 * 1024
+        record["bytes_per_token"] = round(streamed_bytes / max_tokens, 1)
 
 
 def run_real_row(args):
@@ -185,12 +237,14 @@ def run_real_row(args):
         "expert_slots": args.expert_slots,
         "max_tokens": args.max_tokens,
         "on_disk_mib": None,
-        "decode_seconds": None,
-        "tokens_per_sec": None,
+        "wall_seconds": None,
+        "gen_tokens_per_sec": None,
+        "decode_tokens_per_sec": None,
         "ttft_ms": None,
         "resident_mib": None,
         "peak_rss_mib": None,
         "streamed_mib": None,
+        "streamed_bytes": None,
         "bytes_per_token": None,
         "ok": False,
         "error": None,
@@ -252,16 +306,13 @@ def run_real_row(args):
                            else "no 'output:' line in CLI stdout")
         print(f"  FAILED: {record['error']}")
         return record
-    record["decode_seconds"] = round(elapsed, 3)
-    record["tokens_per_sec"] = (round(args.max_tokens / elapsed, 2)
-                                if elapsed > 0 else None)
+    record["wall_seconds"] = round(elapsed, 3)
     record["ttft_ms"] = stats["ttft_ms"]
     record["resident_mib"] = stats["resident_mib"]
     record["peak_rss_mib"] = stats["peak_mib"]
     record["streamed_mib"] = stats["streamed_mib"]
-    if stats["streamed_mib"] is not None:
-        streamed_bytes = stats["streamed_mib"] * 1024 * 1024
-        record["bytes_per_token"] = round(streamed_bytes / args.max_tokens, 1)
+    record["streamed_bytes"] = stats["streamed_bytes"]
+    _fill_throughput_and_bytes(record, args.max_tokens, elapsed, stats)
     record["ok"] = True
     return record
 
@@ -272,9 +323,12 @@ def _fmt(value, spec="{}"):
 
 def print_table(records):
     """Print a fixed-width ASCII results table, one row per config."""
-    header = ["model", "on-disk MiB", "slots", "tok/s", "TTFT ms",
-              "resident MiB", "peak RSS MiB", "streamed MiB", "bytes/tok",
-              "status"]
+    # 'gen tok/s' = end-to-end (max_tokens / full wall-clock, includes prompt +
+    # TTFT). 'decode tok/s' = steady-state ((max_tokens-1)/(wall-clock-TTFT),
+    # first token removed) - the figure the harness targets. See the README.
+    header = ["model", "on-disk MiB", "slots", "gen tok/s", "decode tok/s",
+              "TTFT ms", "resident MiB", "peak RSS MiB", "streamed MiB",
+              "bytes/tok", "status"]
     rows = []
     for r in records:
         if r.get("skipped"):
@@ -289,7 +343,8 @@ def print_table(records):
             r["model"],
             _fmt(r["on_disk_mib"], "{:.1f}"),
             slots_s,
-            _fmt(r["tokens_per_sec"], "{:.2f}"),
+            _fmt(r["gen_tokens_per_sec"], "{:.2f}"),
+            _fmt(r["decode_tokens_per_sec"], "{:.2f}"),
             _fmt(r["ttft_ms"], "{:.1f}"),
             _fmt(r["resident_mib"], "{:.1f}"),
             _fmt(r["peak_rss_mib"], "{:.1f}"),
@@ -313,6 +368,10 @@ def print_table(records):
     print("  ".join("-" * w for w in widths))
     for row in rows:
         print(line(row))
+    print("\nnote: each row is a SINGLE run (no warmup/repeat), so gen tok/s,")
+    print("decode tok/s and TTFT are single noisy samples. gen tok/s is")
+    print("end-to-end (includes prompt + TTFT); decode tok/s removes the first")
+    print("token and is the steady-state figure the harness targets.")
 
 
 def print_exit_criteria(records):
@@ -342,7 +401,7 @@ def print_exit_criteria(records):
 
     print("\nPLAN.md section 2 - absolute tokens/sec ladder: this ladder is for")
     print("LARGE REAL models on NVMe. The generated toy has random weights and")
-    print("tiny dimensions, so its tok/s is a MECHANISM proxy only, NOT a")
+    print("tiny dimensions, so its decode tok/s is a MECHANISM proxy only, NOT a")
     print("comparable throughput figure. No comparison is fabricated here.")
     print("Run the optional --real-model row (or a Mixtral quant on a larger")
     print("runtime) to measure throughput against that ladder on real weights.")
@@ -372,9 +431,10 @@ def write_artifacts(args, records):
 
     # CSV: a flat row per record with a stable column order.
     fields = ["model", "arch", "layers", "experts", "n_embd", "n_ff",
-              "expert_slots", "max_tokens", "on_disk_mib", "decode_seconds",
-              "tokens_per_sec", "ttft_ms", "resident_mib", "peak_rss_mib",
-              "streamed_mib", "bytes_per_token", "ok", "error"]
+              "expert_slots", "max_tokens", "on_disk_mib", "wall_seconds",
+              "gen_tokens_per_sec", "decode_tokens_per_sec", "ttft_ms",
+              "resident_mib", "peak_rss_mib", "streamed_mib", "streamed_bytes",
+              "bytes_per_token", "ok", "error"]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -399,8 +459,9 @@ def main():
     ap.add_argument("--n-ff", type=int, default=512)
     ap.add_argument("--prompt", default="hello world from the strataflow bench")
     ap.add_argument("--max-tokens", type=int, default=16,
-                    help="generation cap per run; tok/s = max-tokens / decode "
-                         "wall-clock (default 16, free-tier quick).")
+                    help="generation cap per run; gen tok/s = max-tokens / full "
+                         "wall-clock, decode tok/s = (max-tokens-1)/(wall-clock"
+                         "-TTFT) (default 16, free-tier quick).")
     # DEFAULT matrix: two model sizes x three expert-slots settings. Small
     # enough for the free Colab tier (a few hundred MiB on disk each) and quick.
     ap.add_argument("--layers-list", default="8,12",
