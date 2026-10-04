@@ -14,6 +14,7 @@
 
 #include "common/log.h"
 #include "hw/gpu_discovery.h"
+#include "model/engine/engine.h"
 #include "plan/llama_placement.h"
 #include "plan/planner.h"
 #include "tws/stream_buft.h"
@@ -55,6 +56,17 @@ bool force_stream_experts_env() {
     return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
 }
 
+// EC-1 opt-in: STRATAFLOW_ENGINE=1 routes GgmlModel::forward through OUR OWN
+// ggml graph (src/model/engine, docs/ENGINE_CORE_DESIGN.md) instead of
+// llama_decode. Default (unset/0/false/off) keeps the proven libllama path.
+// This is the ONLY toggle EC-1 adds; it never changes the sf::Model interface.
+bool use_engine_env() {
+    const char *v = std::getenv("STRATAFLOW_ENGINE");
+    if (v == nullptr || v[0] == '\0') return false;
+    std::string s(v);
+    return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
+}
+
 // Route llama.cpp's internal logging into our logger. Keeps the CLI/test
 // output tidy and under our log-level control.
 void sf_llama_log_cb(ggml_log_level level, const char *text, void * /*user*/) {
@@ -77,10 +89,13 @@ void sf_llama_log_cb(ggml_log_level level, const char *text, void * /*user*/) {
 class GgmlModel final : public Model {
 public:
     // Takes ownership of a loaded model + context. Private; use create().
+    // `path` is retained so the opt-in EC-1 engine (STRATAFLOW_ENGINE=1) can
+    // read the SAME gguf resident on first use.
     GgmlModel(llama_model *model, llama_context *ctx, const ModelShape &shape,
-              llama_token eos)
+              llama_token eos, std::string path)
         : model_(model), ctx_(ctx), vocab_(llama_model_get_vocab(model)),
-          shape_(shape), eos_(eos) {}
+          shape_(shape), eos_(eos), path_(std::move(path)),
+          use_engine_(use_engine_env()) {}
 
     GgmlModel(const GgmlModel &) = delete;
     GgmlModel &operator=(const GgmlModel &) = delete;
@@ -150,6 +165,16 @@ public:
     // Decode `last_token` at the current position, read its logits, and return
     // the greedy (argmax) next token. KV state advances by one each call.
     int32_t forward(int32_t last_token) override {
+        if (use_engine_) {
+            const int32_t r = forward_engine(last_token);
+            if (r >= 0) return r;
+            // Engine unavailable for this model/arch: fall back to libllama for
+            // this call (and future calls) so the model stays usable. EC-1 keeps
+            // libllama as the default and the safe fallback.
+            use_engine_ = false;
+            log_warn("GgmlModel: engine path unavailable; using libllama path");
+        }
+
         llama_token tok = last_token;
         llama_batch batch = llama_batch_get_one(&tok, 1);
 
@@ -191,12 +216,40 @@ public:
     int32_t eos_token() const override { return eos_; }
 
 private:
+    // Opt-in EC-1 path: run OUR OWN ggml graph for one token at position
+    // n_past_ and take the greedy argmax. Returns the next token id, or -1 if
+    // the engine could not load/run (so forward() falls back to libllama). EC-1
+    // is a single-position forward with all experts resident and no KV history.
+    int32_t forward_engine(int32_t last_token) {
+        if (engine_ == nullptr) {
+            engine_ = engine::Engine::load(path_);
+            if (engine_ == nullptr) return -1;  // arch unsupported / load failed
+        }
+        std::vector<float> logits;
+        if (!engine_->forward(last_token, n_past_, logits) || logits.empty()) {
+            return -1;
+        }
+        ++n_past_;
+        int32_t best = 0;
+        float best_logit = -std::numeric_limits<float>::infinity();
+        for (size_t i = 0; i < logits.size(); ++i) {
+            if (logits[i] > best_logit) {
+                best_logit = logits[i];
+                best = static_cast<int32_t>(i);
+            }
+        }
+        return best;
+    }
+
     llama_model         *model_ = nullptr;
     llama_context       *ctx_   = nullptr;
     const llama_vocab   *vocab_ = nullptr;
     ModelShape           shape_{};
     llama_token          eos_    = 0;
     int32_t              n_past_ = 0;
+    std::string          path_;
+    bool                 use_engine_ = false;
+    std::unique_ptr<engine::Engine> engine_;
 };
 
 // Read a GGUF uint32 metadata value by key; returns `fallback` if absent or
@@ -512,7 +565,7 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
         *out_plan = plan_placement(hw, shape, vram_budget, ram_budget);
     }
 
-    out = std::unique_ptr<Model>(new GgmlModel(model, ctx, shape, eos));
+    out = std::unique_ptr<Model>(new GgmlModel(model, ctx, shape, eos, path));
     return SF_OK;
 }
 
