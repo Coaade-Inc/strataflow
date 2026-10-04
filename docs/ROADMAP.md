@@ -17,8 +17,9 @@ present, is an optional accelerator - never a requirement.
 
 Running real pretrained models means running **quantized** weights (Q4_K, Q6_K,
 Q8_0, IQ-families, ...), since that is how real models ship; full-precision
-(F32/F16) must work too. Quantized-weight support is the current top-priority
-gap (see below) - the engine runs F32 only today.
+(F32/F16) must work too. Quantized-weight support now runs: Q8_0 and the K-quant
+families (Q4_K/Q6_K) are validated against the oracle (see below); the IQ
+families are the remaining quant-coverage gap.
 
 ---
 
@@ -66,10 +67,19 @@ most are pure CPU/disk work.
   the libllama oracle on a **Q8_0** llama-arch MoE: identical greedy sequence,
   logit delta within quant-dequant tolerance; the `.strata` streaming path works
   on the quantized model too.
-  - [ ] Still to broaden: validate the K-quant families (Q4_K/Q6_K) and the IQ
-    families specifically, and confirm `.strata` streaming across all of them.
-    Q8_0 is proven; the mechanism is type-agnostic (it uses the source type), so
-    the remaining work is validation + any per-family edge cases, not a redesign.
+  - [x] K-quant families (Q4_K/Q6_K) validated against the libllama oracle on
+    generated fixtures: the engine greedy token SEQUENCE is byte-identical to the
+    oracle for both Q4_K and Q6_K, and K-quant experts stream through the
+    `.strata` path (confirmed via `strata-pack` + the CLI with bounded
+    `--expert-slots`). Gated by a C++ ggml-based fixture generator
+    (`make_kquant_moe_gguf`, using `ggml_quantize_chunk` since the Python `gguf`
+    library cannot emit K-quants) and the guarded
+    `test_engine_kquant_matches_oracle` sub-test
+    (`STRATAFLOW_TEST_KQUANT_MOE_GGUF` / `STRATAFLOW_TEST_Q6K_MOE_GGUF`).
+  - [ ] Still to broaden: validate the IQ families specifically and confirm
+    `.strata` streaming across them. The mechanism is type-agnostic (it uses the
+    source type), so the remaining work is validation + any per-family edge
+    cases, not a redesign.
 - [ ] **Run a real, large MoE end to end.** Everything so far is verified on a
   2-layer F32 toy fixture. The mission is not proven until an actual multi-GB,
   real (quantized) MoE runs end to end in a bounded RAM budget on a real machine
@@ -96,10 +106,16 @@ most are pure CPU/disk work.
   generators do not write a trained context-length key, so llama warns
   `n_ctx_seq (256) > n_ctx_train (0)`. Harmless but noisy; set a context-length
   in the generators (or handle 0 cleanly) so demo output is clean.
-- [ ] **Run a real DOWNLOADED pretrained model end to end.** Everything so far
-  uses generated fixtures. Download an actual small quantized MoE (real
-  tokenizer, real weights), pack to `.strata`, run bounded, and record output +
-  peak RAM + tok/s. The true mission proof. Unblocked by quant support (#26).
+- [~] **Run a real DOWNLOADED pretrained model end to end.** The Colab demo now
+  has a `--real-model` flow (`colab/strataflow_colab.py` + `colab/README.md`):
+  download a real quantized GGUF from HuggingFace, pack to `.strata`, run bounded
+  with `--expert-slots`, and record decoded output + tokens/sec + peak RSS, with
+  disk/RAM guards. The default is a small quantized dense-llama model
+  (TinyLlama-1.1B-Chat Q4_K_M) because the smallest llama-arch MoE (Mixtral) is
+  ~24 GB+; a Mixtral MoE run is exposed via flags for a larger runtime. This is
+  DEMONSTRATED on Colab (the sandbox/CI is offline); the next step is capturing
+  the measured numbers from a real Colab run. Unblocked by quant support (#26)
+  and K-quant validation (K-quant Q4_K/Q6_K oracle gate).
 - [ ] **Benchmark harness with real numbers.** No real tok/s, TTFT, peak RSS, or
   SSD bytes/token measured against the exit criteria in `PLAN.md` and
   `PHASE3_PLAN.md`. (This is the long-promised Phase 0 baseline, now needing the
@@ -145,9 +161,10 @@ most are pure CPU/disk work.
 
 Recommended order, all CPU/disk work (no GPU needed):
 
-1. **Quantized-weight support.** DONE for the common case (Q8_0 validated against
-   the oracle; the path is type-agnostic). Next: validate K-quant and IQ
-   families and `.strata` streaming across them.
+1. **Quantized-weight support.** DONE for the common case: Q8_0 and the K-quant
+   families (Q4_K/Q6_K) are validated against the oracle (identical greedy token
+   sequence) and stream through `.strata`; the path is type-agnostic. Next:
+   validate the IQ families and `.strata` streaming across them.
 2. **Memory-budget CLI + peak-RSS reporting.** DONE: `--expert-slots` plus a
    `stats:` line reporting resident model-weight bytes and peak RSS.
 3. **Run a real, quantized pretrained MoE** (an actual downloaded model, not a

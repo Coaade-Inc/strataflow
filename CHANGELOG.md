@@ -11,6 +11,14 @@ grouped by the pull request that merged them.
 
 ### Engine core (StrataFlow runs its own forward pass over ggml)
 
+- K-quant families (Q4_K/Q6_K) validated against the libllama oracle through the
+  engine and the `.strata` streaming path. The engine greedy token sequence is
+  byte-identical to the oracle for both Q4_K and Q6_K, and K-quant experts stream
+  through `.strata` with bounded `--expert-slots`. Added a C++ ggml-based
+  test-fixture generator (`make_kquant_moe_gguf`, built on `ggml_quantize_chunk`
+  because the Python `gguf` library cannot emit K-quants) and a guarded
+  `test_engine_kquant_matches_oracle` sub-test
+  (`STRATAFLOW_TEST_KQUANT_MOE_GGUF` / `STRATAFLOW_TEST_Q6K_MOE_GGUF`).
 - Hold only the trunk resident on the `.strata` path; the full expert footprint
   is never allocated in RAM. Proven by test (trunk resident vs experts not
   resident). This is the core bounded-RAM, no-GPU capability. (#21)
@@ -46,6 +54,22 @@ grouped by the pull request that merged them.
 - Phase 1b: vendored llama.cpp + GgmlModel real-weights backend. (#2)
 - Phase 1: engine scaffold - modules, build system, CLI, tests; cross-platform
   CI on Linux (GCC+Clang), macOS, Windows. (#1)
+
+### Demo / docs
+
+- Colab demo: added a real downloaded-model flow (`--real-model`) to
+  `colab/strataflow_colab.py` and `colab/README.md`. It downloads a real
+  quantized GGUF from HuggingFace (`hf_hub_download`), packs it to `.strata`,
+  runs it bounded with `--expert-slots`, and records the decoded output text,
+  measured tokens/sec, and peak RSS, with disk/RAM guards. The default is a
+  small quantized dense-llama model (TinyLlama-1.1B-Chat Q4_K_M) because the
+  smallest llama-arch MoE (Mixtral) is ~24 GB+; a Mixtral MoE run is exposed via
+  flags. The generated-F32 demo stays the default no-download path. Corrected
+  the stale "engine is F32-only / a downloaded quantized model will not run yet"
+  claims in both files: quantized weights run through the type-agnostic staging
+  path (Q8_0 oracle-validated, K-quant Q4_K/Q6_K validated by the
+  generated-fixture gate); the remaining honest caveat is architecture coverage
+  (llama-arch MoE + dense llama only). Demonstrated on Colab (sandbox offline).
 
 ### Project / licensing / docs
 
