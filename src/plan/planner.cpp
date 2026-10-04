@@ -60,11 +60,12 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
         plan.expert_slots_ram =
             static_cast<uint32_t>(ram / model.expert_bytes);
 
-        const uint64_t total_experts =
-            uint64_t(model.n_experts) * model.n_layers;
-        const uint64_t cacheable =
-            uint64_t(plan.expert_slots_vram) + plan.expert_slots_ram;
-        plan.stream_experts = cacheable < total_experts;
+        // The engine (the only inference path) ALWAYS streams MoE experts
+        // through the bounded per-layer staging buffer - it never holds the
+        // whole expert set resident, regardless of how much would "fit". So the
+        // plan reports experts as streamed for any MoE. (The slot counts above
+        // are the cache capacity the budget could support, kept for sizing.)
+        plan.stream_experts = true;
     }
 
     // Peak estimate. When experts stream, the engine does NOT hold the full
