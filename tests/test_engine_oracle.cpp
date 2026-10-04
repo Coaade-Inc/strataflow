@@ -387,11 +387,65 @@ static void test_engine_prefetch_hit_rate() {
     CHECK(st.prefetch_hit_rate() > 0.0);
 }
 
+// EC-7: a DENSE llama model (no experts; plain gate/up/down FFN) decodes
+// through the engine's dense path and matches the oracle token sequence. Proves
+// the arch generalization beyond MoE. Guarded on STRATAFLOW_TEST_DENSE_GGUF
+// (generate with tools/testdata/make_tiny_dense_gguf.py).
+static void test_engine_dense_matches_oracle() {
+    const char *path = std::getenv("STRATAFLOW_TEST_DENSE_GGUF");
+    if (path == nullptr || path[0] == '\0') {
+        std::printf("[skipped: set STRATAFLOW_TEST_DENSE_GGUF] ");
+        return;
+    }
+
+    const std::string prompt = "hello world";
+    const int n_generate = 8;
+
+    std::vector<int32_t> oracle_tokens;
+    std::vector<std::vector<float>> oracle_step_logits;
+    CHECK(engine::run_oracle_sequence(path, prompt, n_generate, oracle_tokens,
+                                      &oracle_step_logits));
+
+    engine::EngineCacheStats st{};
+    std::vector<std::vector<float>> eng_logits;
+    std::vector<int32_t> toks =
+        engine_decode_sequence(path, prompt, n_generate, /*slots=*/0, st, eng_logits);
+
+    bool seq_match = toks.size() == oracle_tokens.size();
+    double max_delta = 0.0;
+    const size_t steps = oracle_step_logits.size() < eng_logits.size()
+                             ? oracle_step_logits.size()
+                             : eng_logits.size();
+    for (size_t s = 0; s < steps; ++s) {
+        const size_t n = oracle_step_logits[s].size() < eng_logits[s].size()
+                             ? oracle_step_logits[s].size()
+                             : eng_logits[s].size();
+        for (size_t i = 0; i < n; ++i) {
+            const double d = std::fabs(static_cast<double>(oracle_step_logits[s][i]) -
+                                       static_cast<double>(eng_logits[s][i]));
+            if (d > max_delta) max_delta = d;
+        }
+    }
+    for (size_t i = 0; i < toks.size() && i < oracle_tokens.size(); ++i) {
+        CHECK_EQ(toks[i], oracle_tokens[i]);
+        if (toks[i] != oracle_tokens[i]) seq_match = false;
+    }
+
+    std::printf("[dense seq match=%s n=%d max per-step |delta|=%.3e tokens:",
+                seq_match ? "yes" : "no", n_generate, max_delta);
+    for (size_t i = 0; i < toks.size(); ++i) std::printf(" %d", toks[i]);
+    std::printf("] ");
+
+    CHECK(seq_match);
+    CHECK(max_delta < 1e-3);
+}
+
 static void run_all() {
     RUN(test_engine_matches_oracle);
     RUN(test_engine_sequence_matches_oracle);
     RUN(test_engine_bounded_pool_byte_identical);
     RUN(test_engine_prefetch_hit_rate);
+    RUN(test_engine_dense_matches_oracle);
 }
 
 TEST_MAIN()

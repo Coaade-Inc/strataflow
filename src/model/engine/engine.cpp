@@ -72,6 +72,7 @@ struct Engine::Impl {
     gguf_context *gc   = nullptr;
     ggml_context *wctx = nullptr;  // full weight tensors, resident (backing store)
     EngineHParams hp;
+    bool is_moe = true;            // EC-7: false for a dense llama FFN
 
     ggml_context *kvctx = nullptr;              // KV cache tensors, resident
     ggml_backend_buffer_t kvbuf = nullptr;      // backing buffer for kvctx
@@ -334,27 +335,51 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
 
     ggml_tensor *tok_embd = get_weight(im.wctx, "token_embd.weight");
     ggml_tensor *out_w    = get_weight(im.wctx, "output.weight");
-    ggml_tensor *ge0      = get_weight(im.wctx, "blk.0.ffn_gate_exps.weight");
-    if (tok_embd == nullptr || out_w == nullptr || ge0 == nullptr) {
+    if (tok_embd == nullptr || out_w == nullptr) {
         return nullptr;
     }
 
+    // EC-7: a dense llama model (expert_count 0/absent) has a plain FFN
+    // (ffn_gate/up/down.weight); a MoE model has a router + stacked experts
+    // (ffn_gate_exps.weight). Detect which by the layer-0 FFN tensors. Probe
+    // with ggml_get_tensor directly (not get_weight) so an expected absence is
+    // not logged as an error.
+    ggml_tensor *ge0  = ggml_get_tensor(im.wctx, "blk.0.ffn_gate_exps.weight");
+    ggml_tensor *dg0  = ggml_get_tensor(im.wctx, "blk.0.ffn_gate.weight");
+    im.is_moe = (ge0 != nullptr && hp.n_expert > 0);
+
     hp.n_vocab = static_cast<int>(tok_embd->ne[1]);
     if (hp.n_embd == 0) hp.n_embd = static_cast<int>(tok_embd->ne[0]);
-    hp.n_ff    = static_cast<int>(ge0->ne[1]);  // gate_exps ne = [n_embd, n_ff, n_expert]
 
-    if (hp.n_head <= 0 || hp.n_layer <= 0 || hp.n_embd <= 0 ||
-        hp.n_expert <= 0 || hp.n_expert_used <= 0) {
+    if (hp.n_head <= 0 || hp.n_layer <= 0 || hp.n_embd <= 0) {
         log_warn("engine: incomplete hparams; staying on libllama path");
         return nullptr;
     }
     hp.head_dim = hp.n_embd / hp.n_head;
 
-    // Validate the expert-tensor ne-order against the design doc (6.2) so a
-    // layout surprise is caught here, not as a wrong logit later.
-    if (ge0->ne[0] != hp.n_embd || ge0->ne[2] != hp.n_expert) {
-        log_warn("engine: ffn_gate_exps shape mismatch; staying on libllama path");
-        return nullptr;
+    if (im.is_moe) {
+        if (hp.n_expert_used <= 0) {
+            log_warn("engine: MoE with no expert_used_count; staying on libllama path");
+            return nullptr;
+        }
+        hp.n_ff = static_cast<int>(ge0->ne[1]);  // gate_exps ne = [n_embd, n_ff, n_expert]
+        // Validate the expert-tensor ne-order (design 6.2) so a layout surprise
+        // is caught here, not as a wrong logit later.
+        if (ge0->ne[0] != hp.n_embd || ge0->ne[2] != hp.n_expert) {
+            log_warn("engine: ffn_gate_exps shape mismatch; staying on libllama path");
+            return nullptr;
+        }
+    } else {
+        // Dense FFN: ffn_gate/up ne = [n_embd, n_ff], ffn_down ne = [n_ff, n_embd].
+        if (dg0 == nullptr) {
+            log_warn("engine: no dense FFN and no experts; staying on libllama path");
+            return nullptr;
+        }
+        hp.n_ff = static_cast<int>(dg0->ne[1]);
+        if (dg0->ne[0] != hp.n_embd) {
+            log_warn("engine: ffn_gate shape mismatch; staying on libllama path");
+            return nullptr;
+        }
     }
 
     // Bound the KV cache by the trained context length (n_ctx). The fixture
@@ -408,8 +433,9 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     // ggml_mul_mat_id addresses expert cur_a at the same cur_a*nb02 offset; we
     // populate only the routed slices each token. One slot of the pool holds
     // one expert's gate|up|down bytes, so a pool sized below n_expert bounds
-    // resident expert RAM to that many bundles.
-    {
+    // resident expert RAM to that many bundles. Dense models (EC-7) have no
+    // experts, so this whole block is MoE-only.
+    if (im.is_moe) {
         ggml_tensor *g0 = ggml_get_tensor(im.wctx, "blk.0.ffn_gate_exps.weight");
         ggml_tensor *u0 = ggml_get_tensor(im.wctx, "blk.0.ffn_up_exps.weight");
         ggml_tensor *d0 = ggml_get_tensor(im.wctx, "blk.0.ffn_down_exps.weight");
@@ -482,8 +508,11 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     }
 
     // EC-6: statistical expert predictor for prefetch warming (section 3.5).
-    im.predictor.reset(new ExpertPredictor(static_cast<uint32_t>(hp.n_layer),
-                                           static_cast<uint32_t>(hp.n_expert)));
+    // MoE-only (a dense model routes nothing).
+    if (im.is_moe) {
+        im.predictor.reset(new ExpertPredictor(static_cast<uint32_t>(hp.n_layer),
+                                               static_cast<uint32_t>(hp.n_expert)));
+    }
 
     // One CPU backend + gallocr for the engine's lifetime (1 thread for the
     // greedy-determinism contract). Reused across every segment and token.
@@ -499,12 +528,20 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         return nullptr;
     }
 
-    log_info("engine: loaded llama-arch MoE (" + std::to_string(hp.n_layer) +
-             " layers, " + std::to_string(hp.n_expert) + "x" +
-             std::to_string(hp.n_expert_used) + " experts, n_embd=" +
-             std::to_string(hp.n_embd) + ", n_vocab=" +
-             std::to_string(hp.n_vocab) + ", n_ctx=" + std::to_string(n_ctx) +
-             ")");
+    if (im.is_moe) {
+        log_info("engine: loaded llama-arch MoE (" + std::to_string(hp.n_layer) +
+                 " layers, " + std::to_string(hp.n_expert) + "x" +
+                 std::to_string(hp.n_expert_used) + " experts, n_embd=" +
+                 std::to_string(hp.n_embd) + ", n_vocab=" +
+                 std::to_string(hp.n_vocab) + ", n_ctx=" + std::to_string(n_ctx) +
+                 ")");
+    } else {
+        log_info("engine: loaded llama-arch dense (" + std::to_string(hp.n_layer) +
+                 " layers, n_embd=" + std::to_string(hp.n_embd) + ", n_ff=" +
+                 std::to_string(hp.n_ff) + ", n_vocab=" +
+                 std::to_string(hp.n_vocab) + ", n_ctx=" + std::to_string(n_ctx) +
+                 ")");
+    }
     return eng;
 }
 
@@ -538,6 +575,90 @@ bool run_segment(ggml_backend_t backend, ggml_gallocr_t galloc,
         ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
     if (!compute_ok) log_error("engine: graph compute failed");
     return compute_ok;
+}
+
+// EC-7: build one DENSE llama layer as a single segment (no router/experts, so
+// no mid-layer host read-back): attn + residual + ffn_norm + plain gate/up/down
+// FFN (swiglu) + residual. The attention block is intentionally identical to
+// build_router_segment's (duplicated rather than shared, to keep the proven MoE
+// path untouched). Returns the layer output [n_embd, n_tokens] (set as output);
+// KV stores are appended to `graph_stores` so run_segment roots them.
+ggml_tensor *build_dense_layer_segment(ggml_context *gctx, ggml_tensor *inpL,
+                                       ggml_tensor *inp_pos, int il,
+                                       ggml_context *wctx, const EngineHParams &hp,
+                                       ggml_tensor *k_cache, ggml_tensor *v_cache,
+                                       ggml_tensor *kq_mask, int64_t pos,
+                                       int64_t n_kv,
+                                       std::vector<ggml_tensor *> &graph_stores) {
+    const std::string p = "blk." + std::to_string(il) + ".";
+    ggml_tensor *attn_norm_w = ggml_get_tensor(wctx, (p + "attn_norm.weight").c_str());
+    ggml_tensor *wq          = ggml_get_tensor(wctx, (p + "attn_q.weight").c_str());
+    ggml_tensor *wk          = ggml_get_tensor(wctx, (p + "attn_k.weight").c_str());
+    ggml_tensor *wv          = ggml_get_tensor(wctx, (p + "attn_v.weight").c_str());
+    ggml_tensor *wo          = ggml_get_tensor(wctx, (p + "attn_output.weight").c_str());
+    ggml_tensor *ffn_norm_w  = ggml_get_tensor(wctx, (p + "ffn_norm.weight").c_str());
+    ggml_tensor *w_gate      = ggml_get_tensor(wctx, (p + "ffn_gate.weight").c_str());
+    ggml_tensor *w_up        = ggml_get_tensor(wctx, (p + "ffn_up.weight").c_str());
+    ggml_tensor *w_down      = ggml_get_tensor(wctx, (p + "ffn_down.weight").c_str());
+
+    const int64_t n_tokens = inpL->ne[1];
+    ggml_tensor *inpSA = inpL;
+
+    ggml_tensor *cur = ggml_rms_norm(gctx, inpL, hp.rms_eps);
+    cur = ggml_mul(gctx, cur, attn_norm_w);
+
+    ggml_tensor *Qcur = ggml_mul_mat(gctx, wq, cur);
+    ggml_tensor *Kcur = ggml_mul_mat(gctx, wk, cur);
+    ggml_tensor *Vcur = ggml_mul_mat(gctx, wv, cur);
+    Qcur = ggml_reshape_3d(gctx, Qcur, hp.head_dim, hp.n_head,    n_tokens);
+    Kcur = ggml_reshape_3d(gctx, Kcur, hp.head_dim, hp.n_head_kv, n_tokens);
+    Vcur = ggml_reshape_3d(gctx, Vcur, hp.head_dim, hp.n_head_kv, n_tokens);
+    Qcur = ggml_rope_ext(gctx, Qcur, inp_pos, nullptr, hp.head_dim,
+                         GGML_ROPE_TYPE_NORMAL, hp.n_ctx_orig, hp.freq_base,
+                         hp.freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+    Kcur = ggml_rope_ext(gctx, Kcur, inp_pos, nullptr, hp.head_dim,
+                         GGML_ROPE_TYPE_NORMAL, hp.n_ctx_orig, hp.freq_base,
+                         hp.freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    const size_t kv_col_nb = k_cache->nb[2];
+    ggml_tensor *k_dst = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
+                                      n_tokens, k_cache->nb[1], k_cache->nb[2],
+                                      static_cast<size_t>(pos) * kv_col_nb);
+    ggml_tensor *v_dst = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
+                                      n_tokens, v_cache->nb[1], v_cache->nb[2],
+                                      static_cast<size_t>(pos) * v_cache->nb[2]);
+    graph_stores.push_back(ggml_cpy(gctx, Kcur, k_dst));
+    graph_stores.push_back(ggml_cpy(gctx, Vcur, v_dst));
+
+    ggml_tensor *k_hist = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
+                                       n_kv, k_cache->nb[1], k_cache->nb[2], 0);
+    ggml_tensor *v_hist = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
+                                       n_kv, v_cache->nb[1], v_cache->nb[2], 0);
+    ggml_tensor *q = ggml_permute(gctx, Qcur, 0, 2, 1, 3);
+    ggml_tensor *k = ggml_cont(gctx, ggml_permute(gctx, k_hist, 0, 2, 1, 3));
+    ggml_tensor *v = ggml_cont(gctx, ggml_permute(gctx, v_hist, 0, 2, 1, 3));
+    ggml_tensor *kq = ggml_mul_mat(gctx, k, q);
+    ggml_prec_set_acc(kq, GGML_PREC_F32);
+    const float kq_scale = 1.0f / std::sqrt(static_cast<float>(hp.head_dim));
+    kq = ggml_soft_max_ext(gctx, kq, kq_mask, kq_scale, 0.0f);
+    ggml_tensor *vt = ggml_cont(gctx, ggml_transpose(gctx, v));
+    ggml_tensor *kqv = ggml_mul_mat(gctx, vt, kq);
+    kqv = ggml_permute(gctx, kqv, 0, 2, 1, 3);
+    cur = ggml_cont_2d(gctx, kqv, hp.head_dim * hp.n_head, n_tokens);
+    cur = ggml_mul_mat(gctx, wo, cur);
+    ggml_tensor *ffn_inp = ggml_add(gctx, cur, inpSA);
+
+    cur = ggml_rms_norm(gctx, ffn_inp, hp.rms_eps);
+    cur = ggml_mul(gctx, cur, ffn_norm_w);
+
+    // Dense FFN: swiglu(gate(cur), up(cur)) -> down, then residual.
+    ggml_tensor *gate = ggml_mul_mat(gctx, w_gate, cur);
+    ggml_tensor *up   = ggml_mul_mat(gctx, w_up, cur);
+    ggml_tensor *act  = ggml_swiglu_split(gctx, gate, up);
+    ggml_tensor *down = ggml_mul_mat(gctx, w_down, act);
+    ggml_tensor *layer_out = ggml_cont(gctx, ggml_add(gctx, down, ffn_inp));
+    ggml_set_output(layer_out);
+    return layer_out;
 }
 
 // Build the ROUTER segment for one layer (section 3.2 step 1): attn + residual
@@ -946,6 +1067,41 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     // Per-layer SEGMENTED execution (section 3.2): router segment -> host read
     // back top-k ids -> make resident -> expert segment.
     for (int il = 0; il < hp.n_layer; ++il) {
+        // --- EC-7: dense layer runs as ONE segment (no router read-back) ---
+        if (!im.is_moe) {
+            ggml_context *gctx = new_segment_ctx();
+            if (gctx == nullptr) { log_error("engine: ggml_init failed"); return false; }
+            ggml_tensor *inpL = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hp.n_embd, 1);
+            ggml_set_input(inpL);
+            ggml_tensor *inp_pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+            ggml_set_input(inp_pos);
+            ggml_tensor *kq_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_kv, 1);
+            ggml_set_input(kq_mask);
+
+            std::vector<ggml_tensor *> stores;
+            ggml_tensor *layer_out = build_dense_layer_segment(
+                gctx, inpL, inp_pos, il, im.wctx, hp,
+                im.k_cache[static_cast<size_t>(il)],
+                im.v_cache[static_cast<size_t>(il)], kq_mask, pos, n_kv, stores);
+
+            std::vector<ggml_tensor *> roots = stores;
+            roots.push_back(layer_out);
+            const bool ok = run_segment(im.backend, im.galloc, gctx, roots, [&]() {
+                ggml_backend_tensor_set(inpL, hidden.data(), 0, embd * sizeof(float));
+                int32_t pi = pos;
+                ggml_backend_tensor_set(inp_pos, &pi, 0, sizeof(pi));
+                std::vector<float> mask(static_cast<size_t>(n_kv), 0.0f);
+                ggml_backend_tensor_set(kq_mask, mask.data(), 0,
+                                        mask.size() * sizeof(float));
+            });
+            if (ok) {
+                ggml_backend_tensor_get(layer_out, hidden.data(), 0, embd * sizeof(float));
+            }
+            ggml_free(gctx);
+            if (!ok) return false;
+            continue;
+        }
+
         std::vector<float> cur_host(embd, 0.0f);
         std::vector<float> ffn_inp_host(embd, 0.0f);
         std::vector<float> w_host(n_used, 0.0f);
@@ -1096,12 +1252,15 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     im.kv->advance(1);
 
     // Surface the pool's cache stats (hits/misses/evictions) to the engine.
-    const CacheStats &cs = im.pool->stats();
-    im.cstats.hits      = cs.hits;
-    im.cstats.misses    = cs.misses;
-    im.cstats.evictions = cs.evictions;
-    im.cstats.prefetch_warmed = im.prefetch_warmed;  // EC-6
-    im.cstats.prefetch_used   = im.prefetch_used;
+    // Dense models (EC-7) have no expert pool, so there is nothing to surface.
+    if (im.pool != nullptr) {
+        const CacheStats &cs = im.pool->stats();
+        im.cstats.hits      = cs.hits;
+        im.cstats.misses    = cs.misses;
+        im.cstats.evictions = cs.evictions;
+        im.cstats.prefetch_warmed = im.prefetch_warmed;  // EC-6
+        im.cstats.prefetch_used   = im.prefetch_used;
+    }
     return true;
 }
 
