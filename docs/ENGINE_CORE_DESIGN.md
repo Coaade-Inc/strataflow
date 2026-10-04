@@ -210,7 +210,7 @@ Per `spike/engine_core/spike_engine.cpp`, verified against the oracle:
    a. `cur = ggml_mul(ggml_rms_norm(inpL, 1e-5), attn_norm_w)`.
    b. `Q/K/V = ggml_mul_mat(wq/wk/wv, cur)`; reshape to `[head_dim, n_head(_kv), 1]`.
    c. `ggml_rope_ext(Q, inp_pos, NULL, head_dim=8, GGML_ROPE_TYPE_NORMAL, n_ctx_orig=64, freq_base=10000, freq_scale=1, 0, 1, 0, 0)`; same for K.
-   d. permute to `[head_dim, n_tokens, n_head]`; `kq = ggml_mul_mat(k, q)`; `ggml_soft_max_ext(kq, NULL, 1/sqrt(8), 0)`; `kqv = ggml_mul_mat(cont(transpose(v)), kq)`; permute back; `ggml_cont_2d` to `[n_embd, 1]`.
+   d. attention, mirroring the non-flash (explicit) branch of `build_attn_mha` in `third_party/llama.cpp/src/llama-graph.cpp` (the `else` branch, ~lines 2692-2748): permute to `[head_dim, n_tokens, n_head]`; `kq = ggml_mul_mat(k, q)`; `ggml_soft_max_ext(kq, NULL, 1/sqrt(8), 0)`; `kqv = ggml_mul_mat(cont(transpose(v)), kq)`; permute back; `ggml_cont_2d` to `[n_embd, 1]`. The reference forces `GGML_PREC_F32` accumulation on `kq` in that branch, which the spike's F32 compute matches.
    e. `cur = ggml_mul_mat(wo, cur)`; `ffn_inp = ggml_add(cur, inpL)` (residual).
    f. `cur = ggml_mul(ggml_rms_norm(ffn_inp, 1e-5), ffn_norm_w)`.
    g. MoE: `router = ggml_mul_mat(gate_inp, cur)`; `probs = ggml_soft_max(router)`; `selected = ggml_argsort_top_k(probs, 2)`; weights via `ggml_get_rows` of reshaped probs, normalized by `ggml_div` over `ggml_clamp(ggml_sum_rows(weights), 6.103515625e-5, INFINITY)`; `up = ggml_mul_mat_id(up_exps, cur3, selected)`; `gate = ggml_mul_mat_id(gate_exps, cur3, selected)`; `act = ggml_swiglu_split(gate, up)`; `experts = ggml_mul_mat_id(down_exps, act, selected)`; `ggml_mul` by weights; sum over the `n_expert_used` dim via `ggml_view_2d` + `ggml_add`.
@@ -247,7 +247,7 @@ The spike (`spike/engine_core/`, binary gitignored) ran the full forward (both l
 - **mean absolute logit delta = 1.2078e-5**
 - deterministic: identical numbers across repeated runs (1 CPU thread)
 
-The ~5e-5 residual is non-bit-exact and expected: the oracle `llama_decode` path uses fused flash attention (`ggml_flash_attn_ext`, F16 intermediates) while the engine graph uses explicit F32 `ggml_mul_mat` + `ggml_soft_max_ext` + `ggml_mul_mat` attention. The agreement to 5e-5 confirms the math is equivalent, including the riskiest part, the MoE top-2 routing through `ggml_mul_mat_id` over the stacked expert tensors. No divergence was found. This is the evidence base for proceeding.
+The ~5e-5 residual is non-bit-exact and expected. It is NOT caused by flash attention: the spike includes a probe that re-runs the oracle with flash attention forced off (`flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED`) and compares to the default (`AUTO`) run; on this CPU/F32 fixture the two oracle logit vectors are byte-identical (max delta 0), so flash attention is not selected in a way that affects the result and cannot be the residual source here. The residual instead comes from op ordering / fusion / accumulation differences between our hand-built graph and llama's graph builder (both run explicit F32 attention; the reference path forces `GGML_PREC_F32` accumulation on `kq`). The agreement to 5e-5 confirms the math is equivalent, including the riskiest part, the MoE top-2 routing through `ggml_mul_mat_id` over the stacked expert tensors. No divergence was found. This is the evidence base for proceeding.
 
 ### 7.3 CI test
 

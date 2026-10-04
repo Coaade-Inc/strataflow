@@ -18,6 +18,9 @@ pass" (see docs/TASK5_DESIGN.md, docs/PHASE3_PLAN.md).
    (CPU, 1 thread), decodes a single BOS token at position 0 with one
    `llama_decode`, and captures the full logits (`llama_get_logits_ith(ctx,-1)`)
    and greedy argmax. Logits are also written to `/projects/sandbox/oracle_logits.bin`.
+   The oracle is run twice: once with the default `flash_attn_type = AUTO` and
+   once with it forced to `DISABLED`, so the spike can check whether flash
+   attention changes the oracle result at all (a probe for the residual source).
 2. ENGINE: opens the gguf a second time with `gguf_init_from_file(no_alloc=false)`
    so ggml allocates and fills every tensor, fetches each weight by its GGUF name
    (`token_embd.weight`, `output_norm.weight`, `output.weight`, and per layer
@@ -74,12 +77,19 @@ final norm + lm_head), NOT the single-block fallback.
 PASS (`SPIKE PASS`, exit 0): the engine's own ggml graph reproduces llama's
 greedy argmax exactly and the full logit vector to ~5e-5. No divergence found.
 
-The tiny residual delta (~5e-5, not bit-exact) is expected and benign: the oracle
-`llama_decode` path uses flash attention (fused `ggml_flash_attn_ext`, F16
-intermediates) while the engine graph uses the explicit
-`mul_mat` + `soft_max_ext` + `mul_mat` attention in F32. The agreement to 5e-5
-confirms the math is equivalent, including the MoE top-2 routing through
-`ggml_mul_mat_id` over the stacked expert tensors - the part most at risk.
+The tiny residual delta (~5e-5, not bit-exact) is expected and benign. It is NOT
+caused by flash attention. The spike includes a probe: it re-runs the oracle with
+flash attention forced off (`flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED`)
+and compares to the default `AUTO` run. On this CPU/F32 fixture the two oracle
+logit vectors are byte-identical (max delta 0.000000000), so flash attention is
+not selected in a way that affects the result and cannot be the residual source
+here. The residual instead comes from op ordering / fusion / accumulation
+differences between the hand-built graph and llama's graph builder (both run
+explicit F32 `mul_mat` + `soft_max_ext` + `mul_mat` attention; the reference
+non-flash `build_attn_mha` branch forces `GGML_PREC_F32` accumulation on `kq`).
+The agreement to 5e-5 confirms the math is equivalent, including the MoE top-2
+routing through `ggml_mul_mat_id` over the stacked expert tensors - the part most
+at risk.
 
 ## Divergence instrumentation
 

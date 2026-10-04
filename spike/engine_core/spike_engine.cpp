@@ -7,7 +7,10 @@
 // This TU does three things on the SAME gguf, prompt and position:
 //   1. ORACLE: load via llama_model_load_from_file + llama_init_from_model,
 //      run ONE llama_decode for the first token, capture full logits and the
-//      greedy argmax. Writes logits to a side file for the record.
+//      greedy argmax. Writes logits to a side file for the record. The oracle
+//      is also re-run with flash attention FORCED OFF (a probe) and the two
+//      logit vectors are compared to check whether flash attention is the
+//      source of the small engine-vs-oracle residual.
 //   2. ENGINE: open the gguf a second time with no_alloc=false so ggml fills a
 //      context with all tensors, fetch each weight by GGUF name, and build a
 //      ggml_cgraph by hand that mirrors third_party/llama.cpp/src/models/llama.cpp
@@ -94,7 +97,11 @@ struct OracleResult {
     llama_token token = 0;  // the single prompt token we decode at position 0
 };
 
-static bool run_oracle(const char *path, OracleResult &out) {
+// flash_attn_type selects the oracle's attention path. Default is AUTO (the
+// llama_context_default_params value); pass DISABLED/ENABLED to force it and
+// probe whether flash attention is the source of the engine-vs-oracle residual.
+static bool run_oracle(const char *path, OracleResult &out,
+                       llama_flash_attn_type flash_attn_type) {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
@@ -103,6 +110,7 @@ static bool run_oracle(const char *path, OracleResult &out) {
 
     const llama_vocab *vocab = llama_model_get_vocab(model);
     llama_context_params cp = llama_context_default_params();
+    cp.flash_attn_type = flash_attn_type;  // probe: force the oracle's FA path
     cp.n_ctx = N_CTX_ORIG;
     cp.n_threads = 1;        // determinism
     cp.n_threads_batch = 1;
@@ -126,10 +134,13 @@ static bool run_oracle(const char *path, OracleResult &out) {
     out.logits.assign(logits, logits + out.n_vocab);
     out.argmax = argmax(out.logits.data(), out.n_vocab);
 
-    FILE *f = std::fopen("/projects/sandbox/oracle_logits.bin", "wb");
-    if (f) { std::fwrite(out.logits.data(), sizeof(float), out.n_vocab, f); std::fclose(f); }
+    if (flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+        FILE *f = std::fopen("/projects/sandbox/oracle_logits.bin", "wb");
+        if (f) { std::fwrite(out.logits.data(), sizeof(float), out.n_vocab, f); std::fclose(f); }
+    }
 
-    printf("ORACLE: token(pos0)=%d  argmax=%d  n_vocab=%d\n", out.token, out.argmax, out.n_vocab);
+    printf("ORACLE: flash_attn_type requested=%s  token(pos0)=%d  argmax=%d  n_vocab=%d\n",
+           llama_flash_attn_type_name(flash_attn_type), out.token, out.argmax, out.n_vocab);
     print_top5("oracle", out.logits.data(), out.n_vocab);
 
     llama_free(ctx);
@@ -359,8 +370,28 @@ static bool run_engine(const char *path, llama_token token, EngineResult &out) {
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : "/projects/sandbox/moe.gguf";
 
+    // Primary oracle: AUTO flash-attn (the llama_context_default_params value).
     OracleResult oracle;
-    if (!run_oracle(path, oracle)) { printf("SPIKE FAIL (oracle)\n"); return 1; }
+    if (!run_oracle(path, oracle, LLAMA_FLASH_ATTN_TYPE_AUTO)) { printf("SPIKE FAIL (oracle)\n"); return 1; }
+
+    // Flash-attn probe: re-run the oracle with flash attention FORCED OFF and
+    // compare to the AUTO run. If the two oracle logit vectors are identical,
+    // flash attention (and its F16 intermediates) is NOT the source of the
+    // engine-vs-oracle residual on this CPU/F32 fixture, so the residual must
+    // come from op ordering/fusion differences instead. This verifies the
+    // attribution the design doc makes rather than asserting it.
+    OracleResult oracle_nofa;
+    if (!run_oracle(path, oracle_nofa, LLAMA_FLASH_ATTN_TYPE_DISABLED)) { printf("SPIKE FAIL (oracle no-FA probe)\n"); return 1; }
+    double oracle_fa_delta = 0.0;
+    if ((int)oracle_nofa.logits.size() == oracle.n_vocab) {
+        for (int i = 0; i < oracle.n_vocab; ++i) {
+            double d = std::fabs((double)oracle.logits[i] - (double)oracle_nofa.logits[i]);
+            if (d > oracle_fa_delta) oracle_fa_delta = d;
+        }
+    }
+    printf("FLASH-ATTN PROBE: max|AUTO - DISABLED| oracle logit delta = %.9f%s\n",
+           oracle_fa_delta,
+           oracle_fa_delta == 0.0 ? "  (identical: flash-attn is NOT the residual source here)" : "");
 
     EngineResult engine;
     if (!run_engine(path, oracle.token, engine) || !engine.ok) {
@@ -389,6 +420,8 @@ int main(int argc, char **argv) {
     printf("  argmax match  = %s\n", match ? "yes" : "no");
     printf("  max |delta|   = %.9f\n", max_abs);
     printf("  mean|delta|   = %.9f\n", mean_abs);
+    printf("  oracle AUTO-vs-DISABLED FA delta = %.9f (flash-attn %s the residual source)\n",
+           oracle_fa_delta, oracle_fa_delta == 0.0 ? "is NOT" : "may be");
 
     // Report the engine's per-layer intermediate magnitudes. These are the hook
     // for localizing a divergence: if argmax mismatches, the first block whose
