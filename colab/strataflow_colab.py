@@ -75,8 +75,13 @@ def sh_capture(argv, cwd=None):
     showing the user everything as it happens.
     """
     print("\n$ " + " ".join(shlex.quote(a) for a in argv))
+    # errors="replace": a random-weight generated model can emit raw byte
+    # tokens that are not valid UTF-8; decode them leniently so capture never
+    # crashes. Real models produce valid UTF-8, so this only matters for the
+    # generated demo/bench path.
     proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
-                            stderr=sys.stderr, text=True, bufsize=1)
+                            stderr=sys.stderr, text=True, bufsize=1,
+                            errors="replace")
     lines = []
     for line in proc.stdout:
         sys.stdout.write(line)
@@ -86,27 +91,64 @@ def sh_capture(argv, cwd=None):
     return proc.returncode, "".join(lines)
 
 
-def parse_cli_output(captured):
-    """Extract (decoded_text, resident_mib, peak_rss_mib) from CLI stdout.
+def parse_cli_stats(captured):
+    """Parse the StrataFlow CLI stdout into a dict of every field it reports.
 
-    `decoded` is None if NO 'output:' line was seen at all (a parse failure the
-    caller must flag); it is "" only if the CLI emitted an empty 'output:' line.
+    This is the ONE place the CLI stdout format is parsed; both this module and
+    colab/strataflow_bench.py use it so the parsing never drifts between the two.
+
+    Returns a dict with keys:
+      decoded      - decoded text, or None if NO 'output:' line was seen at all
+                     (a parse failure the caller must flag); "" means the CLI
+                     emitted an empty 'output:' line.
+      resident_mib - resident model weights (MiB), or None if absent.
+      peak_mib     - peak RSS (MiB), or None if absent.
+      ttft_ms      - time-to-first-token (ms), or None if absent (FEAT-002:
+                     only printed when a first token was produced).
+      streamed_mib - SSD streamed bytes (MiB), or None if absent (FEAT-002:
+                     only printed on the streaming .strata path, when > 0).
+
+    The resident/peak fields keep the exact wording from before FEAT-002, and
+    the TTFT/streamed fields are optional, so this parser works against both
+    old and new CLI builds.
     """
-    decoded = None
-    resident_mib = None
-    peak_mib = None
+    stats = {
+        "decoded": None,
+        "resident_mib": None,
+        "peak_mib": None,
+        "ttft_ms": None,
+        "streamed_mib": None,
+    }
     for line in captured.splitlines():
         if line.startswith("output:"):
             # Accept both 'output: <text>' and a bare 'output:' (empty decode).
             rest = line[len("output:"):]
-            decoded = rest[1:] if rest.startswith(" ") else rest
+            stats["decoded"] = rest[1:] if rest.startswith(" ") else rest
         m = re.search(r"resident model weights = ([0-9.]+) MiB", line)
         if m:
-            resident_mib = float(m.group(1))
+            stats["resident_mib"] = float(m.group(1))
         m = re.search(r"peak RSS = ([0-9.]+) MiB", line)
         if m:
-            peak_mib = float(m.group(1))
-    return decoded, resident_mib, peak_mib
+            stats["peak_mib"] = float(m.group(1))
+        m = re.search(r"TTFT = ([0-9.]+) ms", line)
+        if m:
+            stats["ttft_ms"] = float(m.group(1))
+        m = re.search(r"streamed = ([0-9.]+) MiB", line)
+        if m:
+            stats["streamed_mib"] = float(m.group(1))
+    return stats
+
+
+def parse_cli_output(captured):
+    """Extract (decoded_text, resident_mib, peak_rss_mib) from CLI stdout.
+
+    Backward-compatible 3-tuple wrapper around parse_cli_stats() for the
+    existing generated + --real-model flows. `decoded` is None if NO 'output:'
+    line was seen at all (a parse failure the caller must flag); it is "" only
+    if the CLI emitted an empty 'output:' line.
+    """
+    stats = parse_cli_stats(captured)
+    return stats["decoded"], stats["resident_mib"], stats["peak_mib"]
 
 
 def make_moe_gguf(path, n_layer, n_expert, n_embd=256, n_head=8, n_ff=512,

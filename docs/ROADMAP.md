@@ -116,10 +116,19 @@ most are pure CPU/disk work.
   DEMONSTRATED on Colab (the sandbox/CI is offline); the next step is capturing
   the measured numbers from a real Colab run. Unblocked by quant support (#26)
   and K-quant validation (K-quant Q4_K/Q6_K oracle gate).
-- [ ] **Benchmark harness with real numbers.** No real tok/s, TTFT, peak RSS, or
-  SSD bytes/token measured against the exit criteria in `PLAN.md` and
-  `PHASE3_PLAN.md`. (This is the long-promised Phase 0 baseline, now needing the
-  engine measured too.)
+- [~] **Benchmark harness with real numbers.** A harness now exists
+  (`colab/strataflow_bench.py` + Cells 9-10 in `colab/README.md`): it runs a
+  config MATRIX (model size x `--expert-slots`), measures per run tok/s, TTFT,
+  resident weights, peak RSS, on-disk `.strata` size, SSD streamed MiB and
+  bytes/token (TTFT + streamed-bytes are the FEAT-002 instrumentation), prints a
+  fixed-width table, and writes JSON + CSV artifacts. The GENERATED-F32 MoE path
+  is sandbox/CI-verified and demonstrates the Phase 3 criterion 1 "big model,
+  small RAM" (peak RSS/resident far below on-disk size and moving with
+  `--expert-slots`). Still [~], not [x]: the absolute tok/s ladder in `PLAN.md`
+  section 2 is for large REAL models on NVMe, so the generated toy's throughput
+  is a mechanism proxy only - real large-model throughput against that ladder
+  stays Colab/HW-demonstrated (optional `--real-model` row / a Mixtral quant on
+  a larger runtime), not proven in the offline sandbox/CI.
 
 ### Breadth and performance
 
