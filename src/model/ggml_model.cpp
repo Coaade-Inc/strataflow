@@ -216,15 +216,21 @@ public:
     int32_t eos_token() const override { return eos_; }
 
 private:
-    // Opt-in EC-1 path: run OUR OWN ggml graph for one token at position
+    // Opt-in engine path: run OUR OWN ggml graph for one token at position
     // n_past_ and take the greedy argmax. Returns the next token id, or -1 if
-    // the engine could not load/run (so forward() falls back to libllama). EC-1
-    // is a single-position forward with all experts resident and no KV history.
+    // the engine could not load/run (so forward() falls back to libllama).
+    //
+    // EC-2: the engine owns a KV cache, so this drives prefill-then-decode by
+    // position. n_past_ is the one-token-per-call cursor the sf::Model contract
+    // guarantees (same cursor the libllama path advances). When n_past_ == 0 we
+    // are at the start of a sequence, so reset the engine KV first; each call
+    // then appends `last_token` at n_past_ and attends over 0..n_past_.
     int32_t forward_engine(int32_t last_token) {
         if (engine_ == nullptr) {
             engine_ = engine::Engine::load(path_);
             if (engine_ == nullptr) return -1;  // arch unsupported / load failed
         }
+        if (n_past_ == 0) engine_->reset_kv();
         std::vector<float> logits;
         if (!engine_->forward(last_token, n_past_, logits) || logits.empty()) {
             return -1;
