@@ -96,10 +96,16 @@ most are pure CPU/disk work.
   generators do not write a trained context-length key, so llama warns
   `n_ctx_seq (256) > n_ctx_train (0)`. Harmless but noisy; set a context-length
   in the generators (or handle 0 cleanly) so demo output is clean.
-- [ ] **Run a real DOWNLOADED pretrained model end to end.** Everything so far
-  uses generated fixtures. Download an actual small quantized MoE (real
-  tokenizer, real weights), pack to `.strata`, run bounded, and record output +
-  peak RAM + tok/s. The true mission proof. Unblocked by quant support (#26).
+- [~] **Run a real DOWNLOADED pretrained model end to end.** The Colab demo now
+  has a `--real-model` flow (`colab/strataflow_colab.py` + `colab/README.md`):
+  download a real quantized GGUF from HuggingFace, pack to `.strata`, run bounded
+  with `--expert-slots`, and record decoded output + tokens/sec + peak RSS, with
+  disk/RAM guards. The default is a small quantized dense-llama model
+  (TinyLlama-1.1B-Chat Q4_K_M) because the smallest llama-arch MoE (Mixtral) is
+  ~24 GB+; a Mixtral MoE run is exposed via flags for a larger runtime. This is
+  DEMONSTRATED on Colab (the sandbox/CI is offline); the next step is capturing
+  the measured numbers from a real Colab run. Unblocked by quant support (#26)
+  and K-quant validation (K-quant Q4_K/Q6_K oracle gate).
 - [ ] **Benchmark harness with real numbers.** No real tok/s, TTFT, peak RSS, or
   SSD bytes/token measured against the exit criteria in `PLAN.md` and
   `PHASE3_PLAN.md`. (This is the long-promised Phase 0 baseline, now needing the

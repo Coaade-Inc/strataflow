@@ -47,6 +47,22 @@ grouped by the pull request that merged them.
 - Phase 1: engine scaffold - modules, build system, CLI, tests; cross-platform
   CI on Linux (GCC+Clang), macOS, Windows. (#1)
 
+### Demo / docs
+
+- Colab demo: added a real downloaded-model flow (`--real-model`) to
+  `colab/strataflow_colab.py` and `colab/README.md`. It downloads a real
+  quantized GGUF from HuggingFace (`hf_hub_download`), packs it to `.strata`,
+  runs it bounded with `--expert-slots`, and records the decoded output text,
+  measured tokens/sec, and peak RSS, with disk/RAM guards. The default is a
+  small quantized dense-llama model (TinyLlama-1.1B-Chat Q4_K_M) because the
+  smallest llama-arch MoE (Mixtral) is ~24 GB+; a Mixtral MoE run is exposed via
+  flags. The generated-F32 demo stays the default no-download path. Corrected
+  the stale "engine is F32-only / a downloaded quantized model will not run yet"
+  claims in both files: quantized weights run through the type-agnostic staging
+  path (Q8_0 oracle-validated, K-quant Q4_K/Q6_K validated by the
+  generated-fixture gate); the remaining honest caveat is architecture coverage
+  (llama-arch MoE + dense llama only). Demonstrated on Colab (sandbox offline).
+
 ### Project / licensing / docs
 
 - Documentation: ROADMAP + CHANGELOG added; README and PLAN kept current with

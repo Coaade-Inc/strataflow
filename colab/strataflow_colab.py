@@ -3,26 +3,45 @@
 #
 # What this proves on a real (CPU-only) machine:
 #   1. StrataFlow builds and runs its OWN ggml forward pass (not llama_decode).
-#   2. A larger-than-toy F32 MoE is packed to .strata and decoded with ONLY the
+#   2. A larger-than-toy MoE is packed to .strata and decoded with ONLY the
 #      trunk resident in RAM while experts stream from disk - the bounded-RAM,
 #      no-GPU mission - and the resident weight bytes are reported to prove it.
+#   3. A REAL downloaded, QUANTIZED model (via --real-model) runs end to end
+#      through the same path: download a GGUF, pack to .strata, decode bounded,
+#      and record output text + tokens/sec + peak RSS.
+#
+# Two flows:
+#   - Default (no flags / --layers / --experts): generate a larger-than-toy
+#     F32 MoE with random weights and stream it. No download, works offline.
+#   - --real-model: download a real quantized GGUF from HuggingFace, pack, and
+#     run it. Needs network + disk; see run_real_model() for model choice.
 #
 # Honest limits (read before running):
-#   - The engine today runs F32 llama-arch MoE and dense llama only. A downloaded
-#     QUANTIZED real model (Q4/Q6) will NOT run yet (the engine's staging tensors
-#     are F32). So this demo uses a generated F32 MoE that is genuinely larger
-#     than the unit-test fixture (hundreds of MB), which is the real exercise of
-#     the streaming path on real hardware.
+#   - Quantized weights run through the engine's TYPE-AGNOSTIC staging path:
+#     the per-layer expert staging tensors take the SOURCE expert tensor's real
+#     ggml type, so quantized experts stream and compute via ggml_mul_mat_id
+#     natively. Q8_0 is validated against the libllama oracle; K-quant (Q4_K /
+#     Q6_K) is validated by the generated-fixture oracle gate. The remaining
+#     honest caveat is ARCHITECTURE coverage: the engine implements llama-arch
+#     MoE and dense llama only. Qwen2-MoE and DeepSeek-MoE are DIFFERENT
+#     architectures (shared experts, per-expert gate, group-limited sigmoid
+#     gating) that are NOT implemented and would hit the unsupported-arch path.
 #   - Colab free tier is ~12 GB RAM and ~70-100 GB ephemeral disk. Keep the
-#     generated model well under the disk size.
+#     model (generated or downloaded) well under the disk size; --expert-slots
+#     bounds resident weights far below the on-disk size.
 #
 # This script is meant to be driven by the cells in colab/README.md, but it also
-# runs standalone: `python3 strataflow_colab.py --layers 24 --experts 32`.
+# runs standalone: `python3 strataflow_colab.py --layers 24 --experts 32`
+# (generated F32 demo) or `python3 strataflow_colab.py --real-model` (real
+# downloaded quantized model).
 # Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 import argparse
 import os
+import re
+import shutil
 import subprocess
 import sys
+import time
 
 
 def sh(cmd, cwd=None, check=True):
@@ -31,6 +50,43 @@ def sh(cmd, cwd=None, check=True):
     if check and r.returncode != 0:
         sys.exit(f"command failed ({r.returncode}): {cmd}")
     return r.returncode
+
+
+def sh_capture(cmd, cwd=None):
+    """Run a command, stream its stdout live AND return the captured stdout.
+
+    The strataflow CLI writes 'plan:', 'prompt:', 'output: <text>' and the
+    final 'stats:' line to stdout; its logs go to stderr. We capture stdout so
+    we can parse the decoded text and the resident/peak-RSS numbers while still
+    showing the user everything as it happens.
+    """
+    print(f"\n$ {cmd}")
+    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=sys.stderr, text=True, bufsize=1)
+    lines = []
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        lines.append(line)
+    proc.wait()
+    return proc.returncode, "".join(lines)
+
+
+def parse_cli_output(captured):
+    """Extract (decoded_text, resident_mib, peak_rss_mib) from CLI stdout."""
+    decoded = None
+    resident_mib = None
+    peak_mib = None
+    for line in captured.splitlines():
+        if line.startswith("output: "):
+            decoded = line[len("output: "):]
+        m = re.search(r"resident model weights = ([0-9.]+) MiB", line)
+        if m:
+            resident_mib = float(m.group(1))
+        m = re.search(r"peak RSS = ([0-9.]+) MiB", line)
+        if m:
+            peak_mib = float(m.group(1))
+    return decoded, resident_mib, peak_mib
 
 
 def make_moe_gguf(path, n_layer, n_expert, n_embd=256, n_head=8, n_ff=512,
@@ -95,6 +151,171 @@ def make_moe_gguf(path, n_layer, n_expert, n_embd=256, n_head=8, n_ff=512,
           f"(top-{n_expert_used}), n_embd={n_embd}, n_ff={n_ff} -> {mb:.1f} MB")
 
 
+def run_real_model(args):
+    # MODEL SELECTION - why the default is what it is.
+    #
+    # The engine runs ONLY llama-architecture models: llama-arch MoE and dense
+    # llama. That constraint drives the choice:
+    #
+    #   - The natural real llama-arch MoE is Mixtral (mistralai, Apache-2.0,
+    #     genuine llama arch with ffn_*_exps tensors). But the smallest useful
+    #     Mixtral-8x7B GGUF is ~24 GB+ even at a low K-quant, which strains the
+    #     Colab free tier (~12 GB RAM, ~70-100 GB disk). It is downloadable and
+    #     runnable on a larger Colab/standalone box, so we expose it via
+    #     --hf-repo/--hf-file, but it is NOT the default.
+    #
+    #   - Qwen2-MoE and DeepSeek-MoE are DIFFERENT architectures (shared
+    #     experts, per-expert gate, group-limited sigmoid gating). The engine
+    #     does NOT implement them; they would hit the unsupported-arch path and
+    #     return EOS. We deliberately do NOT default to them so nothing fails
+    #     silently.
+    #
+    # So the DEFAULT is a small, real, DOWNLOADED, QUANTIZED *dense llama*
+    # model: TinyLlama-1.1B-Chat at Q4_K_M (~0.67 GB on disk), from
+    # TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF (base model Apache-2.0). The engine
+    # runs real downloaded dense-llama models through the exact same .strata
+    # streaming + type-agnostic quant staging path as a MoE, so this is a real
+    # proof of "downloaded quantized model decodes through StrataFlow's own
+    # forward pass", honestly labeled as DENSE rather than MoE. Pass
+    # --hf-repo/--hf-file to point at any other llama-arch GGUF (e.g. a Mixtral
+    # quant) if your runtime has the disk/RAM for it.
+    #
+    # This path needs NETWORK (HuggingFace) and DISK. It cannot run in an
+    # offline sandbox; it fails with a clear message if the download fails.
+    repo = args.repo
+    build = os.path.join(repo, "build", "release")
+    cli = os.path.join(build, "bin", "strataflow")
+    pack = os.path.join(build, "bin", "strata-pack")
+    os.makedirs(args.workdir, exist_ok=True)
+
+    hf_repo = args.hf_repo
+    hf_file = args.hf_file
+    is_moe_default = False  # the default (TinyLlama) is dense, not MoE
+    expected_gb = args.expected_gb
+
+    print("=" * 70)
+    print("REAL DOWNLOADED MODEL FLOW (needs network + disk)")
+    print("=" * 70)
+    print(f"  model: {hf_repo} :: {hf_file}")
+    print(f"  arch:  {'llama-arch MoE' if is_moe_default or args.is_moe else 'dense llama'}"
+          f"  (quantized GGUF, streamed through StrataFlow)")
+    print(f"  expected on-disk size: ~{expected_gb:.2f} GB")
+    print("  NOTE: this downloads a real GGUF from HuggingFace. It requires")
+    print("  network access and enough free disk. It will NOT run in an offline")
+    print("  sandbox - that is expected; the flow is demonstrated on Colab.")
+
+    # --- disk / RAM guards -------------------------------------------------
+    free_disk_gb = shutil.disk_usage(args.workdir).free / (1024 ** 3)
+    print("\n" + "-" * 70)
+    print("GUARDS")
+    print("-" * 70)
+    print(f"  free disk at {args.workdir}: {free_disk_gb:.1f} GB")
+    # Need room for the GGUF plus a .strata copy of roughly the same size.
+    needed_gb = expected_gb * 2.1
+    print(f"  need ~{needed_gb:.1f} GB (GGUF + .strata copy + headroom)")
+    if free_disk_gb < needed_gb:
+        sys.exit(
+            f"refusing to download: only {free_disk_gb:.1f} GB free but "
+            f"~{needed_gb:.1f} GB needed. Pick a smaller --hf-file or free disk."
+        )
+    total_ram_gb = _total_ram_gb()
+    if total_ram_gb is not None:
+        print(f"  total RAM: {total_ram_gb:.1f} GB"
+              f"  (bounded by --expert-slots {args.expert_slots}; resident")
+        print("   weights stay far below the on-disk size - see the stats line)")
+
+    # --- download ----------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 1: download the GGUF from HuggingFace")
+    print("=" * 70)
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        sys.exit("huggingface_hub is not installed. Run: pip install huggingface_hub")
+    try:
+        gguf_path = hf_hub_download(repo_id=hf_repo, filename=hf_file,
+                                    local_dir=args.workdir)
+    except Exception as exc:  # network/offline/not-found all land here
+        sys.exit(
+            "download failed: " + str(exc) + "\n"
+            "This flow needs network access to HuggingFace and is meant to run "
+            "on Colab (or any machine with internet + disk), not in an offline "
+            "sandbox. Check connectivity, the repo/file names, and free disk."
+        )
+    on_disk_mb = os.path.getsize(gguf_path) / (1024 * 1024)
+    print(f"downloaded {gguf_path}: {on_disk_mb:.0f} MiB")
+
+    # --- pack --------------------------------------------------------------
+    strata = os.path.join(args.workdir, "real_model.strata")
+    print("\n" + "=" * 70)
+    print("STEP 2: pack GGUF -> .strata (trunk + aligned per-expert blobs)")
+    print("=" * 70)
+    sh(f"{pack} {gguf_path} {strata}")
+    strata_mb = os.path.getsize(strata) / (1024 * 1024)
+
+    # --- plan --------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 3: show the placement plan (hardware auto-detected)")
+    print("=" * 70)
+    sh(f"{cli} --model {strata} --plan", check=False)
+
+    # --- run + measure -----------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4: decode the REAL model from .strata, bounded + measured")
+    print(f"  .strata on disk: {strata_mb:.0f} MiB")
+    print(f"  --expert-slots {args.expert_slots} caps resident experts so RAM")
+    print("  stays far below the on-disk size. A real model has a real trained")
+    print("  context length, so the 'n_ctx_seq > n_ctx_train (0)' warning the")
+    print("  generated demo emits should NOT appear here - that is a signal the")
+    print("  real tokenizer + metadata are in use.")
+    print("=" * 70)
+    cmd = (f'{cli} --model {strata} --expert-slots {args.expert_slots} '
+           f'--max-tokens {args.max_tokens} --prompt "{args.prompt}"')
+    t0 = time.time()
+    rc, captured = sh_capture(cmd)
+    elapsed = time.time() - t0
+    if rc != 0:
+        sys.exit(f"decode failed (rc={rc}). See the CLI output above.")
+
+    decoded, resident_mib, peak_mib = parse_cli_output(captured)
+    toks_per_sec = args.max_tokens / elapsed if elapsed > 0 else float("nan")
+
+    print("\n" + "=" * 70)
+    print("MEASURED RESULTS (real downloaded quantized model)")
+    print("=" * 70)
+    print(f"  model:            {hf_repo} :: {hf_file}")
+    print(f"  arch:             {'llama-arch MoE' if args.is_moe else 'dense llama'}")
+    print(f"  prompt:           {args.prompt!r}")
+    print(f"  decoded output:   {decoded!r}")
+    print(f"  wall-clock:       {elapsed:.2f} s for {args.max_tokens} tokens")
+    print(f"  tokens/sec:       {toks_per_sec:.2f}")
+    if resident_mib is not None:
+        print(f"  resident weights: {resident_mib:.1f} MiB")
+    if peak_mib is not None:
+        print(f"  peak RSS:         {peak_mib:.1f} MiB")
+    print(f"  on-disk .strata:  {strata_mb:.0f} MiB")
+    print("\nWHAT THIS PROVES:")
+    print(" - A REAL downloaded, QUANTIZED GGUF decodes end to end through")
+    print("   StrataFlow's OWN ggml forward pass (no llama_decode, no GPU),")
+    print("   with its real tokenizer producing real output text.")
+    print(" - Quantized weights stream through the type-agnostic staging path.")
+    if resident_mib is not None and peak_mib is not None:
+        print(f" - Resident weights ({resident_mib:.1f} MiB) and peak RSS "
+              f"({peak_mib:.1f} MiB) stay")
+        print(f"   bounded far below the {strata_mb:.0f} MiB on-disk model: "
+              "big model, small RAM.")
+
+
+def _total_ram_gb():
+    """Best-effort total RAM in GB; None if it cannot be determined."""
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return pages * page_size / (1024 ** 3)
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="/content/strataflow")
@@ -105,8 +326,32 @@ def main():
     ap.add_argument("--prompt", default="hello world from colab")
     ap.add_argument("--max-tokens", type=int, default=16)
     ap.add_argument("--workdir", default="/content",
-                    help="where to write the generated .gguf/.strata")
+                    help="where to write the generated/downloaded models")
+    # Real downloaded-model flow (needs network + disk; see run_real_model).
+    ap.add_argument("--real-model", action="store_true",
+                    help="download a REAL quantized GGUF from HuggingFace, pack "
+                         "it, and run it bounded (instead of the generated-F32 "
+                         "demo). Needs network + disk.")
+    ap.add_argument("--hf-repo", default="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+                    help="HuggingFace repo id for --real-model (default: a small "
+                         "dense-llama Q4_K_M model). Point at a llama-arch GGUF.")
+    ap.add_argument("--hf-file", default="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+                    help="GGUF filename within --hf-repo.")
+    ap.add_argument("--expert-slots", type=int, default=8,
+                    help="bound resident experts for the real-model run (MoE). "
+                         "Dense models have no experts; the flag is harmless.")
+    ap.add_argument("--expected-gb", type=float, default=0.67,
+                    help="expected on-disk size of --hf-file in GB, used by the "
+                         "disk guard (default matches the TinyLlama Q4_K_M).")
+    ap.add_argument("--is-moe", action="store_true",
+                    help="label the --real-model as MoE in the summary (set this "
+                         "when you point --hf-repo/--hf-file at a Mixtral-style "
+                         "llama-arch MoE GGUF). Default label is dense llama.")
     args = ap.parse_args()
+
+    if args.real_model:
+        run_real_model(args)
+        return
 
     repo = args.repo
     build = os.path.join(repo, "build", "release")
@@ -143,7 +388,7 @@ def main():
     # cap it well below the model's expert count so you can SEE bounded RAM: the
     # resident model-weight bytes stay near the trunk size while the on-disk
     # model is much larger.
-    sh(f'{cli} --model {strata} --expert-slots 8 '
+    sh(f'{cli} --model {strata} --expert-slots {args.expert_slots} '
        f'--max-tokens {args.max_tokens} --prompt "{args.prompt}"', check=False)
 
     print("\n" + "=" * 70)
@@ -155,9 +400,12 @@ def main():
     print("   from disk through a bounded cache. That is the whole mission:")
     print("   big model, small RAM, no GPU.")
     print(" - Output text is gibberish ONLY because the weights are random; what")
-    print("   is proven is the mechanism, not model quality. Running real")
-    print("   (quantized) pretrained models is the next milestone - the engine")
-    print("   is F32-only today (see docs/ROADMAP.md).")
+    print("   is proven here is the mechanism, not model quality. To run a REAL")
+    print("   downloaded, QUANTIZED model (dense llama by default) end to end,")
+    print("   re-run with --real-model (needs network + disk). Quantized weights")
+    print("   stream through the engine's type-agnostic staging path; the honest")
+    print("   caveat is architecture coverage (llama-arch MoE + dense llama")
+    print("   only; Qwen2-MoE / DeepSeek-MoE not yet implemented).")
 
 
 if __name__ == "__main__":
