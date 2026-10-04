@@ -187,6 +187,10 @@ public:
         return engine_ != nullptr ? engine_->resident_weight_bytes() : 0;
     }
 
+    uint64_t streamed_bytes() const override {
+        return engine_ != nullptr ? engine_->streamed_bytes() : 0;
+    }
+
 private:
     // The engine inference path (EC-5: the ONLY inference path): run OUR OWN
     // ggml graph for one token at position n_past_ and take the greedy argmax.

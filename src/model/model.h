@@ -43,6 +43,12 @@ public:
     // a large model runs in a small resident budget. 0 if not applicable (e.g.
     // the plain-GGUF path where ggml owns the mapping, or the dry-run model).
     virtual uint64_t resident_weight_bytes() const { return 0; }
+
+    // Total EXPERT bytes streamed from disk during the run (per-token expert
+    // streaming on the .strata path). 0 when not applicable: the plain-GGUF
+    // path where experts are resident, or the dry-run model. Excludes the
+    // one-time trunk load.
+    virtual uint64_t streamed_bytes() const { return 0; }
 };
 
 // Factory: inspects `path` and returns the right implementation.

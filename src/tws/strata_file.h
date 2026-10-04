@@ -72,11 +72,23 @@ public:
     // read, or -1 on error.
     int64_t read_at(void *dst, uint64_t len, uint64_t offset) const;
 
+    // Total EXPERT bytes streamed from disk via read_blob() since open(). This
+    // counts only per-token expert-slice reads; the one-time trunk fill (which
+    // goes through read_at) is intentionally excluded so this reflects
+    // per-token expert streaming, not the trunk load. Used by the benchmark
+    // harness to report bytes-streamed-per-token. See read_blob() in the .cpp.
+    uint64_t streamed_bytes() const { return streamed_bytes_; }
+
 private:
     uint64_t slice_rel(const ExpertIndexEntry &e, ExpertTensorKind kind) const;
 
     bool                            open_ = false;
     mutable BlockFile               file_;
+    // Accumulated expert-slice bytes read via read_blob(). mutable because
+    // read_blob() is const (it never mutates logical reader state) but still
+    // needs to bump this counter. Single-token greedy decode is single-threaded
+    // on this seam, so a plain counter is sufficient (no atomics needed).
+    mutable uint64_t                streamed_bytes_ = 0;
     StrataSuperblock                sb_{};
     std::vector<uint8_t>            meta_;
     std::vector<ExpertIndexEntry>   index_;

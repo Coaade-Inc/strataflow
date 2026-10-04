@@ -4,6 +4,7 @@
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "strataflow/strataflow.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +12,15 @@
 #include <string>
 
 namespace {
+
+// Carried through sf_generate's user_data so the token callback can measure
+// time-to-first-token (TTFT): wall-clock from just before sf_generate to the
+// FIRST produced token. No engine math is involved, so this is oracle-safe.
+struct TokenTiming {
+    std::chrono::steady_clock::time_point start;  // set just before sf_generate
+    bool     seen_first = false;                  // first token recorded yet?
+    uint64_t ttft_us    = 0;                       // measured TTFT, microseconds
+};
 
 void print_usage(const char *argv0) {
     std::printf(
@@ -34,7 +44,14 @@ void print_usage(const char *argv0) {
 }
 
 int on_token(const char *text, void *user_data) {
-    (void)user_data;
+    auto *t = static_cast<TokenTiming *>(user_data);
+    if (t != nullptr && !t->seen_first) {
+        const auto now = std::chrono::steady_clock::now();
+        t->ttft_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t->start)
+                .count());
+        t->seen_first = true;
+    }
     std::fputs(text, stdout);
     std::fflush(stdout);
     return 0;
@@ -124,7 +141,9 @@ int main(int argc, char **argv) {
 
     std::printf("prompt: %s\noutput: ", prompt.c_str());
     std::fflush(stdout);
-    st = sf_generate(session, prompt.c_str(), &sampling, on_token, nullptr);
+    TokenTiming timing;
+    timing.start = std::chrono::steady_clock::now();
+    st = sf_generate(session, prompt.c_str(), &sampling, on_token, &timing);
     std::printf("\n");
     if (st != SF_OK) {
         std::fprintf(stderr, "error: generate failed: %s\n", sf_status_str(st));
@@ -140,6 +159,18 @@ int main(int argc, char **argv) {
         if (rs.peak_rss_bytes > 0) {
             std::printf(", peak RSS = %.1f MiB",
                         static_cast<double>(rs.peak_rss_bytes) / mib);
+        }
+        // Additive metrics on the SAME line (the existing wording above is
+        // unchanged so the Python parser keeps working). TTFT comes from the
+        // CLI wall-clock (only if a token was produced); streamed comes from
+        // the engine ground truth (only on the streaming .strata path).
+        if (timing.seen_first) {
+            std::printf(", TTFT = %.1f ms",
+                        static_cast<double>(timing.ttft_us) / 1000.0);
+        }
+        if (rs.streamed_bytes > 0) {
+            std::printf(", streamed = %.1f MiB",
+                        static_cast<double>(rs.streamed_bytes) / mib);
         }
         std::printf("\n");
     }

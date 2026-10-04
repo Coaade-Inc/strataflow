@@ -156,6 +156,19 @@ typedef struct sf_runtime_stats {
     /* Process peak resident set size (peak RAM) in bytes, best-effort per OS;
      * 0 if the platform could not report it. */
     uint64_t peak_rss_bytes;
+    /* NOTE: fields below are APPENDED for ABI backward-compatibility. Append
+     * new fields at the END of this struct only; never reorder or remove the
+     * fields above (existing callers depend on the layout). */
+    /* Time to first token in microseconds: wall-clock from the start of
+     * generation to the FIRST produced token. The engine/ABI do not time this;
+     * the CLI measures it around sf_generate and the harness reads it from the
+     * CLI output. 0 if not measured (e.g. no token was produced, or the caller
+     * did not time it). */
+    uint64_t ttft_us;
+    /* Total EXPERT bytes read from the .strata/disk during the run (per-token
+     * expert streaming). On the plain-GGUF path, where experts are resident,
+     * this stays 0. Excludes the one-time trunk load. 0 if not applicable. */
+    uint64_t streamed_bytes;
 } sf_runtime_stats;
 
 /* Fill `out` with current runtime stats. Call after sf_generate to see the

@@ -58,6 +58,44 @@ static void test_generate_runs() {
     sf_context_free(ctx);
 }
 
+// Locks the sf_runtime_stats ABI shape: a default-constructed value must
+// zero-init the appended fields, and sf_session_stats must fill them without
+// error on the dry-run model (ttft_us is 0 - the CLI measures it; streamed_bytes
+// is 0 on the dry-run/non-streaming path).
+static void test_runtime_stats_fields() {
+    sf_runtime_stats zero{};
+    CHECK_EQ(zero.resident_weight_bytes, 0u);
+    CHECK_EQ(zero.peak_rss_bytes, 0u);
+    CHECK_EQ(zero.ttft_us, 0u);
+    CHECK_EQ(zero.streamed_bytes, 0u);
+
+    CHECK_EQ(sf_session_stats(nullptr, &zero), SF_ERR_INVALID_ARGUMENT);
+
+    sf_context_params p = sf_context_default_params();
+    p.model_path = "dummy.strata";
+
+    sf_context *ctx = nullptr;
+    CHECK_EQ(sf_context_create(&p, &ctx), SF_OK);
+    sf_session *s = nullptr;
+    CHECK_EQ(sf_session_create(ctx, &s), SF_OK);
+
+    sf_sampling_params sp = sf_sampling_default_params();
+    sp.max_tokens = 8;
+    std::string out;
+    CHECK_EQ(sf_generate(s, "stats prompt", &sp, append_text, &out), SF_OK);
+
+    sf_runtime_stats rs{};
+    CHECK_EQ(sf_session_stats(s, &rs), SF_OK);
+    // Dry-run model does not stream experts and the CLI (not the ABI) times
+    // TTFT, so both appended fields stay 0 here. This asserts the ABI wiring
+    // (sf_session_stats sets them) without depending on real streaming numbers.
+    CHECK_EQ(rs.ttft_us, 0u);
+    CHECK_EQ(rs.streamed_bytes, 0u);
+
+    sf_session_free(s);
+    sf_context_free(ctx);
+}
+
 // Greedy generation must be reproducible (determinism contract, PLAN section 7).
 static void test_determinism() {
     sf_context_params p = sf_context_default_params();
@@ -83,6 +121,7 @@ static void run_all() {
     RUN(test_version);
     RUN(test_invalid_args);
     RUN(test_generate_runs);
+    RUN(test_runtime_stats_fields);
     RUN(test_determinism);
 }
 

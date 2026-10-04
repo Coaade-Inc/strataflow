@@ -294,6 +294,12 @@ uint64_t Engine::resident_weight_bytes() const {
     return static_cast<uint64_t>(ggml_backend_buffer_get_size(impl_->wbuf));
 }
 
+uint64_t Engine::streamed_bytes() const {
+    // Expert bytes streamed from disk on the .strata path; 0 on the plain-GGUF
+    // path where there is no StrataReader (experts are resident).
+    return impl_->reader ? impl_->reader->streamed_bytes() : 0;
+}
+
 std::unique_ptr<Engine> Engine::load(const std::string &path,
                                      uint32_t expert_slots) {
     std::unique_ptr<Engine> eng(new Engine());

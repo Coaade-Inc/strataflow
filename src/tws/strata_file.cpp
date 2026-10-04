@@ -157,7 +157,13 @@ int64_t StrataReader::read_blob(uint32_t layer, uint32_t expert,
     uint64_t offset = 0;
     uint64_t length = 0;
     if (!slice_range(layer, expert, kind, offset, length)) return -1;
-    return file_.read_at(dst, static_cast<size_t>(length), offset);
+    const int64_t n = file_.read_at(dst, static_cast<size_t>(length), offset);
+    // Count only successful expert-slice reads toward the per-token streamed
+    // total. read_at() (the one-time trunk fill in Engine::load_strata_weights)
+    // is intentionally NOT counted here, so streamed_bytes() reflects per-token
+    // expert streaming rather than the trunk load.
+    if (n > 0) streamed_bytes_ += static_cast<uint64_t>(n);
+    return n;
 }
 
 int64_t StrataReader::read_at(void *dst, uint64_t len, uint64_t offset) const {
