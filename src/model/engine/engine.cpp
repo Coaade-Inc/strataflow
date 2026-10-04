@@ -1,9 +1,18 @@
-// Engine core (EC-1) implementation: build and run OUR OWN ggml_cgraph for the
-// llama-arch MoE single-token forward on the ggml CPU backend. This is the
-// production form of the proven spike spike/engine_core/spike_engine.cpp; the
-// op sequence is lifted verbatim from docs/ENGINE_CORE_DESIGN.md section 6.3,
-// which the spike measured against the libllama oracle (argmax match, max
-// |logit delta| 5.3e-5 on the tiny MoE).
+// Engine core (EC-3) implementation: build and run OUR OWN ggml graphs for the
+// llama-arch MoE forward on the ggml CPU backend, now in PER-LAYER SEGMENTS so
+// only the top-k routed experts per layer are made resident (sections 3.2, 3.3,
+// 3.5). The op math is lifted verbatim from docs/ENGINE_CORE_DESIGN.md section
+// 6.3 and stays byte-identical to EC-1/EC-2 (the spike measured argmax match,
+// max |logit delta| 5.3e-5 on the tiny MoE against the libllama oracle).
+//
+// Segmentation (EC-3): per layer we build+compute a ROUTER segment (attn +
+// residual + ffn_norm + router + argsort top-k), read the top-k expert ids back
+// to the host with ggml_backend_tensor_get, make EXACTLY those experts resident
+// via a bounded SlotPool, then build+compute the EXPERT segment (mul_mat_id over
+// the resident experts + weight-and-sum + residual). Because the router output
+// is known on the host before the expert matmul is built, resident expert RAM
+// is bounded to top-k per layer. The resident full-weight tensors are the
+// backing store the pool loads from (the .strata source is EC-4).
 //
 // This is the ONLY engine TU that includes ggml/llama headers; everything above
 // the sf::Model seam sees only model/engine/engine.h.
@@ -12,6 +21,7 @@
 
 #include "common/log.h"
 #include "kv/kv_store.h"
+#include "tws/weight_store.h"
 
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
@@ -22,6 +32,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
@@ -56,7 +67,7 @@ ggml_tensor *get_weight(ggml_context *wctx, const std::string &name) {
 // bookkeeping owner of the current fill position and the n_ctx bound.
 struct Engine::Impl {
     gguf_context *gc   = nullptr;
-    ggml_context *wctx = nullptr;  // weight tensors, resident
+    ggml_context *wctx = nullptr;  // full weight tensors, resident (backing store)
     EngineHParams hp;
 
     ggml_context *kvctx = nullptr;              // KV cache tensors, resident
@@ -65,7 +76,36 @@ struct Engine::Impl {
     std::vector<ggml_tensor *> v_cache;         // per layer [head_dim, n_head_kv, n_ctx]
     std::unique_ptr<KvStore> kv;                // position + capacity bookkeeping
 
+    // EC-3 top-k residency. `estctx`/`estbuf` back the per-layer STAGING
+    // stacked expert tensors fed to ggml_mul_mat_id: full ne-shape, but only
+    // the routed experts' nb02 slices are populated each token (section 3.3 -
+    // the kernel skips cne1==0 experts before dereferencing the slice). The
+    // SlotPool holds the bounded resident working copies keyed by {layer,
+    // expert}; a slot carries one expert's gate|up|down bytes concatenated. The
+    // full wctx expert tensors are the backing store the pool loads from.
+    ggml_context *estctx = nullptr;
+    ggml_backend_buffer_t estbuf = nullptr;
+    std::vector<ggml_tensor *> stage_gate;      // per layer, ne = ffn_gate_exps
+    std::vector<ggml_tensor *> stage_up;        // per layer, ne = ffn_up_exps
+    std::vector<ggml_tensor *> stage_down;      // per layer, ne = ffn_down_exps
+    std::unique_ptr<SlotPool> pool;
+    uint64_t gate_expert_bytes = 0;             // bytes of one expert's gate slice
+    uint64_t up_expert_bytes   = 0;
+    uint64_t down_expert_bytes = 0;
+    EngineCacheStats cstats;
+
+    // One CPU backend + gallocr reused across every segment and token (section
+    // 3.5: reuse the allocator across tokens; also avoids re-initializing the
+    // CPU backend per segment, which is fragile after libllama churns the
+    // global ggml backend state in the oracle tests).
+    ggml_backend_t backend = nullptr;
+    ggml_gallocr_t galloc  = nullptr;
+
     ~Impl() {
+        if (galloc != nullptr) ggml_gallocr_free(galloc);
+        if (backend != nullptr) ggml_backend_free(backend);
+        if (estbuf != nullptr) ggml_backend_buffer_free(estbuf);
+        if (estctx != nullptr) ggml_free(estctx);
         if (kvbuf != nullptr) ggml_backend_buffer_free(kvbuf);
         if (kvctx != nullptr) ggml_free(kvctx);
         if (wctx != nullptr) ggml_free(wctx);
@@ -77,8 +117,10 @@ Engine::Engine() : impl_(new Impl()) {}
 Engine::~Engine() = default;
 
 const EngineHParams &Engine::hparams() const { return impl_->hp; }
+const EngineCacheStats &Engine::cache_stats() const { return impl_->cstats; }
 
-std::unique_ptr<Engine> Engine::load(const std::string &path) {
+std::unique_ptr<Engine> Engine::load(const std::string &path,
+                                     uint32_t expert_slots) {
     std::unique_ptr<Engine> eng(new Engine());
     Impl &im = *eng->impl_;
 
@@ -202,6 +244,98 @@ std::unique_ptr<Engine> Engine::load(const std::string &path) {
         static_cast<uint64_t>(hp.n_head_kv) * sizeof(float);
     im.kv.reset(new KvStore(static_cast<uint32_t>(n_ctx), bytes_per_token));
 
+    // EC-3: per-layer staging stacked expert tensors + the bounded SlotPool.
+    // The staging tensors have the SAME ne-shape as the full expert tensors so
+    // ggml_mul_mat_id addresses expert cur_a at the same cur_a*nb02 offset; we
+    // populate only the routed slices each token. One slot of the pool holds
+    // one expert's gate|up|down bytes, so a pool sized below n_expert bounds
+    // resident expert RAM to that many bundles.
+    {
+        ggml_tensor *g0 = ggml_get_tensor(im.wctx, "blk.0.ffn_gate_exps.weight");
+        ggml_tensor *u0 = ggml_get_tensor(im.wctx, "blk.0.ffn_up_exps.weight");
+        ggml_tensor *d0 = ggml_get_tensor(im.wctx, "blk.0.ffn_down_exps.weight");
+        if (g0 == nullptr || u0 == nullptr || d0 == nullptr) {
+            log_warn("engine: missing expert tensor; staying on libllama path");
+            return nullptr;
+        }
+        // Per-expert slice bytes = whole-tensor bytes / n_expert (nb02 stride).
+        im.gate_expert_bytes = g0->nb[2];
+        im.up_expert_bytes   = u0->nb[2];
+        im.down_expert_bytes = d0->nb[2];
+        const uint64_t slot_bytes =
+            im.gate_expert_bytes + im.up_expert_bytes + im.down_expert_bytes;
+
+        ggml_init_params ep{};
+        ep.mem_size   = ggml_tensor_overhead() *
+                        (static_cast<size_t>(hp.n_layer) * 3 + 8);
+        ep.mem_buffer = nullptr;
+        ep.no_alloc   = true;  // backing from one buffer below
+        im.estctx = ggml_init(ep);
+        if (im.estctx == nullptr) {
+            log_warn("engine: staging context init failed; libllama path");
+            return nullptr;
+        }
+        im.stage_gate.resize(static_cast<size_t>(hp.n_layer));
+        im.stage_up.resize(static_cast<size_t>(hp.n_layer));
+        im.stage_down.resize(static_cast<size_t>(hp.n_layer));
+        for (int il = 0; il < hp.n_layer; ++il) {
+            const size_t u = static_cast<size_t>(il);
+            im.stage_gate[u] = ggml_new_tensor_3d(im.estctx, GGML_TYPE_F32,
+                                                  g0->ne[0], g0->ne[1], g0->ne[2]);
+            im.stage_up[u]   = ggml_new_tensor_3d(im.estctx, GGML_TYPE_F32,
+                                                  u0->ne[0], u0->ne[1], u0->ne[2]);
+            im.stage_down[u] = ggml_new_tensor_3d(im.estctx, GGML_TYPE_F32,
+                                                  d0->ne[0], d0->ne[1], d0->ne[2]);
+            ggml_set_name(im.stage_gate[u], ("stg_gate." + std::to_string(il)).c_str());
+            ggml_set_name(im.stage_up[u],   ("stg_up."   + std::to_string(il)).c_str());
+            ggml_set_name(im.stage_down[u], ("stg_down." + std::to_string(il)).c_str());
+        }
+        im.estbuf = ggml_backend_alloc_ctx_tensors_from_buft(
+            im.estctx, ggml_backend_cpu_buffer_type());
+        if (im.estbuf == nullptr) {
+            log_warn("engine: staging buffer alloc failed; libllama path");
+            return nullptr;
+        }
+        // Zero the staging buffer so non-routed expert slices are well-defined
+        // (the kernel skips cne1==0 experts, but defined zeros avoid any inf/nan
+        // in uninitialized memory leaking into an assert on debug builds).
+        for (int il = 0; il < hp.n_layer; ++il) {
+            const size_t u = static_cast<size_t>(il);
+            std::memset(im.stage_gate[u]->data, 0, ggml_nbytes(im.stage_gate[u]));
+            std::memset(im.stage_up[u]->data,   0, ggml_nbytes(im.stage_up[u]));
+            std::memset(im.stage_down[u]->data, 0, ggml_nbytes(im.stage_down[u]));
+        }
+
+        // Pool size: auto (0) holds the whole working set (n_layer*n_expert, no
+        // eviction); a positive request is clamped up to n_expert_used so a
+        // single layer's top-k always fits. A test passes a value below
+        // n_expert to force eviction/reload.
+        const uint32_t full_slots =
+            static_cast<uint32_t>(hp.n_layer) * static_cast<uint32_t>(hp.n_expert);
+        uint32_t n_slots = expert_slots == 0 ? full_slots : expert_slots;
+        if (n_slots < static_cast<uint32_t>(hp.n_expert_used)) {
+            n_slots = static_cast<uint32_t>(hp.n_expert_used);
+        }
+        im.pool.reset(new SlotPool(n_slots, slot_bytes));
+        im.cstats.n_slots    = n_slots;
+        im.cstats.slot_bytes = slot_bytes;
+        im.cstats.full_bytes = static_cast<uint64_t>(full_slots) * slot_bytes;
+    }
+
+    // One CPU backend + gallocr for the engine's lifetime (1 thread for the
+    // greedy-determinism contract). Reused across every segment and token.
+    im.backend = ggml_backend_cpu_init();
+    if (im.backend == nullptr) {
+        log_warn("engine: cpu backend init failed; staying on libllama path");
+        return nullptr;
+    }
+    ggml_backend_cpu_set_n_threads(im.backend, 1);
+    im.galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    if (im.galloc == nullptr) {
+        log_warn("engine: gallocr init failed; staying on libllama path");
+        return nullptr;
+    }
+
     log_info("engine: loaded llama-arch MoE (" + std::to_string(hp.n_layer) +
              " layers, " + std::to_string(hp.n_expert) + "x" +
              std::to_string(hp.n_expert_used) + " experts, n_embd=" +
@@ -217,22 +351,50 @@ void Engine::reset_kv() {
 
 namespace {
 
-// Build one transformer layer, mirroring llama_model_llama::graph and
-// build_moe_ffn (docs/ENGINE_CORE_DESIGN.md 6.3 step 2). `inpL` is
-// [n_embd, n_tokens=1]; returns the layer output [n_embd, 1].
-//
-// EC-2 KV cache (section 3.4): this layer's post-rope K and this layer's V for
-// the current token are copied into the persistent per-layer cache tensors at
-// column `pos`; attention then views the first `n_kv = pos+1` cached columns
-// and applies the causal mask through ggml_soft_max_ext. `k_cache`/`v_cache`
-// are the layer's resident cache tensors [head_dim, n_head_kv, n_ctx]; stores
-// into them are forced into the graph via `graph_stores`.
-ggml_tensor *build_layer(ggml_context *gctx, ggml_tensor *inpL,
-                         ggml_tensor *inp_pos, int il, ggml_context *wctx,
-                         const EngineHParams &hp, ggml_tensor *k_cache,
-                         ggml_tensor *v_cache, ggml_tensor *kq_mask,
-                         int64_t pos, int64_t n_kv,
-                         std::vector<ggml_tensor *> &graph_stores) {
+// Allocate and run one segment graph `gf` (rooted at `roots`) on a fresh CPU
+// backend, calling `set_inputs()` after allocation to fill the segment's input
+// tensors. 1 thread for the greedy-determinism contract. Returns true on a
+// successful compute. The caller owns `gctx` and reads outputs afterwards.
+template <typename SetInputs>
+bool run_segment(ggml_backend_t backend, ggml_gallocr_t galloc,
+                 ggml_context *gctx, const std::vector<ggml_tensor *> &roots,
+                 SetInputs &&set_inputs) {
+    ggml_cgraph *gf = ggml_new_graph(gctx);
+    for (ggml_tensor *r : roots) {
+        ggml_build_forward_expand(gf, r);
+    }
+
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        log_error("engine: gallocr alloc failed");
+        return false;
+    }
+
+    set_inputs();  // fill inputs AFTER allocation
+
+    const bool compute_ok =
+        ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    if (!compute_ok) log_error("engine: graph compute failed");
+    return compute_ok;
+}
+
+// Build the ROUTER segment for one layer (section 3.2 step 1): attn + residual
+// + ffn_norm + router + argsort top-k. `inpL` is the segment input [n_embd, 1]
+// (an input tensor filled from the host). Outputs needed by the host and the
+// expert segment are returned via the out-params and marked ggml_set_output:
+//   `cur`      - ffn-normed input to the experts [n_embd, 1]
+//   `ffn_inp`  - the pre-FFN residual branch   [n_embd, 1]
+//   `weights`  - normalized top-k gate weights [n_expert_used]
+//   `selected` - the top-k expert ids          [n_expert_used]
+// KV stores for this layer are appended to `graph_stores` so run_segment roots
+// them (attention reads the cache tensor, not the cpy node).
+void build_router_segment(ggml_context *gctx, ggml_tensor *inpL,
+                          ggml_tensor *inp_pos, int il, ggml_context *wctx,
+                          const EngineHParams &hp, ggml_tensor *k_cache,
+                          ggml_tensor *v_cache, ggml_tensor *kq_mask,
+                          int64_t pos, int64_t n_kv,
+                          std::vector<ggml_tensor *> &graph_stores,
+                          ggml_tensor **out_cur, ggml_tensor **out_ffn_inp,
+                          ggml_tensor **out_weights, ggml_tensor **out_selected) {
     const std::string p = "blk." + std::to_string(il) + ".";
 
     ggml_tensor *attn_norm_w = ggml_get_tensor(wctx, (p + "attn_norm.weight").c_str());
@@ -242,9 +404,6 @@ ggml_tensor *build_layer(ggml_context *gctx, ggml_tensor *inpL,
     ggml_tensor *wo          = ggml_get_tensor(wctx, (p + "attn_output.weight").c_str());
     ggml_tensor *ffn_norm_w  = ggml_get_tensor(wctx, (p + "ffn_norm.weight").c_str());
     ggml_tensor *gate_inp    = ggml_get_tensor(wctx, (p + "ffn_gate_inp.weight").c_str());
-    ggml_tensor *gate_exps   = ggml_get_tensor(wctx, (p + "ffn_gate_exps.weight").c_str());
-    ggml_tensor *down_exps   = ggml_get_tensor(wctx, (p + "ffn_down_exps.weight").c_str());
-    ggml_tensor *up_exps     = ggml_get_tensor(wctx, (p + "ffn_up_exps.weight").c_str());
 
     const int64_t n_tokens = inpL->ne[1];
     ggml_tensor *inpSA = inpL;
@@ -272,10 +431,6 @@ ggml_tensor *build_layer(ggml_context *gctx, ggml_tensor *inpL,
                          hp.freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
 
     // Append this token's K and V to the per-layer KV cache at column `pos`.
-    // Kcur/Vcur are [head_dim, n_head_kv, n_tokens=1]; the cache view selects
-    // the single column `pos`. ggml_cpy records the store as a graph node; we
-    // keep its handle so forward() expands it (otherwise the store could be
-    // pruned, since the cache tensor, not the cpy, is what attention reads).
     const size_t kv_col_nb = k_cache->nb[2];  // bytes per token-column
     ggml_tensor *k_dst = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
                                       n_tokens, k_cache->nb[1], k_cache->nb[2],
@@ -286,10 +441,7 @@ ggml_tensor *build_layer(ggml_context *gctx, ggml_tensor *inpL,
     graph_stores.push_back(ggml_cpy(gctx, Kcur, k_dst));
     graph_stores.push_back(ggml_cpy(gctx, Vcur, v_dst));
 
-    // Attention, mirroring the explicit (non-flash) else-branch of
-    // build_attn_mha, now over KV history. Gather the first n_kv cached columns
-    // of K and V as [head_dim, n_head_kv, n_kv] views, then permute to the
-    // attention layout. The causal mask is applied via ggml_soft_max_ext.
+    // Attention over KV history (explicit non-flash branch of build_attn_mha).
     ggml_tensor *k_hist = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
                                        n_kv, k_cache->nb[1], k_cache->nb[2], 0);
     ggml_tensor *v_hist = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
@@ -303,7 +455,6 @@ ggml_tensor *build_layer(ggml_context *gctx, ggml_tensor *inpL,
     // The reference forces GGML_PREC_F32 accumulation on kq; match it.
     ggml_prec_set_acc(kq, GGML_PREC_F32);
     const float kq_scale = 1.0f / std::sqrt(static_cast<float>(hp.head_dim));
-    // Causal mask [n_kv, n_tokens]: 0 for attendable positions, -inf otherwise.
     kq = ggml_soft_max_ext(gctx, kq, kq_mask, kq_scale, 0.0f);
 
     ggml_tensor *vt = ggml_cont(gctx, ggml_transpose(gctx, v));  // [n_kv, head_dim, n_head_kv]
@@ -319,7 +470,7 @@ ggml_tensor *build_layer(ggml_context *gctx, ggml_tensor *inpL,
     cur = ggml_rms_norm(gctx, ffn_inp, hp.rms_eps);
     cur = ggml_mul(gctx, cur, ffn_norm_w);
 
-    // MoE (build_moe_ffn: SOFTMAX gating, norm_w=true, w_scale=1).
+    // Router (build_moe_ffn: SOFTMAX gating, norm_w=true, w_scale=1).
     ggml_tensor *router   = ggml_mul_mat(gctx, gate_inp, cur);   // [n_expert, n_tokens]
     ggml_tensor *probs    = ggml_soft_max(gctx, router);         // [n_expert, n_tokens]
     ggml_tensor *selected = ggml_argsort_top_k(gctx, probs, hp.n_expert_used);
@@ -331,14 +482,53 @@ ggml_tensor *build_layer(ggml_context *gctx, ggml_tensor *inpL,
     weights = ggml_reshape_2d(gctx, weights, hp.n_expert_used, n_tokens);
     ggml_tensor *wsum = ggml_sum_rows(gctx, weights);           // [1, n_tokens]
     wsum = ggml_clamp(gctx, wsum, 6.103515625e-5f, INFINITY);
-    weights = ggml_div(gctx, weights, wsum);
-    weights = ggml_reshape_3d(gctx, weights, 1, hp.n_expert_used, n_tokens);
+    weights = ggml_div(gctx, weights, wsum);                    // [n_expert_used, n_tokens]
 
-    ggml_tensor *cur3 = ggml_reshape_3d(gctx, cur, hp.n_embd, 1, n_tokens);
-    ggml_tensor *up   = ggml_mul_mat_id(gctx, up_exps,   cur3, selected);
-    ggml_tensor *gate = ggml_mul_mat_id(gctx, gate_exps, cur3, selected);
+    // argsort_top_k returns a strided VIEW into the full argsort row; make the
+    // top-k ids contiguous so the host read-back gets exactly the k ids.
+    ggml_tensor *sel_c = ggml_cont(gctx, selected);
+
+    // Materialize the host-read-back tensors as distinct contiguous copies so
+    // the graph allocator cannot reuse their storage for a later op after the
+    // producing op runs (cur is consumed only by the router matmul, so without
+    // this the allocator may recycle its block and the read-back sees stale
+    // zeros). These copies are explicit graph leaves marked as outputs.
+    ggml_tensor *cur_o = ggml_cont(gctx, cur);
+    ggml_tensor *ffn_o = ggml_cont(gctx, ffn_inp);
+    ggml_tensor *w_o   = ggml_cont(gctx, weights);
+
+    ggml_set_output(cur_o);
+    ggml_set_output(ffn_o);
+    ggml_set_output(w_o);
+    ggml_set_output(sel_c);
+    *out_cur      = cur_o;
+    *out_ffn_inp  = ffn_o;
+    *out_weights  = w_o;
+    *out_selected = sel_c;
+}
+
+// Build the EXPERT segment for one layer (section 3.2 step 3) over the now-
+// resident staging stacked tensors. Inputs are filled from the host router
+// read-back: `cur_in` [n_embd,1], `ids_in` [n_expert_used] (I32), `w_in`
+// [n_expert_used]. `ffn_inp_in` [n_embd,1] is the residual branch. The staging
+// tensors (`stg_*`) carry valid bytes only in the routed experts' nb02 slices;
+// ggml_mul_mat_id skips the cne1==0 experts so the non-routed slices are never
+// read (section 3.3). Returns the layer output [n_embd, 1] (set as output).
+ggml_tensor *build_expert_segment(ggml_context *gctx, const EngineHParams &hp,
+                                  ggml_tensor *cur_in, ggml_tensor *ffn_inp_in,
+                                  ggml_tensor *ids_in, ggml_tensor *w_in,
+                                  ggml_tensor *stg_gate, ggml_tensor *stg_up,
+                                  ggml_tensor *stg_down) {
+    const int64_t n_tokens = 1;
+    ggml_tensor *ids = ggml_reshape_2d(gctx, ids_in, hp.n_expert_used, n_tokens);
+    ggml_tensor *weights =
+        ggml_reshape_3d(gctx, w_in, 1, hp.n_expert_used, n_tokens);
+
+    ggml_tensor *cur3 = ggml_reshape_3d(gctx, cur_in, hp.n_embd, 1, n_tokens);
+    ggml_tensor *up   = ggml_mul_mat_id(gctx, stg_up,   cur3, ids);
+    ggml_tensor *gate = ggml_mul_mat_id(gctx, stg_gate, cur3, ids);
     ggml_tensor *act  = ggml_swiglu_split(gctx, gate, up);
-    ggml_tensor *experts = ggml_mul_mat_id(gctx, down_exps, act, selected);
+    ggml_tensor *experts = ggml_mul_mat_id(gctx, stg_down, act, ids);
 
     // Weight each expert output and sum over the n_expert_used dim.
     experts = ggml_mul(gctx, experts, weights);                // [n_embd, n_used, n_tokens]
@@ -351,10 +541,107 @@ ggml_tensor *build_layer(ggml_context *gctx, ggml_tensor *inpL,
         moe_out = ggml_add(gctx, moe_out, ei);
     }
 
-    return ggml_add(gctx, moe_out, ffn_inp);  // residual
+    // Materialize a distinct contiguous copy for the host read-back so the
+    // graph allocator does not recycle the residual-add block (same reasoning
+    // as the router segment outputs).
+    ggml_tensor *layer_out = ggml_cont(gctx, ggml_add(gctx, moe_out, ffn_inp_in));
+    ggml_set_output(layer_out);
+    return layer_out;
+}
+
+// New no_alloc=true build context sized for one segment's node count.
+ggml_context *new_segment_ctx() {
+    ggml_init_params ip{};
+    ip.mem_size   = ggml_tensor_overhead() * 512 + ggml_graph_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    return ggml_init(ip);
 }
 
 } // namespace
+
+// Make the routed top-k experts of layer `il` resident in the staging stacked
+// tensors (section 3.2 step 2). For each distinct selected expert id, acquire
+// its {layer,expert} bundle from the bounded SlotPool (loading gate|up|down
+// from the full weight tensors on a miss), then copy the slot bytes into that
+// expert's nb02 slice of the staging tensors. Only these slices hold valid
+// bytes; the kernel never reads the others. Returns false on a lookup failure.
+bool Engine::ensure_layer_experts_resident(int il, const int32_t *ids,
+                                           int n_ids) {
+    Impl &im = *impl_;
+    const std::string p = "blk." + std::to_string(il) + ".";
+    ggml_tensor *src_gate = ggml_get_tensor(im.wctx, (p + "ffn_gate_exps.weight").c_str());
+    ggml_tensor *src_up   = ggml_get_tensor(im.wctx, (p + "ffn_up_exps.weight").c_str());
+    ggml_tensor *src_down = ggml_get_tensor(im.wctx, (p + "ffn_down_exps.weight").c_str());
+    if (src_gate == nullptr || src_up == nullptr || src_down == nullptr) {
+        log_error("engine: missing expert source tensor at layer " +
+                  std::to_string(il));
+        return false;
+    }
+    const size_t u = static_cast<size_t>(il);
+    ggml_tensor *dst_gate = im.stage_gate[u];
+    ggml_tensor *dst_up   = im.stage_up[u];
+    ggml_tensor *dst_down = im.stage_down[u];
+
+    const uint64_t gb = im.gate_expert_bytes;
+    const uint64_t ub = im.up_expert_bytes;
+    const uint64_t db = im.down_expert_bytes;
+
+    for (int i = 0; i < n_ids; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= hp_().n_expert) {
+            log_error("engine: routed expert id out of range");
+            return false;
+        }
+        // Skip duplicates within this token's top-k (acquire is idempotent, but
+        // this avoids a redundant copy).
+        bool dup = false;
+        for (int j = 0; j < i; ++j) {
+            if (ids[j] == e) { dup = true; break; }
+        }
+        if (dup) continue;
+
+        ExpertId id{static_cast<uint32_t>(il), static_cast<uint32_t>(e)};
+        // Load bytes for this expert bundle into its slot on a miss, pulling the
+        // nb02 slices from the full resident weight tensors (the backing store;
+        // the .strata source replaces this in EC-4).
+        const uint32_t slot = im.pool->acquire(id, [&](void *dst) {
+            uint8_t *d = static_cast<uint8_t *>(dst);
+            std::memcpy(d,
+                        static_cast<const uint8_t *>(src_gate->data) +
+                            static_cast<size_t>(e) * gb,
+                        static_cast<size_t>(gb));
+            std::memcpy(d + gb,
+                        static_cast<const uint8_t *>(src_up->data) +
+                            static_cast<size_t>(e) * ub,
+                        static_cast<size_t>(ub));
+            std::memcpy(d + gb + ub,
+                        static_cast<const uint8_t *>(src_down->data) +
+                            static_cast<size_t>(e) * db,
+                        static_cast<size_t>(db));
+        });
+        if (slot == UINT32_MAX) {
+            log_error("engine: slot pool returned no slot");
+            return false;
+        }
+
+        // Copy the resident slot bytes into the staging tensors' nb02 slices for
+        // this expert, so ggml_mul_mat_id reads correct bytes at cur_a*nb02.
+        const uint8_t *s = static_cast<const uint8_t *>(im.pool->slot_data(slot));
+        std::memcpy(static_cast<uint8_t *>(dst_gate->data) +
+                        static_cast<size_t>(e) * gb,
+                    s, static_cast<size_t>(gb));
+        std::memcpy(static_cast<uint8_t *>(dst_up->data) +
+                        static_cast<size_t>(e) * ub,
+                    s + gb, static_cast<size_t>(ub));
+        std::memcpy(static_cast<uint8_t *>(dst_down->data) +
+                        static_cast<size_t>(e) * db,
+                    s + gb + ub, static_cast<size_t>(db));
+    }
+    return true;
+}
+
+const EngineHParams &Engine::hp_() const { return impl_->hp; }
 
 bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     Impl &im = *impl_;
@@ -368,9 +655,6 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
         return false;
     }
 
-    // Position must land inside the trained context length. We trust the caller
-    // to drive positions in order, but bound-check against the KV capacity so a
-    // runaway sequence fails loudly instead of writing out of bounds.
     if (pos < 0 || im.kv == nullptr ||
         pos >= static_cast<int32_t>(im.kv->capacity())) {
         log_error("engine: position " + std::to_string(pos) +
@@ -379,107 +663,153 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
         return false;
     }
     const int64_t n_kv = static_cast<int64_t>(pos) + 1;  // attend over 0..pos
+    const size_t embd = static_cast<size_t>(hp.n_embd);
+    const size_t n_used = static_cast<size_t>(hp.n_expert_used);
 
-    // Graph build context (no_alloc=true): nodes get data from gallocr. Sized
-    // generously for the fixed per-token topology (a few dozen nodes/layer).
-    ggml_init_params ip{};
-    ip.mem_size   = ggml_tensor_overhead() * 4096 + ggml_graph_overhead();
-    ip.mem_buffer = nullptr;
-    ip.no_alloc   = true;
-    ggml_context *gctx = ggml_init(ip);
-    if (gctx == nullptr) {
-        log_error("engine: ggml_init failed");
-        return false;
+    // The layer-boundary hidden state carried on the host between segments.
+    // Segment 0's embedding lookup is folded into the first router segment's
+    // input tensor, so compute the embedding here into `hidden`.
+    std::vector<float> hidden(embd, 0.0f);
+    {
+        ggml_context *gctx = new_segment_ctx();
+        if (gctx == nullptr) { log_error("engine: ggml_init failed"); return false; }
+        ggml_tensor *inp_tok = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+        ggml_set_input(inp_tok);
+        ggml_tensor *emb = ggml_get_rows(gctx, tok_embd, inp_tok);  // [n_embd, 1]
+        ggml_set_output(emb);
+        const bool ok = run_segment(im.backend, im.galloc, gctx, {emb}, [&]() {
+            int32_t t = token;
+            ggml_backend_tensor_set(inp_tok, &t, 0, sizeof(t));
+        });
+        if (ok) {
+            ggml_backend_tensor_get(emb, hidden.data(), 0, embd * sizeof(float));
+        }
+        ggml_free(gctx);
+        if (!ok) return false;
     }
 
-    // Inputs: the single token id, its position, and the causal mask. The mask
-    // is [n_kv, 1]: a single query token at `pos` attends over all cached
-    // positions 0..pos, so every entry is attendable (0.0). The general shape
-    // (nonzero -inf entries) is kept so a future multi-token prefill batch can
-    // reuse this path unchanged.
-    ggml_tensor *inp_tok = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
-    ggml_set_input(inp_tok);
-    ggml_set_name(inp_tok, "inp_tok");
-    ggml_tensor *inp_pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
-    ggml_set_input(inp_pos);
-    ggml_set_name(inp_pos, "inp_pos");
-    ggml_tensor *kq_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_kv, 1);
-    ggml_set_input(kq_mask);
-    ggml_set_name(kq_mask, "kq_mask");
-
-    std::vector<ggml_tensor *> graph_stores;
-    ggml_tensor *inpL = ggml_get_rows(gctx, tok_embd, inp_tok);  // [n_embd, 1]
+    // Per-layer SEGMENTED execution (section 3.2): router segment -> host read
+    // back top-k ids -> make resident -> expert segment.
     for (int il = 0; il < hp.n_layer; ++il) {
-        inpL = build_layer(gctx, inpL, inp_pos, il, im.wctx, hp,
-                           im.k_cache[static_cast<size_t>(il)],
-                           im.v_cache[static_cast<size_t>(il)], kq_mask, pos,
-                           n_kv, graph_stores);
+        std::vector<float> cur_host(embd, 0.0f);
+        std::vector<float> ffn_inp_host(embd, 0.0f);
+        std::vector<float> w_host(n_used, 0.0f);
+        std::vector<int32_t> ids_host(n_used, 0);
+
+        // --- Router segment ---
+        {
+            ggml_context *gctx = new_segment_ctx();
+            if (gctx == nullptr) { log_error("engine: ggml_init failed"); return false; }
+
+            ggml_tensor *inpL = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hp.n_embd, 1);
+            ggml_set_input(inpL);
+            ggml_tensor *inp_pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+            ggml_set_input(inp_pos);
+            ggml_tensor *kq_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_kv, 1);
+            ggml_set_input(kq_mask);
+
+            std::vector<ggml_tensor *> stores;
+            ggml_tensor *r_cur = nullptr, *r_ffn = nullptr, *r_w = nullptr,
+                        *r_sel = nullptr;
+            build_router_segment(gctx, inpL, inp_pos, il, im.wctx, hp,
+                                 im.k_cache[static_cast<size_t>(il)],
+                                 im.v_cache[static_cast<size_t>(il)], kq_mask,
+                                 pos, n_kv, stores, &r_cur, &r_ffn, &r_w, &r_sel);
+
+            std::vector<ggml_tensor *> roots = stores;
+            roots.push_back(r_cur);
+            roots.push_back(r_ffn);
+            roots.push_back(r_w);
+            roots.push_back(r_sel);
+            const bool ok = run_segment(im.backend, im.galloc, gctx, roots, [&]() {
+                ggml_backend_tensor_set(inpL, hidden.data(), 0, embd * sizeof(float));
+                int32_t pi = pos;
+                ggml_backend_tensor_set(inp_pos, &pi, 0, sizeof(pi));
+                std::vector<float> mask(static_cast<size_t>(n_kv), 0.0f);
+                ggml_backend_tensor_set(kq_mask, mask.data(), 0,
+                                        mask.size() * sizeof(float));
+            });
+            if (ok) {
+                ggml_backend_tensor_get(r_cur, cur_host.data(), 0, embd * sizeof(float));
+                ggml_backend_tensor_get(r_ffn, ffn_inp_host.data(), 0, embd * sizeof(float));
+                ggml_backend_tensor_get(r_w, w_host.data(), 0, n_used * sizeof(float));
+                ggml_backend_tensor_get(r_sel, ids_host.data(), 0, n_used * sizeof(int32_t));
+            }
+            ggml_free(gctx);
+            if (!ok) return false;
+        }
+
+        // --- Make the routed top-k experts resident (bounded SlotPool) ---
+        if (!ensure_layer_experts_resident(il, ids_host.data(),
+                                           static_cast<int>(n_used))) {
+            return false;
+        }
+
+        // --- Expert segment ---
+        {
+            ggml_context *gctx = new_segment_ctx();
+            if (gctx == nullptr) { log_error("engine: ggml_init failed"); return false; }
+
+            ggml_tensor *cur_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hp.n_embd, 1);
+            ggml_set_input(cur_in);
+            ggml_tensor *ffn_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hp.n_embd, 1);
+            ggml_set_input(ffn_in);
+            ggml_tensor *ids_in = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, hp.n_expert_used);
+            ggml_set_input(ids_in);
+            ggml_tensor *w_in = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, hp.n_expert_used);
+            ggml_set_input(w_in);
+
+            const size_t lu = static_cast<size_t>(il);
+            ggml_tensor *layer_out = build_expert_segment(
+                gctx, hp, cur_in, ffn_in, ids_in, w_in, im.stage_gate[lu],
+                im.stage_up[lu], im.stage_down[lu]);
+
+            const bool ok = run_segment(im.backend, im.galloc, gctx, {layer_out}, [&]() {
+                ggml_backend_tensor_set(cur_in, cur_host.data(), 0, embd * sizeof(float));
+                ggml_backend_tensor_set(ffn_in, ffn_inp_host.data(), 0, embd * sizeof(float));
+                ggml_backend_tensor_set(ids_in, ids_host.data(), 0, n_used * sizeof(int32_t));
+                ggml_backend_tensor_set(w_in, w_host.data(), 0, n_used * sizeof(float));
+            });
+            if (ok) {
+                ggml_backend_tensor_get(layer_out, hidden.data(), 0, embd * sizeof(float));
+            }
+            ggml_free(gctx);
+            if (!ok) return false;
+        }
     }
 
-    // Final norm + lm_head.
-    ggml_tensor *cur = ggml_rms_norm(gctx, inpL, hp.rms_eps);
-    cur = ggml_mul(gctx, cur, out_norm);
-    cur = ggml_mul_mat(gctx, lm_head, cur);  // [n_vocab, 1]
-    ggml_set_output(cur);
-    ggml_set_name(cur, "result_logits");
+    // Final norm + lm_head segment.
+    {
+        ggml_context *gctx = new_segment_ctx();
+        if (gctx == nullptr) { log_error("engine: ggml_init failed"); return false; }
+        ggml_tensor *inpL = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hp.n_embd, 1);
+        ggml_set_input(inpL);
+        ggml_tensor *cur = ggml_rms_norm(gctx, inpL, hp.rms_eps);
+        cur = ggml_mul(gctx, cur, out_norm);
+        cur = ggml_mul_mat(gctx, lm_head, cur);  // [n_vocab, 1]
+        ggml_set_output(cur);
 
-    ggml_cgraph *gf = ggml_new_graph(gctx);
-    // Expand the KV stores first so they are not pruned (attention reads the
-    // cache tensor, not the cpy node, so the cpy must be rooted explicitly).
-    for (ggml_tensor *st : graph_stores) {
-        ggml_build_forward_expand(gf, st);
-    }
-    ggml_build_forward_expand(gf, cur);
-
-    // Allocate + compute on the CPU backend (1 thread for determinism, matching
-    // the greedy-determinism contract in CONTRIBUTING.md).
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    if (backend == nullptr) {
-        log_error("engine: cpu backend init failed");
+        const bool ok = run_segment(im.backend, im.galloc, gctx, {cur}, [&]() {
+            ggml_backend_tensor_set(inpL, hidden.data(), 0, embd * sizeof(float));
+        });
+        if (ok) {
+            out.resize(static_cast<size_t>(hp.n_vocab));
+            ggml_backend_tensor_get(cur, out.data(), 0,
+                                    static_cast<size_t>(hp.n_vocab) * sizeof(float));
+        }
         ggml_free(gctx);
-        return false;
-    }
-    ggml_backend_cpu_set_n_threads(backend, 1);
-
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
-    bool ok = galloc != nullptr && ggml_gallocr_alloc_graph(galloc, gf);
-    if (!ok) {
-        log_error("engine: gallocr alloc failed");
-        if (galloc != nullptr) ggml_gallocr_free(galloc);
-        ggml_backend_free(backend);
-        ggml_free(gctx);
-        return false;
+        if (!ok) return false;
     }
 
-    // Set inputs AFTER allocation.
-    int32_t tok_i = token;
-    int32_t pos_i = pos;
-    ggml_backend_tensor_set(inp_tok, &tok_i, 0, sizeof(tok_i));
-    ggml_backend_tensor_set(inp_pos, &pos_i, 0, sizeof(pos_i));
-    // Causal mask for a single query token at `pos`: all cached positions
-    // 0..pos are <= pos, so all are attendable (0.0). (A multi-token batch
-    // would set -inf for j > i; left as the general shape for reuse.)
-    std::vector<float> mask(static_cast<size_t>(n_kv), 0.0f);
-    ggml_backend_tensor_set(kq_mask, mask.data(), 0,
-                            mask.size() * sizeof(float));
+    // The token at `pos` is now committed to the KV cache; advance bookkeeping.
+    im.kv->advance(1);
 
-    const bool compute_ok =
-        ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-    if (compute_ok) {
-        out.resize(static_cast<size_t>(hp.n_vocab));
-        ggml_backend_tensor_get(cur, out.data(), 0,
-                                static_cast<size_t>(hp.n_vocab) * sizeof(float));
-        // The token at `pos` is now committed to the KV cache; advance the
-        // bookkeeping so used()/bytes() reflect it.
-        im.kv->advance(1);
-    } else {
-        log_error("engine: graph compute failed");
-    }
-
-    ggml_gallocr_free(galloc);
-    ggml_backend_free(backend);
-    ggml_free(gctx);
-    return compute_ok;
+    // Surface the pool's cache stats (hits/misses/evictions) to the engine.
+    const CacheStats &cs = im.pool->stats();
+    im.cstats.hits      = cs.hits;
+    im.cstats.misses    = cs.misses;
+    im.cstats.evictions = cs.evictions;
+    return true;
 }
 
 // ---- oracle + vocab helpers (test support) -------------------------------
