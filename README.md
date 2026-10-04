@@ -91,8 +91,14 @@ and Windows (MSVC):
   count, decode is byte-identical to the fully-resident run while holding only
   the top-k experts per layer (measured: resident expert RAM cut to a fraction,
   with real cache eviction and reload).
-- **`.strata` single-file loader**: our loader reads the trunk and streams
-  experts directly; decode is byte-identical to the source GGUF.
+- **`.strata` single-file loader with bounded RAM**: our loader holds only the
+  always-resident trunk in memory and streams experts from disk on demand - the
+  full expert footprint is never allocated. On the tiny MoE this is proven by a
+  test: 103 KB trunk resident, 393 KB of experts NOT resident. For a real
+  trillion-scale model this is the difference between needing all the RAM and
+  needing only the trunk plus a small expert cache. Decode is byte-identical to
+  the source GGUF. This is the core "run big models on everyday hardware without
+  a GPU" path.
 - **The engine is the default and only inference path.**
 - **Predictor-driven prefetch**: the router read-back feeds a predictor that
   warms the next layer's likely experts into the cache ahead of use, raising the

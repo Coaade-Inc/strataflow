@@ -129,6 +129,12 @@ struct Engine::Impl {
     // differs, which keeps decode byte-identical (same bytes, same ops).
     std::unique_ptr<StrataReader> reader;
     ggml_backend_buffer_t wbuf = nullptr;  // backing for wctx on the .strata path
+    // .strata path only: expert tensors live here as METADATA ONLY (no_alloc,
+    // never backed by a buffer), so the full expert footprint is NOT resident
+    // in RAM - the whole point of streaming. The SlotPool streams each routed
+    // expert from the .strata file via read_blob; these tensors exist only so
+    // the staging-tensor sizing can read their ne-shape and nb[2] stride.
+    ggml_context *ectx = nullptr;
 
     ~Impl() {
         if (galloc != nullptr) ggml_gallocr_free(galloc);
@@ -139,6 +145,7 @@ struct Engine::Impl {
         if (kvctx != nullptr) ggml_free(kvctx);
         if (wbuf != nullptr) ggml_backend_buffer_free(wbuf);
         if (wctx != nullptr) ggml_free(wctx);
+        if (ectx != nullptr) ggml_free(ectx);  // no buffer: metadata only
         if (gc != nullptr) gguf_free(gc);
     }
 };
@@ -182,14 +189,21 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
     // Build a no_alloc context holding every tensor's metadata (name/shape/
     // type) mirrored from the embedded GGUF tensor-info. ggml_new_tensor copies
     // the ne-shape; we set the name so get_weight(name) resolves downstream.
+    // Two contexts: wctx holds the TRUNK tensors (allocated resident); ectx
+    // holds the EXPERT tensors as metadata only (no_alloc, never backed), so
+    // the full expert footprint is NOT resident in RAM. This is the bounded-RAM
+    // guarantee: a huge MoE allocates only trunk + the SlotPool here, and the
+    // experts stream from the .strata file on demand.
     {
         ggml_init_params ip{};
         ip.mem_size = ggml_tensor_overhead() *
                       (static_cast<size_t>(n_tensors) + 8);
         ip.mem_buffer = nullptr;
-        ip.no_alloc = true;  // backing comes from one buffer below
+        ip.no_alloc = true;  // trunk backing comes from one buffer below
         im.wctx = ggml_init(ip);
-        if (im.wctx == nullptr) {
+        ggml_init_params ep = ip;
+        im.ectx = ggml_init(ep);
+        if (im.wctx == nullptr || im.ectx == nullptr) {
             log_warn("engine: .strata weight context init failed");
             return false;
         }
@@ -204,7 +218,10 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         const int64_t *src_ne = gguf_get_tensor_ne(im.gc, i);
         int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
         for (int d = 0; d < GGML_MAX_DIMS; ++d) ne[d] = src_ne[d];
-        ggml_tensor *t = ggml_new_tensor(im.wctx, type, GGML_MAX_DIMS, ne);
+        // Expert tensors -> ectx (metadata only); everything else -> wctx.
+        const bool is_expert = parse_expert_tensor_name(name).valid;
+        ggml_context *into = is_expert ? im.ectx : im.wctx;
+        ggml_tensor *t = ggml_new_tensor(into, type, GGML_MAX_DIMS, ne);
         if (t == nullptr) {
             log_warn("engine: .strata tensor create failed for '" +
                      std::string(name) + "'");
@@ -213,7 +230,8 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         ggml_set_name(t, name);
     }
 
-    // Allocate all weight tensors from the CPU buffer type in one buffer.
+    // Allocate ONLY the trunk tensors (wctx) resident. ectx (experts) is left
+    // unbacked on purpose - experts stream from the .strata file.
     im.wbuf = ggml_backend_alloc_ctx_tensors_from_buft(
         im.wctx, ggml_backend_cpu_buffer_type());
     if (im.wbuf == nullptr) {
@@ -263,6 +281,14 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
 
 const EngineHParams &Engine::hparams() const { return impl_->hp; }
 const EngineCacheStats &Engine::cache_stats() const { return impl_->cstats; }
+
+uint64_t Engine::resident_weight_bytes() const {
+    // The .strata path backs only the trunk tensors in im.wbuf; experts live in
+    // the unbacked ectx. The plain-GGUF path lets ggml/llama own the mapping,
+    // so there is no single wbuf to measure -> report 0 (not applicable).
+    if (impl_->wbuf == nullptr) return 0;
+    return static_cast<uint64_t>(ggml_backend_buffer_get_size(impl_->wbuf));
+}
 
 std::unique_ptr<Engine> Engine::load(const std::string &path,
                                      uint32_t expert_slots) {
@@ -344,7 +370,14 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     // (ffn_gate_exps.weight). Detect which by the layer-0 FFN tensors. Probe
     // with ggml_get_tensor directly (not get_weight) so an expected absence is
     // not logged as an error.
-    ggml_tensor *ge0  = ggml_get_tensor(im.wctx, "blk.0.ffn_gate_exps.weight");
+    // Expert tensors live in ectx on the .strata path (metadata only), in wctx
+    // on the plain-GGUF path. Look in both.
+    auto expert_meta = [&](const char *n) -> ggml_tensor * {
+        ggml_tensor *t = ggml_get_tensor(im.wctx, n);
+        if (t == nullptr && im.ectx != nullptr) t = ggml_get_tensor(im.ectx, n);
+        return t;
+    };
+    ggml_tensor *ge0  = expert_meta("blk.0.ffn_gate_exps.weight");
     ggml_tensor *dg0  = ggml_get_tensor(im.wctx, "blk.0.ffn_gate.weight");
     im.is_moe = (ge0 != nullptr && hp.n_expert > 0);
 
@@ -436,9 +469,9 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     // resident expert RAM to that many bundles. Dense models (EC-7) have no
     // experts, so this whole block is MoE-only.
     if (im.is_moe) {
-        ggml_tensor *g0 = ggml_get_tensor(im.wctx, "blk.0.ffn_gate_exps.weight");
-        ggml_tensor *u0 = ggml_get_tensor(im.wctx, "blk.0.ffn_up_exps.weight");
-        ggml_tensor *d0 = ggml_get_tensor(im.wctx, "blk.0.ffn_down_exps.weight");
+        ggml_tensor *g0 = expert_meta("blk.0.ffn_gate_exps.weight");
+        ggml_tensor *u0 = expert_meta("blk.0.ffn_up_exps.weight");
+        ggml_tensor *d0 = expert_meta("blk.0.ffn_down_exps.weight");
         if (g0 == nullptr || u0 == nullptr || d0 == nullptr) {
             log_warn("engine: missing expert tensor; staying on libllama path");
             return nullptr;

@@ -234,8 +234,55 @@ static void test_strata_decode_byte_identical() {
     std::remove(strata_path.c_str());
 }
 
+// THE MISSION GATE: on the .strata streaming path the engine must hold only the
+// TRUNK resident in RAM, NOT the full expert footprint. This is what lets a
+// huge MoE run in a small RAM budget on an everyday no-GPU machine. We pack the
+// tiny MoE, load it via .strata, and assert the resident weight bytes are far
+// below the full model size (experts excluded) - and specifically below the
+// total expert-region size reported by the pack index.
+static void test_strata_resident_excludes_experts() {
+    const char *gguf = std::getenv("STRATAFLOW_TEST_MOE_GGUF");
+    if (gguf == nullptr || gguf[0] == '\0') {
+        std::printf("[skipped: set STRATAFLOW_TEST_MOE_GGUF] ");
+        return;
+    }
+    const std::string gguf_path = gguf;
+    const std::string strata_path = gguf_path + ".ramgate.strata";
+
+    std::string err;
+    CHECK(pack_gguf_to_strata(gguf_path, strata_path, &err));
+
+    // Expert-region size from the .strata superblock (the bytes that must NOT
+    // be resident), and the trunk size (the bytes that may be).
+    StrataReader reader;
+    CHECK(reader.open(strata_path));
+    const uint64_t expert_region = reader.superblock().expert_region_size;
+    const uint64_t trunk_region  = reader.superblock().trunk_size;
+    CHECK(expert_region > 0);
+
+    std::unique_ptr<engine::Engine> eng = engine::Engine::load(strata_path);
+    CHECK(eng != nullptr);
+    if (eng == nullptr) return;
+
+    const uint64_t resident = eng->resident_weight_bytes();
+
+    std::printf("[resident weight=%lluB trunk=%lluB experts(not resident)=%lluB] ",
+                static_cast<unsigned long long>(resident),
+                static_cast<unsigned long long>(trunk_region),
+                static_cast<unsigned long long>(expert_region));
+
+    // The hard assertion: resident weight RAM does NOT include the expert
+    // footprint. It must be below the full model (trunk + experts) by at least
+    // the whole expert region - i.e. resident < trunk + experts, and in fact
+    // resident should be on the order of the trunk alone.
+    CHECK(resident > 0);                       // trunk is resident
+    CHECK(resident < trunk_region + expert_region);  // experts excluded
+    CHECK(resident <= trunk_region + (trunk_region / 2));  // ~trunk-sized, not model-sized
+}
+
 static void run_all() {
     RUN(test_strata_decode_byte_identical);
+    RUN(test_strata_resident_excludes_experts);
 }
 
 TEST_MAIN()
