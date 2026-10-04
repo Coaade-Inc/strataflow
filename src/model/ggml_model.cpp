@@ -17,6 +17,7 @@
 #include "model/engine/engine.h"
 #include "plan/llama_placement.h"
 #include "plan/planner.h"
+#include "tws/strata_file.h"
 #include "tws/stream_buft.h"
 
 #include <ggml-backend.h>
@@ -92,10 +93,14 @@ public:
     // `path` is retained so the opt-in EC-1 engine (STRATAFLOW_ENGINE=1) can
     // read the SAME gguf resident on first use.
     GgmlModel(llama_model *model, llama_context *ctx, const ModelShape &shape,
-              llama_token eos, std::string path)
+              llama_token eos, std::string path, bool is_strata)
         : model_(model), ctx_(ctx), vocab_(llama_model_get_vocab(model)),
           shape_(shape), eos_(eos), path_(std::move(path)),
-          use_engine_(use_engine_env()) {}
+          is_strata_(is_strata),
+          // A .strata is OUR split format: libllama cannot decode it, so the
+          // engine is MANDATORY (no libllama fallback). A plain GGUF keeps the
+          // opt-in behaviour (STRATAFLOW_ENGINE=1).
+          use_engine_(is_strata || use_engine_env()) {}
 
     GgmlModel(const GgmlModel &) = delete;
     GgmlModel &operator=(const GgmlModel &) = delete;
@@ -168,9 +173,16 @@ public:
         if (use_engine_) {
             const int32_t r = forward_engine(last_token);
             if (r >= 0) return r;
-            // Engine unavailable for this model/arch: fall back to libllama for
-            // this call (and future calls) so the model stays usable. EC-1 keeps
-            // libllama as the default and the safe fallback.
+            // A .strata has no libllama fallback (libllama cannot decode our
+            // split format), so a failure here is terminal: return EOS.
+            if (is_strata_) {
+                log_error("GgmlModel: engine failed on .strata; cannot fall "
+                          "back to libllama");
+                return eos_;
+            }
+            // Plain GGUF: engine unavailable for this model/arch -> fall back to
+            // libllama for this call (and future calls) so the model stays
+            // usable. EC-1 keeps libllama as the default and the safe fallback.
             use_engine_ = false;
             log_warn("GgmlModel: engine path unavailable; using libllama path");
         }
@@ -264,6 +276,7 @@ private:
     llama_token          eos_    = 0;
     int32_t              n_past_ = 0;
     std::string          path_;
+    bool                 is_strata_  = false;
     bool                 use_engine_ = false;
     std::unique_ptr<engine::Engine> engine_;
 };
@@ -450,11 +463,145 @@ void enumerate_gpus(std::vector<GpuInfo> &out) {
     }
 }
 
+// EC-4: load a .strata single file (docs/ENGINE_CORE_DESIGN.md section 5). The
+// weights (trunk + experts) are owned by OUR engine, which reads them straight
+// from the .strata; libllama is never handed the .strata (that was the
+// TASK5_BLOCKER). We still want libllama's vocab/tokenizer, whose data lives in
+// the .strata's embedded GGUF metadata blob. llama's loader cannot open a
+// .strata, and the embedded blob alone has tensor-info but no tensor data, so
+// we extract the blob to a sidecar .gguf and load it VOCAB-ONLY (no tensors
+// read). The resulting llama_model/context serve tokenize/detokenize/vocab;
+// forward() runs entirely through the engine (is_strata=true forces it, with no
+// libllama fallback).
+sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
+                            uint64_t vram_budget, uint64_t ram_budget,
+                            std::unique_ptr<Model> &out,
+                            PlacementPlan *out_plan) {
+    StrataReader reader;
+    if (!reader.open(path)) {
+        log_warn("load_strata_model: cannot open .strata '" + path + "'");
+        return SF_ERR_MODEL_LOAD;
+    }
+
+    // Compute the byte size a standalone GGUF for this metadata would occupy:
+    // data_offset + the end of the last tensor's data. llama's loader (even
+    // vocab_only) validates that every tensor's data range lies within the
+    // file, so the sidecar is the verbatim metadata blob zero-padded up to this
+    // size. vocab_only never reads the (zero) tensor data, so the padding is
+    // inert; it only satisfies the bounds check.
+    uint64_t sidecar_size = reader.metadata_size();
+    {
+        gguf_init_params gp{};
+        gp.no_alloc = true;
+        gp.ctx = nullptr;
+        gguf_context *gc = gguf_init_from_buffer(
+            reader.metadata(), static_cast<size_t>(reader.metadata_size()), gp);
+        if (gc == nullptr) {
+            log_warn("load_strata_model: cannot parse embedded metadata of '" +
+                     path + "'");
+            return SF_ERR_MODEL_LOAD;
+        }
+        const uint64_t data_offset = gguf_get_data_offset(gc);
+        uint64_t data_end = 0;
+        const int64_t n_tensors = gguf_get_n_tensors(gc);
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            const uint64_t end =
+                gguf_get_tensor_offset(gc, i) + gguf_get_tensor_size(gc, i);
+            if (end > data_end) data_end = end;
+        }
+        gguf_free(gc);
+        sidecar_size = data_offset + data_end;
+    }
+
+    // Extract the embedded GGUF metadata blob to a sidecar file for the
+    // vocab-only load, zero-padded to sidecar_size. Placed next to the .strata
+    // so it inherits a writable directory; removed after the load.
+    const std::string meta_path = path + ".vocab.gguf";
+    {
+        std::FILE *mf = std::fopen(meta_path.c_str(), "wb");
+        if (mf == nullptr) {
+            log_warn("load_strata_model: cannot create '" + meta_path + "'");
+            return SF_ERR_MODEL_LOAD;
+        }
+        const size_t n = std::fwrite(reader.metadata(), 1,
+                                     static_cast<size_t>(reader.metadata_size()),
+                                     mf);
+        bool ok = n == static_cast<size_t>(reader.metadata_size());
+        // Zero-pad up to sidecar_size so tensor data ranges are in-bounds.
+        if (ok && sidecar_size > reader.metadata_size()) {
+            ok = std::fseek(mf, static_cast<long>(sidecar_size - 1), SEEK_SET) == 0 &&
+                 std::fputc(0, mf) != EOF;
+        }
+        std::fclose(mf);
+        if (!ok) {
+            std::remove(meta_path.c_str());
+            log_warn("load_strata_model: short write to '" + meta_path + "'");
+            return SF_ERR_MODEL_LOAD;
+        }
+    }
+
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    mp.vocab_only = true;  // metadata/vocab only; no tensor data is read
+    llama_model *model = llama_model_load_from_file(meta_path.c_str(), mp);
+    std::remove(meta_path.c_str());
+    if (model == nullptr) {
+        log_warn("load_strata_model: vocab-only load failed for '" + path + "'");
+        return SF_ERR_MODEL_LOAD;
+    }
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 0;
+    llama_context *ctx = llama_init_from_model(model, cp);
+    // A vocab-only model may not support a decode context on all builds; the
+    // engine owns inference, so a null context is tolerated (tokenize/detokenize
+    // use the model+vocab, not the context).
+
+    const llama_vocab *vocab = llama_model_get_vocab(model);
+    llama_token eos = llama_vocab_eos(vocab);
+    if (eos < 0) eos = 0;
+
+    // Shape from the loaded (vocab-only) model's metadata. make_shape reads the
+    // same KV keys a plain GGUF reports; total/expert byte estimates are from
+    // the metadata too. A vocab-only llama_model reports 0 layers (it did not
+    // read the arch block), so backfill layers/experts from the .strata
+    // superblock, which records them directly.
+    ModelShape shape = make_shape(model);
+    if (shape.name.empty()) shape.name = "strata-model";
+    const StrataSuperblock &sb = reader.superblock();
+    if (shape.n_layers == 0) shape.n_layers = sb.n_layers;
+    if (sb.n_experts > 0) {
+        shape.is_moe = true;
+        if (shape.n_experts == 0) shape.n_experts = sb.n_experts;
+    }
+
+    PlacementPlan plan = plan_placement(hw, shape, vram_budget, ram_budget);
+    if (out_plan != nullptr) *out_plan = plan;
+
+    log_info("GgmlModel loaded .strata '" + shape.name + "': " +
+             std::to_string(shape.n_layers) + " layers, " +
+             (shape.is_moe ? ("MoE " + std::to_string(shape.n_experts) + "x" +
+                              std::to_string(shape.n_experts_used))
+                           : std::string("dense")) +
+             " (engine owns inference; no llama_decode on the .strata)");
+
+    out = std::unique_ptr<Model>(
+        new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/true));
+    return SF_OK;
+}
+
 sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
                           uint64_t vram_budget, uint64_t ram_budget,
                           std::unique_ptr<Model> &out, PlacementPlan *out_plan) {
     ensure_backend();
     llama_log_set(sf_llama_log_cb, nullptr);
+
+    // EC-4: a .strata single file is handled by our own loader + engine; it is
+    // NEVER handed to llama_model_load_from_file (the TASK5_BLOCKER root cause).
+    if (is_strata_file(path)) {
+        return load_strata_model(path, hw, vram_budget, ram_budget, out,
+                                 out_plan);
+    }
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;  // CPU default; overridden below from the plan.
@@ -581,7 +728,8 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
         *out_plan = plan_placement(hw, shape, vram_budget, ram_budget);
     }
 
-    out = std::unique_ptr<Model>(new GgmlModel(model, ctx, shape, eos, path));
+    out = std::unique_ptr<Model>(
+        new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/false));
     return SF_OK;
 }
 

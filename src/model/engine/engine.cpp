@@ -21,6 +21,7 @@
 
 #include "common/log.h"
 #include "kv/kv_store.h"
+#include "tws/strata_file.h"
 #include "tws/weight_store.h"
 
 #include <ggml-alloc.h>
@@ -101,6 +102,16 @@ struct Engine::Impl {
     ggml_backend_t backend = nullptr;
     ggml_gallocr_t galloc  = nullptr;
 
+    // EC-4: when the model was loaded from a .strata single file, `reader` is
+    // the byte source for the SlotPool: expert bundles are streamed from the
+    // .strata expert region via StrataReader::read_blob instead of copied from
+    // resident GGUF weight tensors. nullptr on the plain-GGUF path (experts are
+    // served from the resident wctx expert tensors, EC-3). The trunk tensors
+    // are resident in wctx on both paths; only the expert byte provenance
+    // differs, which keeps decode byte-identical (same bytes, same ops).
+    std::unique_ptr<StrataReader> reader;
+    ggml_backend_buffer_t wbuf = nullptr;  // backing for wctx on the .strata path
+
     ~Impl() {
         if (galloc != nullptr) ggml_gallocr_free(galloc);
         if (backend != nullptr) ggml_backend_free(backend);
@@ -108,6 +119,7 @@ struct Engine::Impl {
         if (estctx != nullptr) ggml_free(estctx);
         if (kvbuf != nullptr) ggml_backend_buffer_free(kvbuf);
         if (kvctx != nullptr) ggml_free(kvctx);
+        if (wbuf != nullptr) ggml_backend_buffer_free(wbuf);
         if (wctx != nullptr) ggml_free(wctx);
         if (gc != nullptr) gguf_free(gc);
     }
@@ -115,6 +127,121 @@ struct Engine::Impl {
 
 Engine::Engine() : impl_(new Impl()) {}
 Engine::~Engine() = default;
+
+// EC-4 (section 5.1): open a .strata, parse its embedded GGUF metadata into
+// im.gc, build the resident weight context im.wctx from that metadata (shapes/
+// types/names), allocate it from the CPU buffer type, and fill the TRUNK
+// tensors from the .strata trunk block. Expert tensors are created resident too
+// (so the staging-tensor sizing and the mul_mat_id addressing are identical to
+// the GGUF path) but are NOT filled here: on the .strata path the SlotPool
+// streams each routed expert bundle from the retained StrataReader
+// (im.reader) via read_blob, so the expert byte provenance is the .strata
+// expert region, not these tensors. The trunk block is a verbatim contiguous
+// copy of the non-expert tensors in GGUF order, so a tensor's trunk-relative
+// offset is the running sum of the preceding non-expert tensor sizes.
+bool Engine::load_strata_weights(Impl &im, const std::string &path) {
+    std::unique_ptr<StrataReader> reader(new StrataReader());
+    if (!reader->open(path)) {
+        return false;  // StrataReader logged the specific failure
+    }
+
+    // Parse the embedded GGUF metadata blob (header+KV+tensor-info, verbatim).
+    // no_alloc=true: metadata only, no tensor data (there is none in the blob).
+    gguf_init_params mp{};
+    mp.no_alloc = true;
+    mp.ctx = nullptr;
+    im.gc = gguf_init_from_buffer(reader->metadata(),
+                                  static_cast<size_t>(reader->metadata_size()),
+                                  mp);
+    if (im.gc == nullptr) {
+        log_warn("engine: failed to parse embedded GGUF metadata in '" + path +
+                 "'");
+        return false;
+    }
+
+    const int64_t n_tensors = gguf_get_n_tensors(im.gc);
+
+    // Build a no_alloc context holding every tensor's metadata (name/shape/
+    // type) mirrored from the embedded GGUF tensor-info. ggml_new_tensor copies
+    // the ne-shape; we set the name so get_weight(name) resolves downstream.
+    {
+        ggml_init_params ip{};
+        ip.mem_size = ggml_tensor_overhead() *
+                      (static_cast<size_t>(n_tensors) + 8);
+        ip.mem_buffer = nullptr;
+        ip.no_alloc = true;  // backing comes from one buffer below
+        im.wctx = ggml_init(ip);
+        if (im.wctx == nullptr) {
+            log_warn("engine: .strata weight context init failed");
+            return false;
+        }
+    }
+
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        const char *name = gguf_get_tensor_name(im.gc, i);
+        const ggml_type type = gguf_get_tensor_type(im.gc, i);
+        // gguf_get_tensor_ne returns a GGML_MAX_DIMS array (ne[d]==1 for d >=
+        // n_dims), the same inner-first order ggml uses, so pass it straight to
+        // ggml_new_tensor with the full dim count; the trailing 1s are inert.
+        const int64_t *src_ne = gguf_get_tensor_ne(im.gc, i);
+        int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) ne[d] = src_ne[d];
+        ggml_tensor *t = ggml_new_tensor(im.wctx, type, GGML_MAX_DIMS, ne);
+        if (t == nullptr) {
+            log_warn("engine: .strata tensor create failed for '" +
+                     std::string(name) + "'");
+            return false;
+        }
+        ggml_set_name(t, name);
+    }
+
+    // Allocate all weight tensors from the CPU buffer type in one buffer.
+    im.wbuf = ggml_backend_alloc_ctx_tensors_from_buft(
+        im.wctx, ggml_backend_cpu_buffer_type());
+    if (im.wbuf == nullptr) {
+        log_warn("engine: .strata weight buffer alloc failed");
+        return false;
+    }
+
+    // Fill the TRUNK tensors from the trunk block. The trunk block packs the
+    // non-expert tensors contiguously in GGUF tensor order (tools/strata-pack),
+    // so iterate in that order and track the running trunk-relative offset.
+    const uint64_t trunk_base = reader->superblock().trunk_offset;
+    uint64_t trunk_rel = 0;
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        const char *name = gguf_get_tensor_name(im.gc, i);
+        const uint64_t sz = gguf_get_tensor_size(im.gc, i);
+        // Expert tensors live in the expert region, not the trunk; skip them
+        // here (they stream through the SlotPool from read_blob).
+        if (parse_expert_tensor_name(name).valid) {
+            continue;
+        }
+        ggml_tensor *t = ggml_get_tensor(im.wctx, name);
+        if (t == nullptr) {
+            log_warn("engine: .strata trunk tensor missing '" +
+                     std::string(name) + "'");
+            return false;
+        }
+        if (static_cast<uint64_t>(ggml_nbytes(t)) != sz) {
+            log_warn("engine: .strata trunk tensor size mismatch '" +
+                     std::string(name) + "'");
+            return false;
+        }
+        const int64_t n = reader->read_at(t->data, sz, trunk_base + trunk_rel);
+        if (n != static_cast<int64_t>(sz)) {
+            log_warn("engine: .strata trunk read failed for '" +
+                     std::string(name) + "'");
+            return false;
+        }
+        trunk_rel += sz;
+    }
+
+    im.reader = std::move(reader);
+    log_info("engine: loaded .strata trunk (" +
+             std::to_string(im.reader->index_count()) + " expert blobs; "
+             "experts stream via StrataReader)");
+    return true;
+}
 
 const EngineHParams &Engine::hparams() const { return impl_->hp; }
 const EngineCacheStats &Engine::cache_stats() const { return impl_->cstats; }
@@ -124,16 +251,31 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     std::unique_ptr<Engine> eng(new Engine());
     Impl &im = *eng->impl_;
 
-    // Read trunk + expert tensors resident. no_alloc=false lets ggml allocate
-    // and fill every tensor so we can fetch each weight by its GGUF name. All
-    // experts resident (no streaming) is EC-1 scope; EC-3 adds residency.
-    gguf_init_params gp{};
-    gp.no_alloc = false;
-    gp.ctx = &im.wctx;
-    im.gc = gguf_init_from_file(path.c_str(), gp);
-    if (im.gc == nullptr || im.wctx == nullptr) {
-        log_warn("engine: gguf open failed for '" + path + "'");
-        return nullptr;
+    // EC-4: a .strata single file is our own split trunk/expert format. We read
+    // its embedded GGUF metadata + trunk tensors directly here (NO
+    // llama_model_load_from_file is ever handed a .strata), and stream experts
+    // from the .strata expert region via the StrataReader (section 5.1). A
+    // plain GGUF stays on the resident gguf_init_from_file path (section 5.2).
+    // Both populate im.gc (metadata) and im.wctx (resident weight tensors) so
+    // everything downstream (hparams, KV sizing, staging, forward) is shared.
+    if (is_strata_file(path)) {
+        if (!load_strata_weights(im, path)) {
+            log_warn("engine: .strata load failed for '" + path + "'");
+            return nullptr;
+        }
+    } else {
+        // Read trunk + expert tensors resident. no_alloc=false lets ggml
+        // allocate and fill every tensor so we can fetch each weight by its
+        // GGUF name. On this path experts are served from these resident
+        // tensors (EC-3's backing store).
+        gguf_init_params gp{};
+        gp.no_alloc = false;
+        gp.ctx = &im.wctx;
+        im.gc = gguf_init_from_file(path.c_str(), gp);
+        if (im.gc == nullptr || im.wctx == nullptr) {
+            log_warn("engine: gguf open failed for '" + path + "'");
+            return nullptr;
+        }
     }
 
     // Confirm this is the one architecture EC-1 handles. Anything else stays on
@@ -570,13 +712,22 @@ bool Engine::ensure_layer_experts_resident(int il, const int32_t *ids,
                                            int n_ids) {
     Impl &im = *impl_;
     const std::string p = "blk." + std::to_string(il) + ".";
-    ggml_tensor *src_gate = ggml_get_tensor(im.wctx, (p + "ffn_gate_exps.weight").c_str());
-    ggml_tensor *src_up   = ggml_get_tensor(im.wctx, (p + "ffn_up_exps.weight").c_str());
-    ggml_tensor *src_down = ggml_get_tensor(im.wctx, (p + "ffn_down_exps.weight").c_str());
-    if (src_gate == nullptr || src_up == nullptr || src_down == nullptr) {
-        log_error("engine: missing expert source tensor at layer " +
-                  std::to_string(il));
-        return false;
+    // Plain-GGUF path: experts are served from the resident wctx tensors. On
+    // the .strata path (im.reader != nullptr) they stream from the .strata
+    // expert region via StrataReader::read_blob, so these resident tensors are
+    // not read (and were never filled). Only look them up on the GGUF path.
+    ggml_tensor *src_gate = nullptr;
+    ggml_tensor *src_up   = nullptr;
+    ggml_tensor *src_down = nullptr;
+    if (im.reader == nullptr) {
+        src_gate = ggml_get_tensor(im.wctx, (p + "ffn_gate_exps.weight").c_str());
+        src_up   = ggml_get_tensor(im.wctx, (p + "ffn_up_exps.weight").c_str());
+        src_down = ggml_get_tensor(im.wctx, (p + "ffn_down_exps.weight").c_str());
+        if (src_gate == nullptr || src_up == nullptr || src_down == nullptr) {
+            log_error("engine: missing expert source tensor at layer " +
+                      std::to_string(il));
+            return false;
+        }
     }
     const size_t u = static_cast<size_t>(il);
     ggml_tensor *dst_gate = im.stage_gate[u];
@@ -602,26 +753,53 @@ bool Engine::ensure_layer_experts_resident(int il, const int32_t *ids,
         if (dup) continue;
 
         ExpertId id{static_cast<uint32_t>(il), static_cast<uint32_t>(e)};
-        // Load bytes for this expert bundle into its slot on a miss, pulling the
-        // nb02 slices from the full resident weight tensors (the backing store;
-        // the .strata source replaces this in EC-4).
+        // Load this expert bundle's gate|up|down bytes into its slot on a miss.
+        // Byte source (EC-4): the .strata expert region via StrataReader when a
+        // .strata was loaded, else the per-expert nb02 slices of the resident
+        // GGUF weight tensors. Either source yields the SAME verbatim bytes
+        // (the packer copies bytes), so the slot contents - and the decode -
+        // are byte-identical regardless of provenance.
+        bool load_ok = true;
         const uint32_t slot = im.pool->acquire(id, [&](void *dst) {
             uint8_t *d = static_cast<uint8_t *>(dst);
-            std::memcpy(d,
-                        static_cast<const uint8_t *>(src_gate->data) +
-                            static_cast<size_t>(e) * gb,
-                        static_cast<size_t>(gb));
-            std::memcpy(d + gb,
-                        static_cast<const uint8_t *>(src_up->data) +
-                            static_cast<size_t>(e) * ub,
-                        static_cast<size_t>(ub));
-            std::memcpy(d + gb + ub,
-                        static_cast<const uint8_t *>(src_down->data) +
-                            static_cast<size_t>(e) * db,
-                        static_cast<size_t>(db));
+            if (im.reader != nullptr) {
+                const int64_t ng = im.reader->read_blob(
+                    static_cast<uint32_t>(il), static_cast<uint32_t>(e),
+                    ExpertTensorKind::kGate, d);
+                const int64_t nu = im.reader->read_blob(
+                    static_cast<uint32_t>(il), static_cast<uint32_t>(e),
+                    ExpertTensorKind::kUp, d + gb);
+                const int64_t nd = im.reader->read_blob(
+                    static_cast<uint32_t>(il), static_cast<uint32_t>(e),
+                    ExpertTensorKind::kDown, d + gb + ub);
+                if (ng != static_cast<int64_t>(gb) ||
+                    nu != static_cast<int64_t>(ub) ||
+                    nd != static_cast<int64_t>(db)) {
+                    load_ok = false;
+                }
+            } else {
+                std::memcpy(d,
+                            static_cast<const uint8_t *>(src_gate->data) +
+                                static_cast<size_t>(e) * gb,
+                            static_cast<size_t>(gb));
+                std::memcpy(d + gb,
+                            static_cast<const uint8_t *>(src_up->data) +
+                                static_cast<size_t>(e) * ub,
+                            static_cast<size_t>(ub));
+                std::memcpy(d + gb + ub,
+                            static_cast<const uint8_t *>(src_down->data) +
+                                static_cast<size_t>(e) * db,
+                            static_cast<size_t>(db));
+            }
         });
         if (slot == UINT32_MAX) {
             log_error("engine: slot pool returned no slot");
+            return false;
+        }
+        if (!load_ok) {
+            log_error("engine: .strata expert read failed (layer " +
+                      std::to_string(il) + ", expert " + std::to_string(e) +
+                      ")");
             return false;
         }
 

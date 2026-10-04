@@ -15,6 +15,8 @@ set(STRATAFLOW_SOURCES
     plan/llama_placement.cpp
     tws/async_io.cpp
     tws/stream_buft.cpp
+    tws/strata_file.cpp
+    tws/strata_pack.cpp
     tws/weight_store.cpp
     predict/predictor.cpp
     sched/scheduler.cpp

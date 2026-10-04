@@ -15,10 +15,19 @@
 // resident EXACTLY the top-k routed experts per layer via a bounded SlotPool
 // (src/tws/weight_store.h), bounding resident expert RAM to top-k per layer.
 // EC-2's engine-owned KV cache and the exact math (section 6.3) are unchanged,
-// so output stays byte-identical to EC-1/EC-2. The in-memory GGUF source is the
-// backing store for the pool (the .strata source is EC-4). The engine path is
-// opt-in behind GgmlModel; one architecture only (the llama-arch MoE fixture;
-// the arch-descriptor table is EC-7).
+// so output stays byte-identical to EC-1/EC-2.
+//
+// EC-4 scope: the .strata single-file loader (section 5). load() detects a
+// .strata (magic STRATA01) and reads the model shape from the embedded GGUF
+// metadata blob, the TRUNK tensors from the .strata trunk block, and streams
+// EXPERT tensors from the .strata expert region through the SAME bounded
+// SlotPool (now sourcing bytes from StrataReader::read_blob instead of resident
+// GGUF tensors). No llama_model_load_from_file is ever handed a .strata, so the
+// TASK5_BLOCKER root cause is gone. The plain-GGUF path (sections 5.2, EC-1/2/3)
+// is retained unchanged; only the weight byte provenance differs, so decode
+// stays byte-identical. The engine path is opt-in behind GgmlModel; one
+// architecture only (the llama-arch MoE fixture; the arch-descriptor table is
+// EC-7).
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
@@ -76,8 +85,9 @@ public:
     Engine(const Engine &) = delete;
     Engine &operator=(const Engine &) = delete;
 
-    // Load the llama-arch MoE weights from `path` (plain GGUF) resident in a
-    // ggml context. Returns nullptr on any failure (bad file, unexpected arch,
+    // Load the llama-arch MoE weights from `path` resident in a ggml context.
+    // `path` may be a plain GGUF or a .strata single file (EC-4, auto-detected
+    // by magic). Returns nullptr on any failure (bad file, unexpected arch,
     // missing tensors); the caller then stays on the libllama path.
     //
     // `expert_slots` bounds the top-k residency SlotPool (EC-3): the number of
@@ -113,13 +123,22 @@ public:
 private:
     Engine();
 
+    struct Impl;
+
     // EC-3: load the routed top-k experts of layer `il` into the staging
     // stacked tensors via the bounded SlotPool. `ids` holds `n_ids` selected
     // expert ids read back from the router segment. Returns false on failure.
     bool ensure_layer_experts_resident(int il, const int32_t *ids, int n_ids);
     const EngineHParams &hp_() const;
 
-    struct Impl;
+    // EC-4: open a .strata single file, parse its embedded GGUF metadata into
+    // im.gc, build the resident weight context (im.wctx) from that metadata,
+    // fill the TRUNK tensors from the .strata trunk block, and retain the
+    // StrataReader (im.reader) as the expert byte source. Returns false on any
+    // failure (bad superblock, metadata parse, trunk read). Defined in
+    // model/engine/engine.cpp (the only TU that may include ggml headers).
+    static bool load_strata_weights(Impl &im, const std::string &path);
+
     std::unique_ptr<Impl> impl_;
 };
 
