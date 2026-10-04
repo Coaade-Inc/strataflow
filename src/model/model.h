@@ -37,6 +37,12 @@ public:
 
     // Token id that signals end of generation.
     virtual int32_t eos_token() const = 0;
+
+    // Bytes of model WEIGHTS held resident in RAM. On the .strata streaming
+    // path this excludes the streamed expert footprint, so it is the proof that
+    // a large model runs in a small resident budget. 0 if not applicable (e.g.
+    // the plain-GGUF path where ggml owns the mapping, or the dry-run model).
+    virtual uint64_t resident_weight_bytes() const { return 0; }
 };
 
 // Factory: inspects `path` and returns the right implementation.

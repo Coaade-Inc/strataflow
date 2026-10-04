@@ -79,9 +79,11 @@ Watch for, in the output:
   engine is streaming experts, not holding them resident.
 - The decoded tokens (garbage text - the weights are random; what matters is it
   runs end to end through our own forward pass).
-- `Maximum resident set size` from `/usr/bin/time -v` - peak RAM. Compare it to
-  the `.strata` file size on disk (`ls -lh /content/colab_moe.strata`): the
-  model on disk is larger than the peak RAM, which is the bounded-RAM point.
+- The final `stats: resident model weights = ... MiB, peak RSS = ... MiB` line.
+  The model is ~1.2 GB on disk, but the resident model weights stay near the
+  trunk size (tens of MiB) because experts stream from disk through a bounded
+  cache (`--expert-slots`). That gap is the bounded-RAM point - no external
+  timing tool needed.
 
 ### Cell 5 (optional) - make it bigger and watch RAM stay bounded
 

@@ -183,6 +183,10 @@ public:
 
     int32_t eos_token() const override { return eos_; }
 
+    uint64_t resident_weight_bytes() const override {
+        return engine_ != nullptr ? engine_->resident_weight_bytes() : 0;
+    }
+
 private:
     // The engine inference path (EC-5: the ONLY inference path): run OUR OWN
     // ggml graph for one token at position n_past_ and take the greedy argmax.
@@ -506,7 +510,11 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
     }
 
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 0;
+    // Tiny non-zero n_ctx: a vocab-only model has no trained context length, and
+    // n_ctx == 0 makes llama_init_from_model log a scary (harmless) error. We
+    // never decode through this context (the engine owns inference; this is only
+    // for tokenize/detokenize via model+vocab), so a minimal value is fine.
+    cp.n_ctx = 8;
     llama_context *ctx = llama_init_from_model(model, cp);
     // A vocab-only model may not support a decode context on all builds; the
     // engine owns inference, so a null context is tolerated (tokenize/detokenize

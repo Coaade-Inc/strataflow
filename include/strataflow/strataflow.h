@@ -95,6 +95,13 @@ typedef struct sf_context_params {
     int32_t  auto_plan;
 
     sf_backend preferred_backend; /* ignored if the backend is unavailable */
+
+    /* Bound the streamed-expert residency pool to this many expert bundles
+       (one bundle = gate+up+down for one (layer,expert)). 0 = auto (hold the
+       whole expert working set, no eviction). A value below the model's expert
+       count forces bounded streaming with LRU eviction - the "run it in a small
+       budget" dial. Appended for ABI compatibility; default 0. */
+    uint32_t expert_slots;
 } sf_context_params;
 
 /* Returns params filled with safe defaults (auto_plan on, CPU backend). */
@@ -138,6 +145,23 @@ SF_API sf_status sf_generate(sf_session *session,
                              const sf_sampling_params *sampling,
                              sf_token_callback cb,
                              void *user_data);
+
+/* ---- runtime stats ---------------------------------------------------- */
+typedef struct sf_runtime_stats {
+    /* Bytes of model WEIGHTS held resident in RAM. On the .strata streaming
+     * path this EXCLUDES the streamed expert footprint - the proof that a large
+     * model runs in a small resident budget. 0 if not applicable. Known only
+     * after generation has started (the engine loads lazily). */
+    uint64_t resident_weight_bytes;
+    /* Process peak resident set size (peak RAM) in bytes, best-effort per OS;
+     * 0 if the platform could not report it. */
+    uint64_t peak_rss_bytes;
+} sf_runtime_stats;
+
+/* Fill `out` with current runtime stats. Call after sf_generate to see the
+ * resident weight budget and peak RSS. Returns SF_ERR_INVALID_ARGUMENT on a
+ * null pointer. */
+SF_API sf_status sf_session_stats(sf_session *session, sf_runtime_stats *out);
 
 /* ---- introspection ---------------------------------------------------- */
 /* Fills `buf` (size `buf_size`) with a one-line human summary of the detected

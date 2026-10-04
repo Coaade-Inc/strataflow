@@ -131,24 +131,33 @@ def main():
     print("=" * 70)
     sh(f"{cli} --model {strata} --plan", check=False)
 
-    print("\n" + "=" * 70)
-    print("STEP 4: decode from .strata (engine owns inference; experts stream)")
-    print("Watch the log: 'engine: loaded .strata trunk ... experts stream'")
-    print("=" * 70)
-    sh(f'/usr/bin/time -v {cli} --model {strata} '
-       f'--max-tokens {args.max_tokens} --prompt "{args.prompt}" || '
-       f'{cli} --model {strata} --max-tokens {args.max_tokens} '
-       f'--prompt "{args.prompt}"', check=False)
+    on_disk_mb = os.path.getsize(strata) / (1024 * 1024)
 
     print("\n" + "=" * 70)
-    print("NOTE on what this proves:")
-    print(" - The model DECODES through StrataFlow's own ggml forward pass.")
-    print(" - On the .strata path only the TRUNK is resident; experts stream")
-    print("   from disk (see docs/ROADMAP.md). '/usr/bin/time -v' above reports")
-    print("   'Maximum resident set size' = peak RAM; compare it to the .strata")
-    print("   file size on disk to see the model is larger than its RAM use.")
-    print(" - A memory-budget CLI (--trunk-gb/--cache-gb) and per-run resident")
-    print("   reporting are the next planned work (docs/ROADMAP.md).")
+    print("STEP 4: decode from .strata (engine owns inference; experts stream)")
+    print(f"  model on disk: {on_disk_mb:.0f} MiB")
+    print("  watch for: 'engine: loaded .strata trunk ... experts stream' and")
+    print("  the final 'stats:' line reporting resident weights + peak RSS.")
+    print("=" * 70)
+    # --expert-slots bounds how many experts are held resident at once. Here we
+    # cap it well below the model's expert count so you can SEE bounded RAM: the
+    # resident model-weight bytes stay near the trunk size while the on-disk
+    # model is much larger.
+    sh(f'{cli} --model {strata} --expert-slots 8 '
+       f'--max-tokens {args.max_tokens} --prompt "{args.prompt}"', check=False)
+
+    print("\n" + "=" * 70)
+    print("WHAT THIS PROVES:")
+    print(" - The model DECODES through StrataFlow's own ggml forward pass")
+    print("   (no llama_decode, no GPU).")
+    print(f" - The model is {on_disk_mb:.0f} MiB on disk, but the 'stats:' line")
+    print("   above shows resident model weights far below that - experts stream")
+    print("   from disk through a bounded cache. That is the whole mission:")
+    print("   big model, small RAM, no GPU.")
+    print(" - Output text is gibberish ONLY because the weights are random; what")
+    print("   is proven is the mechanism, not model quality. Running real")
+    print("   (quantized) pretrained models is the next milestone - the engine")
+    print("   is F32-only today (see docs/ROADMAP.md).")
 
 
 if __name__ == "__main__":

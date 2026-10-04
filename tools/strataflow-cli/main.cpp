@@ -4,6 +4,7 @@
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "strataflow/strataflow.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,10 @@ void print_usage(const char *argv0) {
         "  --prompt TEXT      prompt text (or pass after --)\n"
         "  --vram-gb X        VRAM budget in GiB (0 = auto)\n"
         "  --ram-gb X         RAM budget in GiB (0 = auto)\n"
+        "  --cache-gb X       (reserved) expert-cache RAM budget in GiB\n"
+        "  --expert-slots N   bound streamed experts to N bundles (0 = auto;\n"
+        "                     a value below the model's expert count forces\n"
+        "                     bounded streaming - run a big model in little RAM)\n"
         "  --max-tokens N     generation cap (default 64)\n"
         "  --plan             print the placement plan and exit\n"
         "  --version          print version and exit\n"
@@ -42,7 +47,8 @@ uint64_t gib(double x) { return static_cast<uint64_t>(x * 1024.0 * 1024.0 * 1024
 int main(int argc, char **argv) {
     std::string model_path;
     std::string prompt = "hello from strataflow";
-    double vram_gb = 0, ram_gb = 0;
+    double vram_gb = 0, ram_gb = 0, cache_gb = 0;
+    uint32_t expert_slots = 0;
     int max_tokens = 64;
     bool plan_only = false;
 
@@ -61,6 +67,8 @@ int main(int argc, char **argv) {
         else if (a == "--prompt")       { prompt = next("--prompt"); }
         else if (a == "--vram-gb")      { vram_gb = std::atof(next("--vram-gb")); }
         else if (a == "--ram-gb")       { ram_gb = std::atof(next("--ram-gb")); }
+        else if (a == "--cache-gb")     { cache_gb = std::atof(next("--cache-gb")); }
+        else if (a == "--expert-slots") { expert_slots = (uint32_t)std::strtoul(next("--expert-slots"), nullptr, 10); }
         else if (a == "--max-tokens")   { max_tokens = std::atoi(next("--max-tokens")); }
         else if (a == "--plan")         { plan_only = true; }
         else if (a == "--")             { // rest is the prompt
@@ -84,9 +92,11 @@ int main(int argc, char **argv) {
     }
 
     sf_context_params params = sf_context_default_params();
-    params.model_path  = model_path.c_str();
-    params.vram_budget = gib(vram_gb);
-    params.ram_budget  = gib(ram_gb);
+    params.model_path   = model_path.c_str();
+    params.vram_budget  = gib(vram_gb);
+    params.ram_budget   = gib(ram_gb);
+    params.expert_slots = expert_slots;
+    (void)cache_gb;  // reserved: byte-budget -> slot derivation lands with the planner wiring
 
     sf_context *ctx = nullptr;
     sf_status st = sf_context_create(&params, &ctx);
@@ -118,6 +128,20 @@ int main(int argc, char **argv) {
     std::printf("\n");
     if (st != SF_OK) {
         std::fprintf(stderr, "error: generate failed: %s\n", sf_status_str(st));
+    }
+
+    // Report the resident weight budget and peak RAM so the bounded-memory
+    // claim is observable without an external tool (no /usr/bin/time needed).
+    sf_runtime_stats rs;
+    if (sf_session_stats(session, &rs) == SF_OK) {
+        const double mib = 1024.0 * 1024.0;
+        std::printf("stats: resident model weights = %.1f MiB",
+                    static_cast<double>(rs.resident_weight_bytes) / mib);
+        if (rs.peak_rss_bytes > 0) {
+            std::printf(", peak RSS = %.1f MiB",
+                        static_cast<double>(rs.peak_rss_bytes) / mib);
+        }
+        std::printf("\n");
     }
 
     sf_session_free(session);
