@@ -4,6 +4,7 @@
 /spike/**/spike_touch
 /spike/**/spike_stream
 /spike/**/spike_baseline
+/spike/**/spike_engine
 /build-*/
 /out/
 *.o
@@ -36,3 +37,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Agent task-state scaffolding (not part of the project)
+/.agents/
