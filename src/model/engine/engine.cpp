@@ -11,6 +11,7 @@
 #include "model/engine/engine.h"
 
 #include "common/log.h"
+#include "kv/kv_store.h"
 
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
@@ -20,6 +21,9 @@
 #include <llama.h>
 
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,15 +43,31 @@ ggml_tensor *get_weight(ggml_context *wctx, const std::string &name) {
 } // namespace
 
 // Private state: the resident weight context (ggml owns + fills the tensors via
-// gguf no_alloc=false, matching the spike's reliable path) and the parsed
-// hparams. The weight context is kept alive for the engine's lifetime so the
-// graph leaves (weight tensors) stay backed across every forward() call.
+// gguf no_alloc=false, matching the spike's reliable path), the parsed hparams,
+// and the engine-owned KV cache (section 3.4). The weight context is kept alive
+// for the engine's lifetime so the graph leaves (weight tensors) stay backed
+// across every forward() call.
+//
+// KV cache: one persistent, data-owning context (kvctx) holds a K and a V
+// tensor per layer, each shaped [head_dim, n_head_kv, n_ctx] with real backing
+// (allocated once, filled in-graph via ggml_cpy into a position view). These
+// are graph LEAVES across forwards, so the per-call gallocr leaves their data
+// untouched (same pattern as the resident weight tensors). KvStore is the
+// bookkeeping owner of the current fill position and the n_ctx bound.
 struct Engine::Impl {
     gguf_context *gc   = nullptr;
     ggml_context *wctx = nullptr;  // weight tensors, resident
     EngineHParams hp;
 
+    ggml_context *kvctx = nullptr;              // KV cache tensors, resident
+    ggml_backend_buffer_t kvbuf = nullptr;      // backing buffer for kvctx
+    std::vector<ggml_tensor *> k_cache;         // per layer [head_dim, n_head_kv, n_ctx]
+    std::vector<ggml_tensor *> v_cache;         // per layer [head_dim, n_head_kv, n_ctx]
+    std::unique_ptr<KvStore> kv;                // position + capacity bookkeeping
+
     ~Impl() {
+        if (kvbuf != nullptr) ggml_backend_buffer_free(kvbuf);
+        if (kvctx != nullptr) ggml_free(kvctx);
         if (wctx != nullptr) ggml_free(wctx);
         if (gc != nullptr) gguf_free(gc);
     }
@@ -136,22 +156,83 @@ std::unique_ptr<Engine> Engine::load(const std::string &path) {
         return nullptr;
     }
 
+    // Bound the KV cache by the trained context length (n_ctx). The fixture
+    // reports 64; fall back to a safe minimum if the key was absent.
+    const int n_ctx = hp.n_ctx_orig > 0 ? hp.n_ctx_orig : 64;
+
+    // Allocate the engine-owned KV cache (section 3.4): a K and a V tensor per
+    // layer, [head_dim, n_head_kv, n_ctx], in one data-owning context backed by
+    // the CPU buffer type. These persist for the engine's lifetime and are the
+    // store that each forward() appends to and attends over.
+    {
+        ggml_init_params kp{};
+        kp.mem_size   = ggml_tensor_overhead() *
+                        (static_cast<size_t>(hp.n_layer) * 2 + 8);
+        kp.mem_buffer = nullptr;
+        kp.no_alloc   = true;  // tensors get backing from a single buffer below
+        im.kvctx = ggml_init(kp);
+        if (im.kvctx == nullptr) {
+            log_warn("engine: KV context init failed; staying on libllama path");
+            return nullptr;
+        }
+        im.k_cache.resize(static_cast<size_t>(hp.n_layer));
+        im.v_cache.resize(static_cast<size_t>(hp.n_layer));
+        for (int il = 0; il < hp.n_layer; ++il) {
+            ggml_tensor *kc = ggml_new_tensor_3d(im.kvctx, GGML_TYPE_F32,
+                                                 hp.head_dim, hp.n_head_kv, n_ctx);
+            ggml_tensor *vc = ggml_new_tensor_3d(im.kvctx, GGML_TYPE_F32,
+                                                 hp.head_dim, hp.n_head_kv, n_ctx);
+            ggml_set_name(kc, ("kv_k." + std::to_string(il)).c_str());
+            ggml_set_name(vc, ("kv_v." + std::to_string(il)).c_str());
+            im.k_cache[static_cast<size_t>(il)] = kc;
+            im.v_cache[static_cast<size_t>(il)] = vc;
+        }
+        im.kvbuf = ggml_backend_alloc_ctx_tensors_from_buft(
+            im.kvctx, ggml_backend_cpu_buffer_type());
+        if (im.kvbuf == nullptr) {
+            log_warn("engine: KV buffer alloc failed; staying on libllama path");
+            return nullptr;
+        }
+    }
+
+    // bytes_per_token across all layers: K and V, head_dim * n_head_kv F32 each.
+    const uint64_t bytes_per_token =
+        static_cast<uint64_t>(hp.n_layer) * 2 *
+        static_cast<uint64_t>(hp.head_dim) *
+        static_cast<uint64_t>(hp.n_head_kv) * sizeof(float);
+    im.kv.reset(new KvStore(static_cast<uint32_t>(n_ctx), bytes_per_token));
+
     log_info("engine: loaded llama-arch MoE (" + std::to_string(hp.n_layer) +
              " layers, " + std::to_string(hp.n_expert) + "x" +
              std::to_string(hp.n_expert_used) + " experts, n_embd=" +
              std::to_string(hp.n_embd) + ", n_vocab=" +
-             std::to_string(hp.n_vocab) + ")");
+             std::to_string(hp.n_vocab) + ", n_ctx=" + std::to_string(n_ctx) +
+             ")");
     return eng;
+}
+
+void Engine::reset_kv() {
+    if (impl_->kv != nullptr) impl_->kv->reset();
 }
 
 namespace {
 
 // Build one transformer layer, mirroring llama_model_llama::graph and
-// build_moe_ffn (docs/ENGINE_CORE_DESIGN.md 6.3 step 2). `cur_in` is
+// build_moe_ffn (docs/ENGINE_CORE_DESIGN.md 6.3 step 2). `inpL` is
 // [n_embd, n_tokens=1]; returns the layer output [n_embd, 1].
+//
+// EC-2 KV cache (section 3.4): this layer's post-rope K and this layer's V for
+// the current token are copied into the persistent per-layer cache tensors at
+// column `pos`; attention then views the first `n_kv = pos+1` cached columns
+// and applies the causal mask through ggml_soft_max_ext. `k_cache`/`v_cache`
+// are the layer's resident cache tensors [head_dim, n_head_kv, n_ctx]; stores
+// into them are forced into the graph via `graph_stores`.
 ggml_tensor *build_layer(ggml_context *gctx, ggml_tensor *inpL,
                          ggml_tensor *inp_pos, int il, ggml_context *wctx,
-                         const EngineHParams &hp) {
+                         const EngineHParams &hp, ggml_tensor *k_cache,
+                         ggml_tensor *v_cache, ggml_tensor *kq_mask,
+                         int64_t pos, int64_t n_kv,
+                         std::vector<ggml_tensor *> &graph_stores) {
     const std::string p = "blk." + std::to_string(il) + ".";
 
     ggml_tensor *attn_norm_w = ggml_get_tensor(wctx, (p + "attn_norm.weight").c_str());
@@ -190,19 +271,42 @@ ggml_tensor *build_layer(ggml_context *gctx, ggml_tensor *inpL,
                          GGML_ROPE_TYPE_NORMAL, hp.n_ctx_orig, hp.freq_base,
                          hp.freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    // Attention, mirroring the explicit (non-flash) else-branch of
-    // build_attn_mha. No KV history (n_kv == n_tokens == 1), so NULL mask.
-    ggml_tensor *q = ggml_permute(gctx, Qcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head]
-    ggml_tensor *k = ggml_permute(gctx, Kcur, 0, 2, 1, 3);
-    ggml_tensor *v = ggml_permute(gctx, Vcur, 0, 2, 1, 3);
+    // Append this token's K and V to the per-layer KV cache at column `pos`.
+    // Kcur/Vcur are [head_dim, n_head_kv, n_tokens=1]; the cache view selects
+    // the single column `pos`. ggml_cpy records the store as a graph node; we
+    // keep its handle so forward() expands it (otherwise the store could be
+    // pruned, since the cache tensor, not the cpy, is what attention reads).
+    const size_t kv_col_nb = k_cache->nb[2];  // bytes per token-column
+    ggml_tensor *k_dst = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
+                                      n_tokens, k_cache->nb[1], k_cache->nb[2],
+                                      static_cast<size_t>(pos) * kv_col_nb);
+    ggml_tensor *v_dst = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
+                                      n_tokens, v_cache->nb[1], v_cache->nb[2],
+                                      static_cast<size_t>(pos) * v_cache->nb[2]);
+    graph_stores.push_back(ggml_cpy(gctx, Kcur, k_dst));
+    graph_stores.push_back(ggml_cpy(gctx, Vcur, v_dst));
 
-    ggml_tensor *kq = ggml_mul_mat(gctx, k, q);
+    // Attention, mirroring the explicit (non-flash) else-branch of
+    // build_attn_mha, now over KV history. Gather the first n_kv cached columns
+    // of K and V as [head_dim, n_head_kv, n_kv] views, then permute to the
+    // attention layout. The causal mask is applied via ggml_soft_max_ext.
+    ggml_tensor *k_hist = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
+                                       n_kv, k_cache->nb[1], k_cache->nb[2], 0);
+    ggml_tensor *v_hist = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
+                                       n_kv, v_cache->nb[1], v_cache->nb[2], 0);
+
+    ggml_tensor *q = ggml_permute(gctx, Qcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head]
+    ggml_tensor *k = ggml_cont(gctx, ggml_permute(gctx, k_hist, 0, 2, 1, 3));  // [head_dim, n_kv, n_head_kv]
+    ggml_tensor *v = ggml_cont(gctx, ggml_permute(gctx, v_hist, 0, 2, 1, 3));  // [head_dim, n_kv, n_head_kv]
+
+    ggml_tensor *kq = ggml_mul_mat(gctx, k, q);             // [n_kv, n_tokens, n_head]
     // The reference forces GGML_PREC_F32 accumulation on kq; match it.
     ggml_prec_set_acc(kq, GGML_PREC_F32);
     const float kq_scale = 1.0f / std::sqrt(static_cast<float>(hp.head_dim));
-    kq = ggml_soft_max_ext(gctx, kq, nullptr, kq_scale, 0.0f);
+    // Causal mask [n_kv, n_tokens]: 0 for attendable positions, -inf otherwise.
+    kq = ggml_soft_max_ext(gctx, kq, kq_mask, kq_scale, 0.0f);
 
-    ggml_tensor *vt = ggml_cont(gctx, ggml_transpose(gctx, v));
+    ggml_tensor *vt = ggml_cont(gctx, ggml_transpose(gctx, v));  // [n_kv, head_dim, n_head_kv]
     ggml_tensor *kqv = ggml_mul_mat(gctx, vt, kq);          // [head_dim, n_tokens, n_head]
     kqv = ggml_permute(gctx, kqv, 0, 2, 1, 3);              // [head_dim, n_head, n_tokens]
     cur = ggml_cont_2d(gctx, kqv, hp.head_dim * hp.n_head, n_tokens);
@@ -264,6 +368,18 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
         return false;
     }
 
+    // Position must land inside the trained context length. We trust the caller
+    // to drive positions in order, but bound-check against the KV capacity so a
+    // runaway sequence fails loudly instead of writing out of bounds.
+    if (pos < 0 || im.kv == nullptr ||
+        pos >= static_cast<int32_t>(im.kv->capacity())) {
+        log_error("engine: position " + std::to_string(pos) +
+                  " out of KV bounds (capacity " +
+                  std::to_string(im.kv != nullptr ? im.kv->capacity() : 0) + ")");
+        return false;
+    }
+    const int64_t n_kv = static_cast<int64_t>(pos) + 1;  // attend over 0..pos
+
     // Graph build context (no_alloc=true): nodes get data from gallocr. Sized
     // generously for the fixed per-token topology (a few dozen nodes/layer).
     ggml_init_params ip{};
@@ -276,17 +392,28 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
         return false;
     }
 
-    // Inputs: the single token id and its position.
+    // Inputs: the single token id, its position, and the causal mask. The mask
+    // is [n_kv, 1]: a single query token at `pos` attends over all cached
+    // positions 0..pos, so every entry is attendable (0.0). The general shape
+    // (nonzero -inf entries) is kept so a future multi-token prefill batch can
+    // reuse this path unchanged.
     ggml_tensor *inp_tok = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
     ggml_set_input(inp_tok);
     ggml_set_name(inp_tok, "inp_tok");
     ggml_tensor *inp_pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
     ggml_set_input(inp_pos);
     ggml_set_name(inp_pos, "inp_pos");
+    ggml_tensor *kq_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_kv, 1);
+    ggml_set_input(kq_mask);
+    ggml_set_name(kq_mask, "kq_mask");
 
+    std::vector<ggml_tensor *> graph_stores;
     ggml_tensor *inpL = ggml_get_rows(gctx, tok_embd, inp_tok);  // [n_embd, 1]
     for (int il = 0; il < hp.n_layer; ++il) {
-        inpL = build_layer(gctx, inpL, inp_pos, il, im.wctx, hp);
+        inpL = build_layer(gctx, inpL, inp_pos, il, im.wctx, hp,
+                           im.k_cache[static_cast<size_t>(il)],
+                           im.v_cache[static_cast<size_t>(il)], kq_mask, pos,
+                           n_kv, graph_stores);
     }
 
     // Final norm + lm_head.
@@ -297,6 +424,11 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     ggml_set_name(cur, "result_logits");
 
     ggml_cgraph *gf = ggml_new_graph(gctx);
+    // Expand the KV stores first so they are not pruned (attention reads the
+    // cache tensor, not the cpy node, so the cpy must be rooted explicitly).
+    for (ggml_tensor *st : graph_stores) {
+        ggml_build_forward_expand(gf, st);
+    }
     ggml_build_forward_expand(gf, cur);
 
     // Allocate + compute on the CPU backend (1 thread for determinism, matching
@@ -324,6 +456,12 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     int32_t pos_i = pos;
     ggml_backend_tensor_set(inp_tok, &tok_i, 0, sizeof(tok_i));
     ggml_backend_tensor_set(inp_pos, &pos_i, 0, sizeof(pos_i));
+    // Causal mask for a single query token at `pos`: all cached positions
+    // 0..pos are <= pos, so all are attendable (0.0). (A multi-token batch
+    // would set -inf for j > i; left as the general shape for reuse.)
+    std::vector<float> mask(static_cast<size_t>(n_kv), 0.0f);
+    ggml_backend_tensor_set(kq_mask, mask.data(), 0,
+                            mask.size() * sizeof(float));
 
     const bool compute_ok =
         ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
@@ -331,6 +469,9 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
         out.resize(static_cast<size_t>(hp.n_vocab));
         ggml_backend_tensor_get(cur, out.data(), 0,
                                 static_cast<size_t>(hp.n_vocab) * sizeof(float));
+        // The token at `pos` is now committed to the KV cache; advance the
+        // bookkeeping so used()/bytes() reflect it.
+        im.kv->advance(1);
     } else {
         log_error("engine: graph compute failed");
     }
@@ -397,6 +538,135 @@ int32_t vocab_bos_token(const std::string &path) {
     int32_t bos = llama_vocab_bos(vocab);
     llama_model_free(model);
     return bos;
+}
+
+namespace {
+
+// Tokenize `prompt` with `vocab` (add_special=true, parse_special=true),
+// returning the ids. Mirrors GgmlModel::tokenize's two-pass sizing.
+std::vector<int32_t> tokenize_with_vocab(const llama_vocab *vocab,
+                                         const std::string &prompt) {
+    std::vector<int32_t> ids;
+    const int32_t n_max = static_cast<int32_t>(prompt.size()) + 8;
+    std::vector<llama_token> toks(static_cast<size_t>(n_max));
+    int32_t n = llama_tokenize(vocab, prompt.c_str(),
+                               static_cast<int32_t>(prompt.size()), toks.data(),
+                               n_max, /*add_special=*/true,
+                               /*parse_special=*/true);
+    if (n < 0) {
+        toks.resize(static_cast<size_t>(-n));
+        n = llama_tokenize(vocab, prompt.c_str(),
+                           static_cast<int32_t>(prompt.size()), toks.data(), -n,
+                           /*add_special=*/true, /*parse_special=*/true);
+    }
+    if (n > 0) {
+        ids.assign(toks.begin(), toks.begin() + n);
+    }
+    if (ids.empty()) ids.push_back(llama_vocab_bos(vocab));
+    return ids;
+}
+
+int32_t argmax_logits(const float *v, int n) {
+    int32_t best = 0;
+    float best_v = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < n; ++i) {
+        if (v[i] > best_v) {
+            best_v = v[i];
+            best = i;
+        }
+    }
+    return best;
+}
+
+} // namespace
+
+bool vocab_tokenize(const std::string &path, const std::string &prompt,
+                    std::vector<int32_t> &out) {
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    llama_model *model = llama_model_load_from_file(path.c_str(), mp);
+    if (model == nullptr) {
+        log_error("engine oracle: tokenize model load failed");
+        return false;
+    }
+    const llama_vocab *vocab = llama_model_get_vocab(model);
+    out = tokenize_with_vocab(vocab, prompt);
+    llama_model_free(model);
+    return !out.empty();
+}
+
+bool run_oracle_sequence(const std::string &path, const std::string &prompt,
+                         int n_generate, std::vector<int32_t> &out_tokens,
+                         std::vector<std::vector<float>> *out_step_logits) {
+    out_tokens.clear();
+    if (out_step_logits != nullptr) out_step_logits->clear();
+
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    llama_model *model = llama_model_load_from_file(path.c_str(), mp);
+    if (model == nullptr) {
+        log_error("engine oracle: model load failed");
+        return false;
+    }
+
+    const llama_vocab *vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = static_cast<uint32_t>(llama_model_n_ctx_train(model));
+    cp.n_threads = 1;
+    cp.n_threads_batch = 1;
+    llama_context *ctx = llama_init_from_model(model, cp);
+    if (ctx == nullptr) {
+        log_error("engine oracle: context creation failed");
+        llama_model_free(model);
+        return false;
+    }
+
+    std::vector<int32_t> prompt_ids = tokenize_with_vocab(vocab, prompt);
+
+    bool ok = true;
+    // Prefill: decode the prompt one token at a time so the per-step logits
+    // line up with the engine's one-token-per-call path. Only the final prompt
+    // token's logits drive the first generated token.
+    const float *logits = nullptr;
+    for (size_t i = 0; i < prompt_ids.size() && ok; ++i) {
+        llama_token tok = prompt_ids[i];
+        llama_batch batch = llama_batch_get_one(&tok, 1);
+        if (llama_decode(ctx, batch) != 0) {
+            log_error("engine oracle: prompt decode failed");
+            ok = false;
+            break;
+        }
+        logits = llama_get_logits_ith(ctx, -1);
+    }
+
+    for (int g = 0; g < n_generate && ok; ++g) {
+        if (logits == nullptr) {
+            log_error("engine oracle: null logits");
+            ok = false;
+            break;
+        }
+        if (out_step_logits != nullptr) {
+            out_step_logits->emplace_back(logits, logits + n_vocab);
+        }
+        const int32_t next = argmax_logits(logits, n_vocab);
+        out_tokens.push_back(next);
+
+        llama_token tok = next;
+        llama_batch batch = llama_batch_get_one(&tok, 1);
+        if (llama_decode(ctx, batch) != 0) {
+            log_error("engine oracle: generate decode failed");
+            ok = false;
+            break;
+        }
+        logits = llama_get_logits_ith(ctx, -1);
+    }
+
+    llama_free(ctx);
+    llama_model_free(model);
+    return ok;
 }
 
 } // namespace engine

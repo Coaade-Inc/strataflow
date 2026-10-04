@@ -7,10 +7,13 @@
 // that GgmlModel and the oracle test sit on. The implementation
 // (model/engine/engine.cpp) is the only engine TU that includes ggml.
 //
-// EC-1 scope: a single-token forward at a given position with ALL expert
-// weights resident (no streaming - that is EC-3), one architecture only (the
-// llama-arch MoE fixture - the arch-descriptor table is EC-7), no KV history
-// (multi-token/KV is EC-2). The engine path is opt-in behind GgmlModel.
+// EC-2 scope: a prefill-then-decode forward over an engine-owned KV cache
+// (section 3.4). Each forward() processes one query token at its position,
+// appends that layer's post-rope K and V to a per-layer KV store, and attends
+// over all cached positions 0..pos (causal mask through ggml_soft_max_ext).
+// Still ALL expert weights resident (no streaming - that is EC-3), one
+// architecture only (the llama-arch MoE fixture - the arch-descriptor table is
+// EC-7). The engine path is opt-in behind GgmlModel.
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #pragma once
 
@@ -57,9 +60,18 @@ public:
 
     const EngineHParams &hparams() const;
 
-    // Run a single-token forward for `token` at `pos`, writing the full logit
-    // vector (length n_vocab) to `out`. Returns false on build/compute failure.
+    // Run a forward for `token` at `pos`, writing the full logit vector (length
+    // n_vocab) to `out`. `token` is appended to the engine-owned KV cache at
+    // `pos` and the query attends over all cached positions 0..pos (causal).
+    // Callers must drive positions in order from 0 for a given sequence; call
+    // reset_kv() before starting a new sequence. `pos` must be < n_ctx (the
+    // trained context length) or the call fails. Returns false on build/compute
+    // failure or an out-of-bounds position.
     bool forward(int32_t token, int32_t pos, std::vector<float> &out);
+
+    // Clear the KV cache so the next forward() starts a fresh sequence at
+    // position 0. Does not free the cache buffers (they are reused).
+    void reset_kv();
 
 private:
     Engine();
@@ -78,6 +90,27 @@ bool run_oracle_single_token(const std::string &path, int32_t token,
 // The BOS token id for `path`'s vocab, or -1 on failure. Used by the oracle
 // test to pick the same seed token the oracle and engine both run.
 int32_t vocab_bos_token(const std::string &path);
+
+// Multi-token oracle helper for the EC-2 sequence gate (docs/ENGINE_CORE_DESIGN
+// section 7.3). Tokenizes `prompt` with the model vocab, runs libllama's
+// llama_decode over the prompt and then greedily generates `n_generate` tokens
+// (argmax each step, feeding the previous token back), carrying the llama KV
+// cache. Writes the generated token id SEQUENCE to `out_tokens` and, when
+// `out_last_logits` is non-null, the full logit vector produced at each step
+// (prompt-final step first, then one per generated token) flattened in order.
+// This lives in the engine TU because it is the only place that may include
+// <llama.h> for tests above the sf::Model seam. Returns false on load/decode
+// failure. Test-only; not on the hot path.
+bool run_oracle_sequence(const std::string &path, const std::string &prompt,
+                         int n_generate, std::vector<int32_t> &out_tokens,
+                         std::vector<std::vector<float>> *out_step_logits);
+
+// Tokenize `prompt` with `path`'s vocab (add_special=true, matching
+// run_oracle_sequence), writing the ids to `out`. Lets the engine test drive
+// the SAME prompt tokens the oracle used without pulling <llama.h> above the
+// seam. Returns false on load/tokenize failure.
+bool vocab_tokenize(const std::string &path, const std::string &prompt,
+                    std::vector<int32_t> &out);
 
 } // namespace engine
 } // namespace sf
