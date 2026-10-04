@@ -14,3 +14,14 @@ target_link_libraries(strataflow-cli PRIVATE StrataFlow::strataflow strataflow_w
 add_executable(strata-pack strata-pack/main.cpp)
 target_link_libraries(strata-pack PRIVATE StrataFlow::strataflow strataflow_warnings)
 target_include_directories(strata-pack PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# make-kquant-moe-gguf: a testdata generator that emits a tiny K-quant (Q4_K /
+# Q6_K) llama-arch MoE GGUF. The Python gguf library cannot quantize to
+# K-quants, so this tool quantizes with the vendored ggml (ggml_quantize_chunk)
+# and writes with gguf. It links the vendored ggml target directly (the one
+# place a tool needs ggml); the headers are consumed SYSTEM like the core lib
+# does, so our -Werror does not flag the vendored headers.
+add_executable(make-kquant-moe-gguf testdata/make_kquant_moe_gguf.cpp)
+target_link_libraries(make-kquant-moe-gguf PRIVATE ggml strataflow_warnings)
+target_include_directories(make-kquant-moe-gguf SYSTEM PRIVATE
+    $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>)

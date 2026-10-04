@@ -497,6 +497,85 @@ static void test_engine_quant_matches_oracle() {
     CHECK(max_delta < 2e-2);
 }
 
+// K-quant gate: a Q4_K / Q6_K llama-arch MoE must decode through the engine's
+// quantized path and match the libllama oracle sequence. Real downloaded models
+// are almost always K-quants, so this proves the engine runs the quant family a
+// real model uses, including quantized TRUNK tensors (token_embd/output/attn at
+// a K-quant type). The engine stages experts at the SOURCE tensor's real ggml
+// type, and K-quant inner dims are multiples of the 256 superblock, so per-
+// expert nb02 slices stay whole-block and the type-agnostic staging path works
+// unchanged. `label` names the type for the log line. Mirrors the Q8_0 test.
+static void run_kquant_oracle(const char *path, const char *label) {
+    const std::string prompt = "hello world";
+    const int n_generate = 8;
+
+    std::vector<int32_t> oracle_tokens;
+    std::vector<std::vector<float>> oracle_step_logits;
+    CHECK(engine::run_oracle_sequence(path, prompt, n_generate, oracle_tokens,
+                                      &oracle_step_logits));
+
+    engine::EngineCacheStats st{};
+    std::vector<std::vector<float>> eng_logits;
+    std::vector<int32_t> toks =
+        engine_decode_sequence(path, prompt, n_generate, /*slots=*/0, st, eng_logits);
+
+    bool seq_match = toks.size() == oracle_tokens.size();
+    double max_delta = 0.0;
+    const size_t steps = oracle_step_logits.size() < eng_logits.size()
+                             ? oracle_step_logits.size()
+                             : eng_logits.size();
+    for (size_t s = 0; s < steps; ++s) {
+        const size_t n = oracle_step_logits[s].size() < eng_logits[s].size()
+                             ? oracle_step_logits[s].size()
+                             : eng_logits[s].size();
+        for (size_t i = 0; i < n; ++i) {
+            const double d = std::fabs(static_cast<double>(oracle_step_logits[s][i]) -
+                                       static_cast<double>(eng_logits[s][i]));
+            if (d > max_delta) max_delta = d;
+        }
+    }
+    for (size_t i = 0; i < toks.size() && i < oracle_tokens.size(); ++i) {
+        CHECK_EQ(toks[i], oracle_tokens[i]);
+        if (toks[i] != oracle_tokens[i]) seq_match = false;
+    }
+
+    std::printf("[quant(%s) seq match=%s n=%d max per-step |delta|=%.3e tokens:",
+                label, seq_match ? "yes" : "no", n_generate, max_delta);
+    for (size_t i = 0; i < toks.size(); ++i) std::printf(" %d", toks[i]);
+    std::printf("] ");
+
+    // Hard gate: identical greedy token SEQUENCE vs the oracle. This is the
+    // real correctness proof and it holds exactly for Q4_K and Q6_K.
+    //
+    // Soft gate: the per-step max |logit delta| vs the oracle. This fixture has
+    // RANDOM weights at K-quant-friendly dims (n_embd=256/n_ff=512), so its
+    // logits carry much higher entropy than the tiny n_embd=32 Q8_0 fixture;
+    // the genuine K-quant dequant error (engine-vs-F32 is ~0.02 for Q8_0, ~0.04
+    // for Q6_K, ~0.15 for Q4_K at step 0) then ACCUMULATES across the 8 auto-
+    // regressive steps. Both the engine and the oracle see the same growth, so
+    // the greedy argmax still agrees everywhere, but the raw logit gap at a
+    // near-tied vocab entry can reach ~0.2. We keep a 3e-1 sanity bound (not a
+    // precision claim): it confirms the engine tracks the oracle's own dequant
+    // path, while the SEQUENCE equality above carries the correctness weight.
+    CHECK(seq_match);
+    CHECK(max_delta < 3e-1);
+}
+
+// Guarded on STRATAFLOW_TEST_KQUANT_MOE_GGUF (Q4_K) and the optional
+// STRATAFLOW_TEST_Q6K_MOE_GGUF (Q6_K). Skips cleanly when neither is set, same
+// pattern as the other guarded tests.
+static void test_engine_kquant_matches_oracle() {
+    const char *q4k = std::getenv("STRATAFLOW_TEST_KQUANT_MOE_GGUF");
+    const char *q6k = std::getenv("STRATAFLOW_TEST_Q6K_MOE_GGUF");
+    if ((q4k == nullptr || q4k[0] == '\0') &&
+        (q6k == nullptr || q6k[0] == '\0')) {
+        std::printf("[skipped: set STRATAFLOW_TEST_KQUANT_MOE_GGUF] ");
+        return;
+    }
+    if (q4k != nullptr && q4k[0] != '\0') run_kquant_oracle(q4k, "Q4_K");
+    if (q6k != nullptr && q6k[0] != '\0') run_kquant_oracle(q6k, "Q6_K");
+}
+
 static void run_all() {
     RUN(test_engine_matches_oracle);
     RUN(test_engine_sequence_matches_oracle);
@@ -504,6 +583,7 @@ static void run_all() {
     RUN(test_engine_prefetch_hit_rate);
     RUN(test_engine_dense_matches_oracle);
     RUN(test_engine_quant_matches_oracle);
+    RUN(test_engine_kquant_matches_oracle);
 }
 
 TEST_MAIN()
