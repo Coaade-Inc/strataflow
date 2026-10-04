@@ -111,6 +111,14 @@ public:
 
     const EngineHParams &hparams() const;
 
+    // Bytes of model WEIGHTS held resident in RAM (the trunk-weight backing
+    // buffer). On the .strata streaming path this EXCLUDES the expert tensors
+    // (they stream on demand), so it is the hard proof that a huge MoE's expert
+    // footprint is not resident. On the plain-GGUF path ggml owns the mapping,
+    // so this reports 0 (not applicable). Does not include the KV cache, the
+    // staging tensors, or the SlotPool (those are separately bounded).
+    uint64_t resident_weight_bytes() const;
+
     // Top-k residency cache stats accumulated across all forward() calls since
     // load() (EC-3). Lets the oracle test assert hits/misses/evictions and the
     // bounded resident-byte footprint.
