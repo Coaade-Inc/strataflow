@@ -103,13 +103,18 @@ sf_status load_model(const std::string &path, const HardwareProfile &hw,
     std::error_code ec;
     const bool exists = std::filesystem::exists(path, ec) && !ec;
 
-    if (exists && ends_with_ci(path, ".gguf")) {
+    // Real weights: a *.gguf goes to the llama.cpp backend; a *.strata goes to
+    // our own engine loader (EC-4). load_ggml_model auto-detects the .strata
+    // magic and never hands it to libllama (the TASK5_BLOCKER root cause). Any
+    // failure degrades to the dry-run model rather than failing the context.
+    if (exists && (ends_with_ci(path, ".gguf") ||
+                   ends_with_ci(path, ".strata"))) {
         sf_status st =
             load_ggml_model(path, hw, vram_budget, ram_budget, out, out_plan);
         if (st == SF_OK && out) {
             return SF_OK;
         }
-        log_warn("load_model: GGUF load failed for '" + path +
+        log_warn("load_model: model load failed for '" + path +
                  "'; falling back to dry-run model.");
     } else {
         // Missing file, or a format we don't load yet (.strata is Phase 2+).
