@@ -1,14 +1,21 @@
-// GgmlModel: the Phase 1b llama.cpp-backed implementation of sf::Model.
+// GgmlModel: the llama.cpp-backed implementation of sf::Model.
 //
-// It loads a GGUF checkpoint through the vendored llama.cpp C API, tokenizes
-// and detokenizes with the model's real vocabulary, and runs a real greedy
-// (argmax) single-token forward pass. KV state is carried across forward()
-// calls by owning the llama_context and tracking the sequence position
-// internally, matching the one-token-per-call contract the Scheduler relies
-// on (see src/sched/scheduler.cpp and docs/PLAN.md section 3.x).
+// It loads a GGUF (or .strata) checkpoint and tokenizes/detokenizes with the
+// model's real vocabulary through the vendored llama.cpp C API. Inference
+// (forward()) runs through OUR OWN ggml engine (src/model/engine, see
+// docs/ENGINE_CORE_DESIGN.md): EC-5 made the engine the DEFAULT and ONLY
+// inference path, so llama_decode is no longer called to run the model. KV
+// state is carried across forward() calls by the engine owning its own KV
+// cache keyed by the sequence position this class tracks, matching the
+// one-token-per-call contract the Scheduler relies on (see
+// src/sched/scheduler.cpp and docs/PLAN.md section 3.x).
 //
-// Only this translation unit touches llama.cpp; the rest of the engine sees
-// just the sf::Model interface, so the backend stays swappable.
+// libllama stays linked for exactly two things: (a) the tokenizer/vocab
+// (tokenize/detokenize/eos via the llama_vocab API, design 4.4) and (b) the
+// test oracle (engine::run_oracle_* in model/engine). It is NOT on the
+// inference path. Only this translation unit touches llama.cpp directly; the
+// rest of the engine sees just the sf::Model interface, so the backend stays
+// swappable.
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "model/model.h"
 
@@ -57,17 +64,6 @@ bool force_stream_experts_env() {
     return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
 }
 
-// EC-1 opt-in: STRATAFLOW_ENGINE=1 routes GgmlModel::forward through OUR OWN
-// ggml graph (src/model/engine, docs/ENGINE_CORE_DESIGN.md) instead of
-// llama_decode. Default (unset/0/false/off) keeps the proven libllama path.
-// This is the ONLY toggle EC-1 adds; it never changes the sf::Model interface.
-bool use_engine_env() {
-    const char *v = std::getenv("STRATAFLOW_ENGINE");
-    if (v == nullptr || v[0] == '\0') return false;
-    std::string s(v);
-    return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
-}
-
 // Route llama.cpp's internal logging into our logger. Keeps the CLI/test
 // output tidy and under our log-level control.
 void sf_llama_log_cb(ggml_log_level level, const char *text, void * /*user*/) {
@@ -90,17 +86,17 @@ void sf_llama_log_cb(ggml_log_level level, const char *text, void * /*user*/) {
 class GgmlModel final : public Model {
 public:
     // Takes ownership of a loaded model + context. Private; use create().
-    // `path` is retained so the opt-in EC-1 engine (STRATAFLOW_ENGINE=1) can
-    // read the SAME gguf resident on first use.
+    // `path` is retained so the engine (the only inference path, EC-5) can
+    // read the SAME gguf/.strata weights resident on first use. `is_strata`
+    // is kept for logging/diagnostics; both a plain GGUF and a .strata now
+    // run inference through the engine (libllama is never used to decode).
     GgmlModel(llama_model *model, llama_context *ctx, const ModelShape &shape,
               llama_token eos, std::string path, bool is_strata)
         : model_(model), ctx_(ctx), vocab_(llama_model_get_vocab(model)),
-          shape_(shape), eos_(eos), path_(std::move(path)),
-          is_strata_(is_strata),
-          // A .strata is OUR split format: libllama cannot decode it, so the
-          // engine is MANDATORY (no libllama fallback). A plain GGUF keeps the
-          // opt-in behaviour (STRATAFLOW_ENGINE=1).
-          use_engine_(is_strata || use_engine_env()) {}
+          shape_(shape), eos_(eos), path_(std::move(path)) {
+        log_debug(std::string("GgmlModel: inference via engine (EC-5) on ") +
+                  (is_strata ? ".strata" : "GGUF") + " '" + path_ + "'");
+    }
 
     GgmlModel(const GgmlModel &) = delete;
     GgmlModel &operator=(const GgmlModel &) = delete;
@@ -169,68 +165,29 @@ public:
 
     // Decode `last_token` at the current position, read its logits, and return
     // the greedy (argmax) next token. KV state advances by one each call.
+    //
+    // EC-5: inference always runs through OUR OWN engine (forward_engine) for
+    // both plain GGUF and .strata inputs. libllama's llama_decode is no longer
+    // on the inference path (it stays linked only for vocab + the test oracle).
+    // There is no libllama fallback: if the engine cannot load/run this
+    // model/arch, the call is terminal and returns EOS.
     int32_t forward(int32_t last_token) override {
-        if (use_engine_) {
-            const int32_t r = forward_engine(last_token);
-            if (r >= 0) return r;
-            // A .strata has no libllama fallback (libllama cannot decode our
-            // split format), so a failure here is terminal: return EOS.
-            if (is_strata_) {
-                log_error("GgmlModel: engine failed on .strata; cannot fall "
-                          "back to libllama");
-                return eos_;
-            }
-            // Plain GGUF: engine unavailable for this model/arch -> fall back to
-            // libllama for this call (and future calls) so the model stays
-            // usable. EC-1 keeps libllama as the default and the safe fallback.
-            use_engine_ = false;
-            log_warn("GgmlModel: engine path unavailable; using libllama path");
-        }
-
-        llama_token tok = last_token;
-        llama_batch batch = llama_batch_get_one(&tok, 1);
-
-        // Task 3 residency pass: before llama_decode runs the FULL graph for
-        // all layers in one call, make every stacked expert tensor it will read
-        // resident in its slot (loading bytes from the backing store on a cache
-        // miss, driving the SlotPool LRU). No-op when experts are not streaming.
-        // prefill=false: a single-token decode is the hot decode path, so it
-        // populates the cache normally (the prefill-bypass rule applies to
-        // multi-token micro-batches, PLAN 3.3).
-        stream_buft_ensure_decode_residency(/*prefill=*/false);
-
-        const int32_t rc = llama_decode(ctx_, batch);
-        if (rc != 0) {
-            log_error("GgmlModel::forward: llama_decode failed (rc=" +
-                      std::to_string(rc) + ")");
+        const int32_t r = forward_engine(last_token);
+        if (r < 0) {
+            log_error("GgmlModel::forward: engine failed (unsupported arch or "
+                      "load/run error); no libllama inference fallback");
             return eos_;
         }
-        ++n_past_;
-
-        const float *logits = llama_get_logits_ith(ctx_, -1);
-        if (logits == nullptr) {
-            log_error("GgmlModel::forward: null logits");
-            return eos_;
-        }
-
-        const int32_t n_vocab = llama_vocab_n_tokens(vocab_);
-        int32_t best = 0;
-        float best_logit = -std::numeric_limits<float>::infinity();
-        for (int32_t i = 0; i < n_vocab; ++i) {
-            if (logits[i] > best_logit) {
-                best_logit = logits[i];
-                best = i;
-            }
-        }
-        return best;
+        return r;
     }
 
     int32_t eos_token() const override { return eos_; }
 
 private:
-    // Opt-in engine path: run OUR OWN ggml graph for one token at position
-    // n_past_ and take the greedy argmax. Returns the next token id, or -1 if
-    // the engine could not load/run (so forward() falls back to libllama).
+    // The engine inference path (EC-5: the ONLY inference path): run OUR OWN
+    // ggml graph for one token at position n_past_ and take the greedy argmax.
+    // Returns the next token id, or -1 if the engine could not load/run (the
+    // caller then returns EOS; there is no libllama inference fallback).
     //
     // EC-2: the engine owns a KV cache, so this drives prefill-then-decode by
     // position. n_past_ is the one-token-per-call cursor the sf::Model contract
@@ -276,8 +233,6 @@ private:
     llama_token          eos_    = 0;
     int32_t              n_past_ = 0;
     std::string          path_;
-    bool                 is_strata_  = false;
-    bool                 use_engine_ = false;
     std::unique_ptr<engine::Engine> engine_;
 };
 
