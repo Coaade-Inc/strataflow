@@ -38,6 +38,7 @@
 import argparse
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -45,23 +46,36 @@ import time
 
 
 def sh(cmd, cwd=None, check=True):
-    print(f"\n$ {cmd}")
-    r = subprocess.run(cmd, shell=True, cwd=cwd)
+    """Run a command. `cmd` may be a LIST (preferred, no shell) or a string
+    (legacy, run under the shell). Passing user-supplied values as list entries
+    avoids any quoting/escaping hazard."""
+    if isinstance(cmd, (list, tuple)):
+        shown = " ".join(shlex.quote(str(a)) for a in cmd)
+        print(f"\n$ {shown}")
+        r = subprocess.run(list(cmd), cwd=cwd)
+    else:
+        shown = cmd
+        print(f"\n$ {cmd}")
+        r = subprocess.run(cmd, shell=True, cwd=cwd)
     if check and r.returncode != 0:
-        sys.exit(f"command failed ({r.returncode}): {cmd}")
+        sys.exit(f"command failed ({r.returncode}): {shown}")
     return r.returncode
 
 
-def sh_capture(cmd, cwd=None):
+def sh_capture(argv, cwd=None):
     """Run a command, stream its stdout live AND return the captured stdout.
+
+    `argv` is a LIST of arguments (no shell): user-supplied values such as the
+    prompt are passed as separate argv entries, so no quoting/escaping hazard
+    exists even if the prompt contains quotes or shell metacharacters.
 
     The strataflow CLI writes 'plan:', 'prompt:', 'output: <text>' and the
     final 'stats:' line to stdout; its logs go to stderr. We capture stdout so
     we can parse the decoded text and the resident/peak-RSS numbers while still
     showing the user everything as it happens.
     """
-    print(f"\n$ {cmd}")
-    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+    print("\n$ " + " ".join(shlex.quote(a) for a in argv))
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
                             stderr=sys.stderr, text=True, bufsize=1)
     lines = []
     for line in proc.stdout:
@@ -73,13 +87,19 @@ def sh_capture(cmd, cwd=None):
 
 
 def parse_cli_output(captured):
-    """Extract (decoded_text, resident_mib, peak_rss_mib) from CLI stdout."""
+    """Extract (decoded_text, resident_mib, peak_rss_mib) from CLI stdout.
+
+    `decoded` is None if NO 'output:' line was seen at all (a parse failure the
+    caller must flag); it is "" only if the CLI emitted an empty 'output:' line.
+    """
     decoded = None
     resident_mib = None
     peak_mib = None
     for line in captured.splitlines():
-        if line.startswith("output: "):
-            decoded = line[len("output: "):]
+        if line.startswith("output:"):
+            # Accept both 'output: <text>' and a bare 'output:' (empty decode).
+            rest = line[len("output:"):]
+            decoded = rest[1:] if rest.startswith(" ") else rest
         m = re.search(r"resident model weights = ([0-9.]+) MiB", line)
         if m:
             resident_mib = float(m.group(1))
@@ -245,19 +265,40 @@ def run_real_model(args):
     on_disk_mb = os.path.getsize(gguf_path) / (1024 * 1024)
     print(f"downloaded {gguf_path}: {on_disk_mb:.0f} MiB")
 
+    # --- re-validate disk against the ACTUAL downloaded size ----------------
+    # The pre-download guard sized everything off --expected-gb, which can be
+    # wrong (e.g. the default 0.67 pointed at a 20 GB Mixtral). Now that the
+    # real GGUF is on disk, re-check free space against its ACTUAL size before
+    # we pack: strata-pack writes a .strata copy of roughly the same size, so
+    # we need ~1x the GGUF free plus a little headroom. Fail clearly if it will
+    # not fit rather than letting strata-pack run out of disk mid-write.
+    gguf_bytes = os.path.getsize(gguf_path)
+    free_after_dl_gb = shutil.disk_usage(args.workdir).free / (1024 ** 3)
+    strata_needed_gb = gguf_bytes / (1024 ** 3) * 1.1  # .strata copy + headroom
+    print(f"  actual GGUF size: {gguf_bytes / (1024 ** 3):.2f} GB")
+    print(f"  free disk now:    {free_after_dl_gb:.1f} GB")
+    print(f"  need for .strata: ~{strata_needed_gb:.2f} GB (copy + headroom)")
+    if free_after_dl_gb < strata_needed_gb:
+        sys.exit(
+            f"refusing to pack: only {free_after_dl_gb:.1f} GB free after "
+            f"download but ~{strata_needed_gb:.2f} GB needed to write the "
+            f".strata copy of the {gguf_bytes / (1024 ** 3):.2f} GB GGUF. Free "
+            "disk or pick a smaller --hf-file."
+        )
+
     # --- pack --------------------------------------------------------------
     strata = os.path.join(args.workdir, "real_model.strata")
     print("\n" + "=" * 70)
     print("STEP 2: pack GGUF -> .strata (trunk + aligned per-expert blobs)")
     print("=" * 70)
-    sh(f"{pack} {gguf_path} {strata}")
+    sh([pack, gguf_path, strata])
     strata_mb = os.path.getsize(strata) / (1024 * 1024)
 
     # --- plan --------------------------------------------------------------
     print("\n" + "=" * 70)
     print("STEP 3: show the placement plan (hardware auto-detected)")
     print("=" * 70)
-    sh(f"{cli} --model {strata} --plan", check=False)
+    sh([cli, "--model", strata, "--plan"], check=False)
 
     # --- run + measure -----------------------------------------------------
     print("\n" + "=" * 70)
@@ -269,8 +310,8 @@ def run_real_model(args):
     print("  generated demo emits should NOT appear here - that is a signal the")
     print("  real tokenizer + metadata are in use.")
     print("=" * 70)
-    cmd = (f'{cli} --model {strata} --expert-slots {args.expert_slots} '
-           f'--max-tokens {args.max_tokens} --prompt "{args.prompt}"')
+    cmd = [cli, "--model", strata, "--expert-slots", str(args.expert_slots),
+           "--max-tokens", str(args.max_tokens), "--prompt", args.prompt]
     t0 = time.time()
     rc, captured = sh_capture(cmd)
     elapsed = time.time() - t0
@@ -278,6 +319,17 @@ def run_real_model(args):
         sys.exit(f"decode failed (rc={rc}). See the CLI output above.")
 
     decoded, resident_mib, peak_mib = parse_cli_output(captured)
+    # A measurement run must not silently report a non-result. If the CLI
+    # produced NO 'output:' line at all, parsing failed (format drift, crash
+    # before decode, etc.) and `decoded` is None - treat that as a hard error
+    # rather than printing 'None' as if it were the model's output.
+    if decoded is None:
+        sys.exit(
+            "decode produced no 'output:' line to parse. The CLI ran (rc=0) "
+            "but its stdout did not contain the expected 'output: <text>' "
+            "line, so there is no decoded text to report. Check the CLI output "
+            "above; do not treat this run as a valid measurement."
+        )
     toks_per_sec = args.max_tokens / elapsed if elapsed > 0 else float("nan")
 
     print("\n" + "=" * 70)
@@ -369,12 +421,12 @@ def main():
     print("\n" + "=" * 70)
     print("STEP 2: pack GGUF -> .strata (trunk + aligned per-expert blobs)")
     print("=" * 70)
-    sh(f"{pack} {model} {strata}")
+    sh([pack, model, strata])
 
     print("\n" + "=" * 70)
     print("STEP 3: show the placement plan (hardware auto-detected)")
     print("=" * 70)
-    sh(f"{cli} --model {strata} --plan", check=False)
+    sh([cli, "--model", strata, "--plan"], check=False)
 
     on_disk_mb = os.path.getsize(strata) / (1024 * 1024)
 
@@ -388,8 +440,9 @@ def main():
     # cap it well below the model's expert count so you can SEE bounded RAM: the
     # resident model-weight bytes stay near the trunk size while the on-disk
     # model is much larger.
-    sh(f'{cli} --model {strata} --expert-slots {args.expert_slots} '
-       f'--max-tokens {args.max_tokens} --prompt "{args.prompt}"', check=False)
+    sh([cli, "--model", strata, "--expert-slots", str(args.expert_slots),
+        "--max-tokens", str(args.max_tokens), "--prompt", args.prompt],
+       check=False)
 
     print("\n" + "=" * 70)
     print("WHAT THIS PROVES:")

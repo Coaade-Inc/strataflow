@@ -505,7 +505,11 @@ static void test_engine_quant_matches_oracle() {
 // type, and K-quant inner dims are multiples of the 256 superblock, so per-
 // expert nb02 slices stay whole-block and the type-agnostic staging path works
 // unchanged. `label` names the type for the log line. Mirrors the Q8_0 test.
-static void run_kquant_oracle(const char *path, const char *label) {
+// `soft_bound` is a per-type calibrated ceiling on the accumulated per-step
+// max |logit delta| vs the oracle (derived from the observed deltas; see the
+// comment at the CHECK below), tight enough to trip a real numerical drift.
+static void run_kquant_oracle(const char *path, const char *label,
+                              double soft_bound) {
     const std::string prompt = "hello world";
     const int n_generate = 8;
 
@@ -547,18 +551,22 @@ static void run_kquant_oracle(const char *path, const char *label) {
     // Hard gate: identical greedy token SEQUENCE vs the oracle. This is the
     // real correctness proof and it holds exactly for Q4_K and Q6_K.
     //
-    // Soft gate: the per-step max |logit delta| vs the oracle. This fixture has
-    // RANDOM weights at K-quant-friendly dims (n_embd=256/n_ff=512), so its
-    // logits carry much higher entropy than the tiny n_embd=32 Q8_0 fixture;
-    // the genuine K-quant dequant error (engine-vs-F32 is ~0.02 for Q8_0, ~0.04
-    // for Q6_K, ~0.15 for Q4_K at step 0) then ACCUMULATES across the 8 auto-
-    // regressive steps. Both the engine and the oracle see the same growth, so
-    // the greedy argmax still agrees everywhere, but the raw logit gap at a
-    // near-tied vocab entry can reach ~0.2. We keep a 3e-1 sanity bound (not a
-    // precision claim): it confirms the engine tracks the oracle's own dequant
-    // path, while the SEQUENCE equality above carries the correctness weight.
+    // Soft gate: the accumulated per-step max |logit delta| vs the oracle, with
+    // a PER-TYPE calibrated bound (passed in via `soft_bound`) rather than one
+    // loose shared ceiling. The engine and the oracle both run the SAME quant
+    // dequant path, so this delta measures only the small residual between our
+    // ggml forward pass and libllama's on identical weights; it is NOT the
+    // engine-vs-F32 dequant error. Measured accumulated max |delta| over the 8
+    // autoregressive steps is Q4_K ~2.0e-2 and Q6_K ~1.85e-1 (the per-fixture
+    // numbers are not comparable across types: each is diffed only against its
+    // OWN oracle run on its OWN random-weight fixture, so where the logits land
+    // relative to near-tied vocab entries dominates). The caller sets a bound a
+    // small multiple above the observed value for that type (Q4_K 5e-2, Q6_K
+    // 2.5e-1), tight enough that a real numerical regression that nudges the
+    // delta without yet flipping the argmax would trip it, while the SEQUENCE
+    // equality above remains the primary correctness gate.
     CHECK(seq_match);
-    CHECK(max_delta < 3e-1);
+    CHECK(max_delta < soft_bound);
 }
 
 // Guarded on STRATAFLOW_TEST_KQUANT_MOE_GGUF (Q4_K) and the optional
@@ -572,8 +580,10 @@ static void test_engine_kquant_matches_oracle() {
         std::printf("[skipped: set STRATAFLOW_TEST_KQUANT_MOE_GGUF] ");
         return;
     }
-    if (q4k != nullptr && q4k[0] != '\0') run_kquant_oracle(q4k, "Q4_K");
-    if (q6k != nullptr && q6k[0] != '\0') run_kquant_oracle(q6k, "Q6_K");
+    // Per-type soft bounds: a small multiple above the observed accumulated
+    // per-step max |delta| for each type (Q4_K ~2.0e-2, Q6_K ~1.85e-1).
+    if (q4k != nullptr && q4k[0] != '\0') run_kquant_oracle(q4k, "Q4_K", 5e-2);
+    if (q6k != nullptr && q6k[0] != '\0') run_kquant_oracle(q6k, "Q6_K", 2.5e-1);
 }
 
 static void run_all() {

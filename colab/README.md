@@ -188,7 +188,10 @@ python3 colab/strataflow_colab.py --real-model --is-moe \
 
 As with the generated demo, `--expert-slots` bounds how many experts are held
 resident at once, so a multi-GB MoE decodes with peak RAM far below the on-disk
-size - that is the whole mission on a real, downloaded, quantized MoE.
+size - the whole mission on a real, downloaded, quantized MoE, once you run this
+cell on a large-enough runtime. Nothing in the sandbox or CI executes this cell
+(both are offline), so the real-downloaded-MoE result is Colab-demonstrated
+here, not proven by an in-sandbox/CI run.
 
 ## What this does and does not prove
 
