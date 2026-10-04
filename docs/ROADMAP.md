@@ -10,10 +10,15 @@ Legend: [x] done and merged, [~] partial, [ ] not started.
 
 ## Mission
 
-Run very large Mixture-of-Experts models (100B up to trillion-scale) on
-everyday hardware **without a GPU**, in a bounded RAM budget, by streaming
-experts from disk. A GPU, if present, is an optional accelerator - never a
-requirement.
+Run very large Mixture-of-Experts models (100B up to trillion-scale), **in any
+GGUF weight type - quantized or full-precision**, on everyday hardware **without
+a GPU**, in a bounded RAM budget, by streaming experts from disk. A GPU, if
+present, is an optional accelerator - never a requirement.
+
+Running real pretrained models means running **quantized** weights (Q4_K, Q6_K,
+Q8_0, IQ-families, ...), since that is how real models ship; full-precision
+(F32/F16) must work too. Quantized-weight support is the current top-priority
+gap (see below) - the engine runs F32 only today.
 
 ---
 
@@ -51,11 +56,31 @@ most are pure CPU/disk work.
 
 ### Must-do to actually prove the mission
 
+- [ ] **Run ALL models - quantized and non-quantized (TOP PRIORITY).** The
+  engine today runs **F32 only**: its graph builder and the per-layer staging
+  stacked tensors are hard-coded `GGML_TYPE_F32`, so it cannot run any real
+  downloaded model, which are almost always quantized (Q4_K, Q6_K, Q8_0, the IQ
+  families, etc.). StrataFlow must run **every GGUF weight type** - quantized and
+  full-precision alike - because real models are quantized and that is the whole
+  point of running big models on small machines. Required work:
+  - Make the engine's weight tensors and the `mul_mat` / `mul_mat_id` paths
+    carry the source tensor's real ggml type instead of forcing F32 (ggml's
+    kernels already handle quantized matmul; the engine must stop up-casting /
+    assuming F32).
+  - Size the SlotPool slots and `.strata` per-expert blobs by the real quantized
+    byte size (they already copy verbatim bytes, so this is mostly removing the
+    F32 assumption in the staging-tensor creation).
+  - Keep KV and intermediate activations at an appropriate precision (F16/F32)
+    while weights stay quantized, matching how llama.cpp mixes precisions.
+  - Validate against the oracle on a real quantized GGUF (e.g. a small Q4_K_M
+    MoE), not just the F32 fixture.
+  This unblocks running real pretrained models and is the prerequisite for the
+  "run a real large MoE" item below.
 - [ ] **Run a real, large MoE end to end.** Everything so far is verified on a
-  2-layer toy fixture. The mission is not proven until an actual multi-GB MoE
-  runs end to end in a bounded RAM budget on a real machine, byte-reasonable
-  output at a usable speed. First real exercise of the engine; likely to surface
-  bugs the toy never did (real tokenizers, large shapes, quant types beyond F32).
+  2-layer F32 toy fixture. The mission is not proven until an actual multi-GB,
+  real (quantized) MoE runs end to end in a bounded RAM budget on a real machine
+  with sensible output at a usable speed. Depends on quant support above. Likely
+  to surface bugs the toy never did (real tokenizers, large shapes, quant types).
 - [ ] **Memory-budget CLI + peak-RSS reporting.** A user cannot yet say "run this
   model in 8 GB" and see the result. Expose `--trunk-gb` / `--cache-gb` /
   expert-slot knobs on the CLI and report peak resident memory, so the bounded
@@ -103,8 +128,15 @@ most are pure CPU/disk work.
 
 ## Notes on sequencing
 
-The highest-value next work is the top of "Must-do to prove the mission":
-expose the memory-budget CLI + RSS reporting, then run a real mid-size MoE
-(small enough to fit a modest disk, larger than RAM) through the `.strata`
-streaming path and record the numbers. That turns a unit-proven mechanism into a
-demonstrated capability. All of it is CPU/disk work and needs no GPU.
+Recommended order, all CPU/disk work (no GPU needed):
+
+1. **Quantized-weight support (TOP PRIORITY).** Nothing real can run until the
+   engine handles quantized GGUF weight types, not just F32. This is the gate to
+   every real pretrained model.
+2. **Memory-budget CLI + peak-RSS reporting**, so a run is user-settable and the
+   bounded budget is observable.
+3. **Run a real, quantized mid-size MoE** (fits a modest disk, larger than RAM)
+   through the `.strata` streaming path and record real tok/s and peak RAM.
+
+That sequence turns a unit-proven F32 mechanism into a demonstrated capability on
+real models.

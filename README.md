@@ -5,8 +5,10 @@
 **Run very large models on the hardware you already own.**
 
 A local inference engine that streams trillion-scale Mixture-of-Experts models
-from disk, caches the hot parts in RAM and VRAM, and uses whatever GPU it finds
-to go faster - on Windows, Linux and macOS.
+from disk - in any GGUF weight type, quantized or full-precision - caches the
+hot parts in RAM and VRAM, and uses whatever GPU it finds to go faster, on
+Windows, Linux and macOS. (Quantized-weight support is the current top-priority
+gap: the engine runs F32 today - see [`docs/ROADMAP.md`](docs/ROADMAP.md).)
 
 *A Coaade Inc. project. Source-available. Free for personal, non-commercial use.*
 

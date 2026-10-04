@@ -41,8 +41,13 @@ echo "cloned at $(git -C /content/strataflow rev-parse --short HEAD)"
 
 ```bash
 %%bash
-apt-get -qq update
-apt-get -qq install -y cmake ninja-build build-essential > /dev/null
+# Colab usually already has cmake/ninja/build-essential. If so you can skip the
+# apt lines. The "W: Skipping acquire of configured file .../Sources" warning
+# from Colab's preconfigured R2U/CRAN apt repo is HARMLESS - the install still
+# succeeds; ignore it. Use `apt-get update ... || true` so a flaky mirror never
+# fails the cell.
+apt-get -qq update || true
+apt-get -qq install -y cmake ninja-build build-essential > /dev/null || true
 pip -q install gguf numpy
 cmake --version | head -1
 ```
@@ -113,7 +118,12 @@ STRATAFLOW_TEST_DENSE_GGUF=/content/dense.gguf \
 - **Proves:** StrataFlow builds and runs on a real CPU-only Linux box, decodes a
   real-size MoE through its own ggml forward pass, and streams experts from a
   `.strata` file so the on-disk model is larger than peak RAM.
-- **Does not prove yet:** running a real *pretrained, quantized* model
-  (needs quant-type support), a user-facing memory-budget flag, or published
-  tok/s benchmarks. Those are the next items in
-  [`../docs/ROADMAP.md`](../docs/ROADMAP.md).
+- **Does not prove yet:** running a real *pretrained, quantized* model, a
+  user-facing memory-budget flag, or published tok/s benchmarks.
+
+> **Top-priority next work: quantized-weight support.** Real models ship
+> quantized (Q4_K, Q6_K, Q8_0, IQ families). The engine is **F32-only** today,
+> so a downloaded real model will not run yet - this is the #1 item in
+> [`../docs/ROADMAP.md`](../docs/ROADMAP.md). StrataFlow's goal is to run **all**
+> GGUF weight types, quantized and full-precision alike; this demo uses a
+> generated F32 model only because that is what the engine handles right now.
