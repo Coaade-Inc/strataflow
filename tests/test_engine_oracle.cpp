@@ -724,12 +724,180 @@ static void test_engine_auto_slots_matches_oracle() {
     CHECK(auto_stats.resident_bytes() < auto_stats.full_bytes);
 }
 
+// FEAT-002: set STRATAFLOW_ENGINE_ASYNC_PREFETCH for the scope of an engine
+// run, restoring the prior value on destruction. The engine reads this env var
+// in Engine::pf_maybe_start() to decide between the async I/O-worker prefetch
+// path ("1") and the synchronous warm_expert path ("0"). RAII so an assertion
+// mid-test cannot leak the override into sibling tests.
+class ScopedAsyncPrefetch {
+public:
+    explicit ScopedAsyncPrefetch(const char *value) {
+        const char *prev = std::getenv("STRATAFLOW_ENGINE_ASYNC_PREFETCH");
+        had_prev_ = prev != nullptr;
+        if (had_prev_) prev_ = prev;
+#if defined(_WIN32)
+        _putenv_s("STRATAFLOW_ENGINE_ASYNC_PREFETCH", value);
+#else
+        setenv("STRATAFLOW_ENGINE_ASYNC_PREFETCH", value, /*overwrite=*/1);
+#endif
+    }
+    ~ScopedAsyncPrefetch() {
+#if defined(_WIN32)
+        _putenv_s("STRATAFLOW_ENGINE_ASYNC_PREFETCH", had_prev_ ? prev_.c_str() : "");
+#else
+        if (had_prev_) {
+            setenv("STRATAFLOW_ENGINE_ASYNC_PREFETCH", prev_.c_str(), 1);
+        } else {
+            unsetenv("STRATAFLOW_ENGINE_ASYNC_PREFETCH");
+        }
+#endif
+    }
+    ScopedAsyncPrefetch(const ScopedAsyncPrefetch &) = delete;
+    ScopedAsyncPrefetch &operator=(const ScopedAsyncPrefetch &) = delete;
+
+private:
+    bool had_prev_ = false;
+    std::string prev_;
+};
+
+// FEAT-002 gate: ASYNC/overlapped expert prefetch must be byte-identical to the
+// synchronous-prefetch path, the fully-resident path, and the libllama oracle,
+// under a BOUNDED pool (3 slots, below the fixture's 8 experts/layer) that
+// forces eviction so a prefetch races eviction/reload. Because the authoritative
+// ensure_layer_experts_resident re-acquires exactly the router-selected experts,
+// a mispredicted or still-in-flight prefetch is just a synchronous miss and the
+// output never changes. We also decode REPEATEDLY to perturb prefetch timing and
+// assert the output is identical every run (determinism regardless of when the
+// I/O worker's reads land), and assert the bounded pool still shows
+// hits+misses+evictions (prefetch genuinely raced eviction and correctness held).
+static void test_engine_async_prefetch_byte_identical() {
+    const char *path = std::getenv("STRATAFLOW_TEST_MOE_GGUF");
+    if (path == nullptr || path[0] == '\0') {
+        std::printf("[skipped: set STRATAFLOW_TEST_MOE_GGUF] ");
+        return;
+    }
+
+    const std::string prompt = "hello world";
+    const int n_generate = 8;
+    const uint32_t bounded_slots = 3;  // below 8 experts/layer: forces eviction
+
+    // Oracle sequence (the hard gate all engine runs must reproduce).
+    std::vector<int32_t> oracle_tokens;
+    std::vector<std::vector<float>> oracle_step_logits;
+    CHECK(engine::run_oracle_sequence(path, prompt, n_generate, oracle_tokens,
+                                      &oracle_step_logits));
+    CHECK_EQ(oracle_tokens.size(), static_cast<size_t>(n_generate));
+    if (oracle_tokens.size() != static_cast<size_t>(n_generate)) return;
+
+    // Fully-resident engine (auto pool, no eviction, no prefetch worker).
+    engine::EngineCacheStats full_stats{};
+    std::vector<std::vector<float>> full_logits;
+    std::vector<int32_t> full_tokens = engine_decode_sequence(
+        path, prompt, n_generate, /*slots=*/0, full_stats, full_logits);
+    CHECK_EQ(full_tokens.size(), static_cast<size_t>(n_generate));
+
+    // Synchronous-prefetch bounded engine (async OFF -> warm_expert inline).
+    engine::EngineCacheStats sync_stats{};
+    std::vector<std::vector<float>> sync_logits;
+    std::vector<int32_t> sync_tokens;
+    {
+        ScopedAsyncPrefetch off("0");
+        sync_tokens = engine_decode_sequence(path, prompt, n_generate,
+                                             bounded_slots, sync_stats,
+                                             sync_logits);
+    }
+    CHECK_EQ(sync_tokens.size(), static_cast<size_t>(n_generate));
+
+    // Async-prefetch bounded engine (async ON -> background I/O worker),
+    // repeated several times to perturb prefetch timing. Every run must produce
+    // byte-identical tokens AND logits.
+    const int n_runs = 5;
+    double max_async_vs_sync = 0.0;
+    double max_async_vs_full = 0.0;
+    double max_async_vs_oracle = 0.0;
+    bool runs_identical = true;
+    bool seq_match = true;
+    engine::EngineCacheStats async_stats{};
+    std::vector<int32_t> first_async_tokens;
+    for (int run = 0; run < n_runs; ++run) {
+        ScopedAsyncPrefetch on("1");
+        engine::EngineCacheStats st{};
+        std::vector<std::vector<float>> async_logits;
+        std::vector<int32_t> async_tokens = engine_decode_sequence(
+            path, prompt, n_generate, bounded_slots, st, async_logits);
+        CHECK_EQ(async_tokens.size(), static_cast<size_t>(n_generate));
+        if (async_tokens.size() != static_cast<size_t>(n_generate)) {
+            runs_identical = false;
+            break;
+        }
+        if (run == 0) {
+            first_async_tokens = async_tokens;
+            async_stats = st;
+        } else if (async_tokens != first_async_tokens) {
+            runs_identical = false;
+        }
+
+        // Tokens: async == oracle == sync == full.
+        for (size_t i = 0; i < async_tokens.size(); ++i) {
+            if (async_tokens[i] != oracle_tokens[i] ||
+                async_tokens[i] != sync_tokens[i] ||
+                async_tokens[i] != full_tokens[i]) {
+                seq_match = false;
+            }
+        }
+        // Logits: async bit-identical to sync and full; within F32 tol vs oracle.
+        const size_t steps = async_logits.size();
+        for (size_t s = 0; s < steps; ++s) {
+            const auto &a = async_logits[s];
+            for (size_t i = 0; i < a.size(); ++i) {
+                const double av = static_cast<double>(a[i]);
+                if (s < sync_logits.size() && i < sync_logits[s].size()) {
+                    const double d = std::fabs(av - static_cast<double>(sync_logits[s][i]));
+                    if (d > max_async_vs_sync) max_async_vs_sync = d;
+                }
+                if (s < full_logits.size() && i < full_logits[s].size()) {
+                    const double d = std::fabs(av - static_cast<double>(full_logits[s][i]));
+                    if (d > max_async_vs_full) max_async_vs_full = d;
+                }
+                if (s < oracle_step_logits.size() && i < oracle_step_logits[s].size()) {
+                    const double d = std::fabs(av - static_cast<double>(oracle_step_logits[s][i]));
+                    if (d > max_async_vs_oracle) max_async_vs_oracle = d;
+                }
+            }
+        }
+    }
+
+    std::printf("[async runs=%d identical=%s seq match=%s "
+                "async-vs-sync|delta|=%.3e async-vs-full|delta|=%.3e "
+                "async-vs-oracle|delta|=%.3e "
+                "async(hits=%llu miss=%llu evict=%llu)] ",
+                n_runs, runs_identical ? "yes" : "no", seq_match ? "yes" : "no",
+                max_async_vs_sync, max_async_vs_full, max_async_vs_oracle,
+                static_cast<unsigned long long>(async_stats.hits),
+                static_cast<unsigned long long>(async_stats.misses),
+                static_cast<unsigned long long>(async_stats.evictions));
+
+    // (a) async-prefetch decode is byte-identical to sync and fully-resident,
+    // and matches the oracle sequence within F32 tolerance.
+    CHECK(seq_match);
+    CHECK(max_async_vs_sync == 0.0);
+    CHECK(max_async_vs_full == 0.0);
+    CHECK(max_async_vs_oracle < 1e-3);
+    // (b) identical output across repeated runs (timing perturbation).
+    CHECK(runs_identical);
+    // (c) the bounded pool actually raced eviction: hits + misses + evictions.
+    CHECK(async_stats.hits > 0);
+    CHECK(async_stats.misses > 0);
+    CHECK(async_stats.evictions > 0);
+}
+
 static void run_all() {
     RUN(test_engine_matches_oracle);
     RUN(test_engine_sequence_matches_oracle);
     RUN(test_engine_bounded_pool_byte_identical);
     RUN(test_engine_auto_slots_matches_oracle);
     RUN(test_engine_prefetch_hit_rate);
+    RUN(test_engine_async_prefetch_byte_identical);
     RUN(test_engine_dense_matches_oracle);
     RUN(test_engine_quant_matches_oracle);
     RUN(test_engine_kquant_matches_oracle);

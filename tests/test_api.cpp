@@ -68,6 +68,10 @@ static void test_runtime_stats_fields() {
     CHECK_EQ(zero.peak_rss_bytes, 0u);
     CHECK_EQ(zero.ttft_us, 0u);
     CHECK_EQ(zero.streamed_bytes, 0u);
+    // FEAT-003 appended overlap fields: zero-init.
+    CHECK_EQ(zero.prefetch_completed_before_use, 0u);
+    CHECK_EQ(zero.prefetch_used, 0u);
+    CHECK_EQ(zero.prefetch_warmed, 0u);
 
     CHECK_EQ(sf_session_stats(nullptr, &zero), SF_ERR_INVALID_ARGUMENT);
 
@@ -91,6 +95,10 @@ static void test_runtime_stats_fields() {
     // (sf_session_stats sets them) without depending on real streaming numbers.
     CHECK_EQ(rs.ttft_us, 0u);
     CHECK_EQ(rs.streamed_bytes, 0u);
+    // Dry-run model has no engine/prefetch, so the overlap signals stay 0.
+    CHECK_EQ(rs.prefetch_completed_before_use, 0u);
+    CHECK_EQ(rs.prefetch_used, 0u);
+    CHECK_EQ(rs.prefetch_warmed, 0u);
 
     sf_session_free(s);
     sf_context_free(ctx);

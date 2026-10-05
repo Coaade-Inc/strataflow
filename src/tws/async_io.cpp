@@ -300,6 +300,14 @@ int64_t BlockFile::read_at(void *dst, size_t len, uint64_t offset) const {
         return read_direct_aligned(dst, len, offset);
     }
     FILE *f = static_cast<FILE *>(handle_);
+    // _fseeki64 + fread advance a SHARED, stateful file position on `f`. The
+    // async-prefetch worker and the compute thread can both reach here via
+    // read_blob concurrently, so serialize the seek+read as one atomic
+    // positional read. The POSIX pread path below needs no lock (positional and
+    // stateless). This Windows CRT fallback is not exercised on the Linux CI
+    // sandbox; the lock is a correctness guard for the concurrent streaming
+    // build on Windows.
+    std::lock_guard<std::mutex> lk(win_crt_mu_);
     if (_fseeki64(f, static_cast<long long>(offset), SEEK_SET) != 0) return -1;
     return static_cast<int64_t>(std::fread(dst, 1, len, f));
 #else

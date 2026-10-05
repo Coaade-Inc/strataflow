@@ -58,6 +58,16 @@ public:
     bool resident(const ExpertId &id) const { return map_.count(id) != 0; }
     void *slot_data(uint32_t slot) { return buffers_[slot].data(); }
 
+    // True when acquiring a NOT-yet-resident id would NOT need to evict: either
+    // the pool is not full or there is a reclaimed free slot. Const, read-only.
+    // FEAT-003: lets a speculative async-prefetch install (on the compute
+    // thread) decline when installing would evict a still-needed authoritative
+    // resident expert; a prefetch then only ever fills otherwise-idle slots and
+    // never amplifies disk traffic by evicting a resident the layer still uses.
+    bool has_free_slot() const {
+        return !free_slots_.empty() || map_.size() < n_slots_;
+    }
+
     const CacheStats &stats() const { return stats_; }
 
 private:

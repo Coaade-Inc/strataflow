@@ -14,6 +14,7 @@
 #include "tws/strata_format.h"
 #include "tws/stream_buft.h"  // ExpertTensorKind
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -77,7 +78,9 @@ public:
     // goes through read_at) is intentionally excluded so this reflects
     // per-token expert streaming, not the trunk load. Used by the benchmark
     // harness to report bytes-streamed-per-token. See read_blob() in the .cpp.
-    uint64_t streamed_bytes() const { return streamed_bytes_; }
+    uint64_t streamed_bytes() const {
+        return streamed_bytes_.load(std::memory_order_relaxed);
+    }
 
 private:
     uint64_t slice_rel(const ExpertIndexEntry &e, ExpertTensorKind kind) const;
@@ -86,9 +89,13 @@ private:
     mutable BlockFile               file_;
     // Accumulated expert-slice bytes read via read_blob(). mutable because
     // read_blob() is const (it never mutates logical reader state) but still
-    // needs to bump this counter. Single-token greedy decode is single-threaded
-    // on this seam, so a plain counter is sufficient (no atomics needed).
-    mutable uint64_t                streamed_bytes_ = 0;
+    // needs to bump this counter. ATOMIC because the async prefetch worker
+    // (src/model/engine/engine.cpp) now calls read_blob() concurrently with the
+    // compute thread's own read_blob() in ensure_layer_experts_resident, so the
+    // increment races; relaxed order is sufficient (it is a pure monotonic
+    // byte-counter whose value is read only for benchmark reporting, with no
+    // ordering dependency on other memory). The reported total is unchanged.
+    mutable std::atomic<uint64_t>   streamed_bytes_{0};
     StrataSuperblock                sb_{};
     std::vector<uint8_t>            meta_;
     std::vector<ExpertIndexEntry>   index_;

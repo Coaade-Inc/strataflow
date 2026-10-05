@@ -112,10 +112,21 @@ def parse_cli_stats(captured):
                      CLI builds; use it for an exact bytes/token (streamed_mib
                      is the 1-decimal rounded display value and is kept only as
                      a fallback for old CLI builds).
+      prefetch_warmed - experts speculatively warmed ahead of a layer (FEAT-003),
+                     or None if absent. Only printed on the bounded streaming
+                     path (something was actually prefetched).
+      prefetch_used - of the warmed experts, how many the routing then used
+                     (FEAT-003 prefetch hit count), or None if absent.
+      prefetch_completed_before_use - of the used experts, how many the ASYNC
+                     background I/O worker had fully read AND installed before
+                     the layer's authoritative acquire needed them (FEAT-003
+                     overlap signal: the overlap actually hid the disk read), or
+                     None if absent. 0 on the synchronous (--async-prefetch off)
+                     path.
 
     The resident/peak fields keep the exact wording from before FEAT-002, and
-    the TTFT/streamed fields are optional, so this parser works against both
-    old and new CLI builds.
+    the TTFT/streamed/prefetch fields are optional, so this parser works against
+    old and new CLI builds alike.
     """
     stats = {
         "decoded": None,
@@ -124,6 +135,9 @@ def parse_cli_stats(captured):
         "ttft_ms": None,
         "streamed_mib": None,
         "streamed_bytes": None,
+        "prefetch_warmed": None,
+        "prefetch_used": None,
+        "prefetch_completed_before_use": None,
     }
     for line in captured.splitlines():
         if line.startswith("output:"):
@@ -147,6 +161,20 @@ def parse_cli_stats(captured):
         m = re.search(r"streamed_bytes = ([0-9]+)", line)
         if m:
             stats["streamed_bytes"] = int(m.group(1))
+        # FEAT-003 async-prefetch overlap fields (new CLI builds only). Matched
+        # by exact substrings APPENDED to the stats line; absent on old builds
+        # and on the fully-resident path (nothing prefetched). The
+        # 'prefetch_completed_before_use' pattern is checked before the shorter
+        # 'prefetch_used' so the regexes do not alias.
+        m = re.search(r"prefetch_warmed = ([0-9]+)", line)
+        if m:
+            stats["prefetch_warmed"] = int(m.group(1))
+        m = re.search(r"prefetch_completed_before_use = ([0-9]+)", line)
+        if m:
+            stats["prefetch_completed_before_use"] = int(m.group(1))
+        m = re.search(r"prefetch_used = ([0-9]+)", line)
+        if m:
+            stats["prefetch_used"] = int(m.group(1))
     return stats
 
 
@@ -364,7 +392,8 @@ def run_real_model(args):
     print("  real tokenizer + metadata are in use.")
     print("=" * 70)
     cmd = [cli, "--model", strata, "--expert-slots", str(args.expert_slots),
-           "--max-tokens", str(args.max_tokens), "--prompt", args.prompt]
+           "--max-tokens", str(args.max_tokens),
+           "--async-prefetch", args.async_prefetch, "--prompt", args.prompt]
     t0 = time.time()
     rc, captured = sh_capture(cmd)
     elapsed = time.time() - t0
@@ -372,6 +401,7 @@ def run_real_model(args):
         sys.exit(f"decode failed (rc={rc}). See the CLI output above.")
 
     decoded, resident_mib, peak_mib = parse_cli_output(captured)
+    stats = parse_cli_stats(captured)  # FEAT-003 overlap metric, when present
     # A measurement run must not silently report a non-result. If the CLI
     # produced NO 'output:' line at all, parsing failed (format drift, crash
     # before decode, etc.) and `decoded` is None - treat that as a hard error
@@ -394,6 +424,19 @@ def run_real_model(args):
     print(f"  decoded output:   {decoded!r}")
     print(f"  wall-clock:       {elapsed:.2f} s for {args.max_tokens} tokens")
     print(f"  tokens/sec:       {toks_per_sec:.2f}")
+    print(f"  async-prefetch:   {args.async_prefetch} (FEAT-003 overlap)")
+    # FEAT-003: the overlap signal, when the CLI printed it (bounded streaming
+    # path). completed-before-use counts experts the background I/O worker read
+    # and installed BEFORE the layer needed them (0 when async-prefetch=off).
+    if stats.get("prefetch_completed_before_use") is not None:
+        print(f"  prefetch warmed:  {stats['prefetch_warmed']}")
+        print(f"  prefetch used:    {stats['prefetch_used']}")
+        print("  completed-before-use (overlap hid the read): "
+              f"{stats['prefetch_completed_before_use']}")
+        print("    (run once with --async-prefetch on and once off, same")
+        print("     --expert-slots: the decoded text is identical, and the")
+        print("     completed-before-use count is 0 for off and > 0 for on when")
+        print("     the overlap fires; compare the two tokens/sec too.)")
     if resident_mib is not None:
         print(f"  resident weights: {resident_mib:.1f} MiB")
     if peak_mib is not None:
@@ -448,6 +491,13 @@ def main():
     ap.add_argument("--expected-gb", type=float, default=0.67,
                     help="expected on-disk size of --hf-file in GB, used by the "
                          "disk guard (default matches the TinyLlama Q4_K_M).")
+    ap.add_argument("--async-prefetch", default="on", choices=["on", "off"],
+                    help="async/overlapped expert prefetch (FEAT-003): 'on' "
+                         "(default) overlaps the next layer's expert disk reads "
+                         "with the current layer's compute on a background I/O "
+                         "thread; 'off' uses the synchronous warm path. Output "
+                         "is byte-identical either way; run both to contrast "
+                         "the overlap metric + decode tok/s on a real model.")
     ap.add_argument("--is-moe", action="store_true",
                     help="label the --real-model as MoE in the summary (set this "
                          "when you point --hf-repo/--hf-file at a Mixtral-style "

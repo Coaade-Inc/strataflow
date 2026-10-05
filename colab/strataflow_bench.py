@@ -132,7 +132,7 @@ def _decode_tok_per_sec(max_tokens, elapsed, ttft_ms):
     return round((max_tokens - 1) / decode_window, 2)
 
 
-def run_one(args, cfg, slots):
+def run_one(args, cfg, slots, async_prefetch="on"):
     """Run ONE generated-MoE config and return a result record (dict).
 
     Steps: generate GGUF (if needed) -> pack to .strata (if needed) -> run the
@@ -140,6 +140,10 @@ def run_one(args, cfg, slots):
     stats line. A missing 'output:' line is a HARD error for that run: the row
     is marked failed rather than emitting a fabricated measurement (mirrors
     run_real_model's guard in strataflow_colab.py).
+
+    `async_prefetch` is 'on' (default) or 'off' and is threaded straight to the
+    CLI's --async-prefetch flag so the harness can contrast the SAME bounded
+    config with the background I/O overlap on versus off (FEAT-003).
 
     Throughput is reported two honest ways: 'gen tok/s' is end-to-end
     (max_tokens / full wall-clock, includes prompt + TTFT) and 'decode tok/s'
@@ -152,11 +156,13 @@ def run_one(args, cfg, slots):
     on_disk_mib = os.path.getsize(strata_path) / (1024 * 1024)
 
     print("\n" + "=" * 70)
-    print(f"RUN {label}  expert-slots={slots}  max-tokens={args.max_tokens}")
+    print(f"RUN {label}  expert-slots={slots}  "
+          f"async-prefetch={async_prefetch}  max-tokens={args.max_tokens}")
     print("=" * 70)
     cmd = [args.cli, "--model", strata_path,
            "--expert-slots", str(slots),
            "--max-tokens", str(args.max_tokens),
+           "--async-prefetch", async_prefetch,
            "--prompt", args.prompt]
     t0 = time.time()
     rc, captured = sfc.sh_capture(cmd)
@@ -171,6 +177,7 @@ def run_one(args, cfg, slots):
         "n_embd": args.n_embd,
         "n_ff": args.n_ff,
         "expert_slots": slots,
+        "async_prefetch": async_prefetch,
         "max_tokens": args.max_tokens,
         "on_disk_mib": round(on_disk_mib, 1),
         "wall_seconds": round(elapsed, 3),
@@ -181,6 +188,11 @@ def run_one(args, cfg, slots):
         "peak_rss_mib": stats["peak_mib"],
         "streamed_mib": stats["streamed_mib"],
         "streamed_bytes": stats["streamed_bytes"],
+        "prefetch_warmed": stats["prefetch_warmed"],
+        "prefetch_used": stats["prefetch_used"],
+        "prefetch_completed_before_use":
+            stats["prefetch_completed_before_use"],
+        "decoded_text": stats["decoded"],
         "bytes_per_token": None,
         "ok": False,
         "error": None,
@@ -242,6 +254,7 @@ def run_real_row(args):
         "n_embd": None,
         "n_ff": None,
         "expert_slots": args.expert_slots,
+        "async_prefetch": args.async_list[0],
         "max_tokens": args.max_tokens,
         "on_disk_mib": None,
         "wall_seconds": None,
@@ -252,6 +265,9 @@ def run_real_row(args):
         "peak_rss_mib": None,
         "streamed_mib": None,
         "streamed_bytes": None,
+        "prefetch_warmed": None,
+        "prefetch_used": None,
+        "prefetch_completed_before_use": None,
         "bytes_per_token": None,
         "ok": False,
         "error": None,
@@ -303,6 +319,7 @@ def run_real_row(args):
     cmd = [args.cli, "--model", strata_path,
            "--expert-slots", str(args.expert_slots),
            "--max-tokens", str(args.max_tokens),
+           "--async-prefetch", args.async_list[0],
            "--prompt", args.prompt]
     t0 = time.time()
     rc, captured = sfc.sh_capture(cmd)
@@ -319,6 +336,10 @@ def run_real_row(args):
     record["peak_rss_mib"] = stats["peak_mib"]
     record["streamed_mib"] = stats["streamed_mib"]
     record["streamed_bytes"] = stats["streamed_bytes"]
+    record["prefetch_warmed"] = stats["prefetch_warmed"]
+    record["prefetch_used"] = stats["prefetch_used"]
+    record["prefetch_completed_before_use"] = \
+        stats["prefetch_completed_before_use"]
     _fill_throughput_and_bytes(record, args.max_tokens, elapsed, stats)
     record["ok"] = True
     return record
@@ -333,9 +354,9 @@ def print_table(records):
     # 'gen tok/s' = end-to-end (max_tokens / full wall-clock, includes prompt +
     # TTFT). 'decode tok/s' = steady-state ((max_tokens-1)/(wall-clock-TTFT),
     # first token removed) - the figure the harness targets. See the README.
-    header = ["model", "on-disk MiB", "slots", "gen tok/s", "decode tok/s",
-              "TTFT ms", "resident MiB", "peak RSS MiB", "streamed MiB",
-              "bytes/tok", "status"]
+    header = ["model", "on-disk MiB", "slots", "async", "gen tok/s",
+              "decode tok/s", "TTFT ms", "resident MiB", "peak RSS MiB",
+              "streamed MiB", "bytes/tok", "cbu", "status"]
     rows = []
     for r in records:
         if r.get("skipped"):
@@ -350,6 +371,7 @@ def print_table(records):
             r["model"],
             _fmt(r["on_disk_mib"], "{:.1f}"),
             slots_s,
+            _fmt(r.get("async_prefetch")),
             _fmt(r["gen_tokens_per_sec"], "{:.2f}"),
             _fmt(r["decode_tokens_per_sec"], "{:.2f}"),
             _fmt(r["ttft_ms"], "{:.1f}"),
@@ -357,6 +379,7 @@ def print_table(records):
             _fmt(r["peak_rss_mib"], "{:.1f}"),
             _fmt(r["streamed_mib"], "{:.1f}"),
             _fmt(r["bytes_per_token"], "{:.0f}"),
+            _fmt(r.get("prefetch_completed_before_use"), "{:d}"),
             status,
         ])
 
@@ -379,6 +402,11 @@ def print_table(records):
     print("decode tok/s and TTFT are single noisy samples. gen tok/s is")
     print("end-to-end (includes prompt + TTFT); decode tok/s removes the first")
     print("token and is the steady-state figure the harness targets.")
+    print("'async' = --async-prefetch (background I/O overlap on/off, FEAT-003).")
+    print("'cbu' = prefetch_completed_before_use: experts whose disk read the")
+    print("background worker FINISHED and installed BEFORE the layer needed them")
+    print("(the overlap that hid the read). It is 0 by construction when")
+    print("async=off, so a nonzero cbu on async=on is the mechanism firing.")
 
 
 def print_exit_criteria(records):
@@ -460,6 +488,9 @@ def print_exit_criteria(records):
     # evicts and re-streams experts every token.
     _print_auto_vs_small_contrast(gen_ok)
 
+    # FEAT-003: async-prefetch overlap on vs off at the same bounded config.
+    _print_async_on_vs_off_contrast(gen_ok)
+
     print("\nPLAN.md section 2 - absolute tokens/sec ladder: this ladder is for")
     print("LARGE REAL models on NVMe. The generated toy has random weights and")
     print("tiny dimensions, so its decode tok/s is a MECHANISM proxy only, NOT a")
@@ -522,6 +553,73 @@ def _print_auto_vs_small_contrast(gen_ok):
         print(ln)
 
 
+def _print_async_on_vs_off_contrast(gen_ok):
+    """Contrast async-prefetch ON vs OFF at the SAME (model, slots) config.
+
+    For every (model, expert-slots) pair that was run at BOTH async=on and
+    async=off, print them side by side so a reader sees the mechanism directly:
+      - streamed bytes/token: the AUTHORITATIVE experts loaded are identical
+        either way (ensure_layer_experts_resident is unchanged), so the DECODED
+        TEXT is byte-identical on vs off - the invariant to confirm. Note the
+        streamed-bytes COUNTER can be HIGHER with async on, because the
+        background worker issues speculative reads that race eviction at a tight
+        slot count; that is extra I/O work, not a correctness change.
+      - completed-before-use (cbu): 0 when off (the warm is inline, not
+        overlapped) and > 0 when on IF the worker finished a predicted read
+        before the layer needed it. A nonzero cbu on the ON row is the overlap
+        firing - prefetches completed ahead of use and hid the read latency.
+      - decode tok/s + TTFT: reported honestly as single noisy samples on a tiny
+        sandbox CPU where the per-layer compute window is small, so wall-clock
+        gains are hardware-dependent; the MECHANISM (cbu > 0) is the proof here,
+        not the absolute speed.
+    """
+    def key(r):
+        return (r["model"], r["expert_slots"])
+
+    pairs = {}
+    for r in gen_ok:
+        ap = r.get("async_prefetch")
+        if ap in ("on", "off"):
+            pairs.setdefault(key(r), {})[ap] = r
+
+    contrasted = {k: v for k, v in pairs.items() if "on" in v and "off" in v}
+    if not contrasted:
+        return
+
+    print("\nASYNC PREFETCH on vs off (same model, same expert-slots) - FEAT-003.")
+    print("The authoritative expert load is unchanged, so the decoded text is")
+    print("byte-identical on vs off (correctness invariant). The overlap signal")
+    print("is completed-before-use (cbu): experts the background I/O worker read")
+    print("and installed BEFORE the layer's acquire needed them (0 when off).")
+    print("Absolute decode tok/s is hardware-dependent (tiny sandbox CPU => tiny")
+    print("compute window to hide reads behind); the mechanism is cbu > 0:")
+    for (model, slots), v in sorted(contrasted.items()):
+        on, off = v["on"], v["off"]
+        slots_s = "auto" if slots == 0 else str(slots)
+        same_text = (on.get("decoded_text") == off.get("decoded_text"))
+        print(f"    {model} slots={slots_s}:")
+        print(f"      decoded text identical on-vs-off: "
+              f"{'yes' if same_text else 'NO (unexpected!)'}")
+        cbu_on = on.get("prefetch_completed_before_use")
+        cbu_off = off.get("prefetch_completed_before_use")
+        used_on = on.get("prefetch_used")
+        print(f"      completed-before-use: on={_fmt(cbu_on)} "
+              f"off={_fmt(cbu_off)} (of prefetch_used={_fmt(used_on)} on 'on')")
+        print(f"      streamed bytes/tok:   on={_fmt(on['bytes_per_token'], '{:.0f}')} "
+              f"off={_fmt(off['bytes_per_token'], '{:.0f}')} "
+              f"(authoritative experts identical; 'on' may read more "
+              f"speculatively)")
+        d_on = on.get("decode_tokens_per_sec")
+        d_off = off.get("decode_tokens_per_sec")
+        print(f"      decode tok/s:         on={_fmt(d_on, '{:.2f}')} "
+              f"off={_fmt(d_off, '{:.2f}')} "
+              f"(single noisy sample; hardware-dependent)")
+        t_on = on.get("ttft_ms")
+        t_off = off.get("ttft_ms")
+        print(f"      TTFT ms:              on={_fmt(t_on, '{:.1f}')} "
+              f"off={_fmt(t_off, '{:.1f}')}")
+
+
 def _print_peak_rss_flatness(gen_ok):
     """Show that peak RSS stays ~flat across the --expert-slots sweep per model.
 
@@ -561,6 +659,7 @@ def write_artifacts(args, records):
             "layers_list": args.layers_list,
             "experts_list": args.experts_list,
             "slots_list": args.slots_list,
+            "async_list": args.async_list,
             "n_embd": args.n_embd,
             "n_ff": args.n_ff,
             "max_tokens": args.max_tokens,
@@ -576,10 +675,11 @@ def write_artifacts(args, records):
 
     # CSV: a flat row per record with a stable column order.
     fields = ["model", "arch", "layers", "experts", "n_embd", "n_ff",
-              "expert_slots", "max_tokens", "on_disk_mib", "wall_seconds",
-              "gen_tokens_per_sec", "decode_tokens_per_sec", "ttft_ms",
-              "resident_mib", "peak_rss_mib", "streamed_mib", "streamed_bytes",
-              "bytes_per_token", "ok", "error"]
+              "expert_slots", "async_prefetch", "max_tokens", "on_disk_mib",
+              "wall_seconds", "gen_tokens_per_sec", "decode_tokens_per_sec",
+              "ttft_ms", "resident_mib", "peak_rss_mib", "streamed_mib",
+              "streamed_bytes", "prefetch_warmed", "prefetch_used",
+              "prefetch_completed_before_use", "bytes_per_token", "ok", "error"]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -590,6 +690,27 @@ def write_artifacts(args, records):
 
 def parse_int_list(text):
     return [int(x) for x in text.split(",") if x.strip() != ""]
+
+
+def parse_async_list(text):
+    """Parse the --async-list value into a list of 'on'/'off' strings.
+
+    Accepts 'on', 'off' (and the aliases 1/true, 0/false) in any order, e.g.
+    'on,off'. Rejects anything else loudly so a typo cannot silently run only
+    one side of the contrast.
+    """
+    out = []
+    for raw in text.split(","):
+        tok = raw.strip().lower()
+        if tok == "":
+            continue
+        if tok in ("on", "1", "true"):
+            out.append("on")
+        elif tok in ("off", "0", "false"):
+            out.append("off")
+        else:
+            sys.exit(f"--async-list: expected on/off tokens, got '{raw}'")
+    return out or ["on"]
 
 
 def main():
@@ -617,6 +738,11 @@ def main():
     ap.add_argument("--slots-list", default="2,8,0",
                     help="comma list of --expert-slots to sweep; 0 = auto "
                          "(default 2,8,0).")
+    ap.add_argument("--async-list", default="on",
+                    help="comma list of async-prefetch settings to sweep per "
+                         "config ('on', 'off', or 'on,off' to contrast the "
+                         "background I/O overlap on vs off at the SAME bounded "
+                         "slot count; default 'on'). FEAT-003.")
     # Optional real-model row (Colab only).
     ap.add_argument("--real-model", action="store_true",
                     help="append ONE real downloaded TinyLlama (dense) row. "
@@ -647,6 +773,7 @@ def main():
     args.layers_list = parse_int_list(args.layers_list)
     args.experts_list = parse_int_list(args.experts_list)
     args.slots_list = parse_int_list(args.slots_list)
+    args.async_list = parse_async_list(args.async_list)
     if len(args.layers_list) != len(args.experts_list):
         sys.exit("--layers-list and --experts-list must have the same length "
                  "(they pair by index to define each model size).")
@@ -660,13 +787,15 @@ def main():
     print(f"  workdir:      {args.workdir}")
     print(f"  model sizes:  {[model_label(c) for c in model_cfgs]}")
     print(f"  expert-slots: {args.slots_list} (0 = auto)")
+    print(f"  async-list:   {args.async_list} (--async-prefetch sweep)")
     print(f"  max-tokens:   {args.max_tokens}")
     print(f"  real-model:   {'yes (optional row)' if args.real_model else 'no'}")
 
     records = []
     for cfg in model_cfgs:
         for slots in args.slots_list:
-            records.append(run_one(args, cfg, slots))
+            for ap in args.async_list:
+                records.append(run_one(args, cfg, slots, async_prefetch=ap))
 
     if args.real_model:
         records.append(run_real_row(args))

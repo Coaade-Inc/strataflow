@@ -278,6 +278,79 @@ python3 colab/strataflow_colab.py --real-model --is-moe \
   --prompt "The city of"
 ```
 
+#### Async prefetch overlap on vs off (FEAT-003), real Mixtral
+
+Async prefetch overlaps the next layer's predicted-expert disk reads with the
+current layer's compute on a background I/O thread, hiding read latency behind
+compute. It only has work to do on a **bounded** cache (a fully-resident working
+set never streams), so these commands use auto residency (`--expert-slots 0`)
+**capped by `--cache-gb`** so the resident pool is smaller than Mixtral's full
+working set and experts stream every layer. Run the SAME config twice - once
+with `--async-prefetch on` and once `off` - and compare `tokens/sec` and the
+`completed-before-use` overlap metric the driver prints. The decoded text is
+byte-identical between the two (the authoritative load is unchanged); only
+`completed-before-use` (0 when off, > 0 when the overlap fires) and the
+wall-clock differ.
+
+```bash
+%%bash
+cd /content/strataflow
+# RUN C - async prefetch ON (default). Auto residency capped by --cache-gb so
+# the pool is BOUNDED below Mixtral's full working set and experts stream every
+# layer (so overlap has something to hide). Tune --cache-gb down if this runtime
+# has enough RAM to cache the whole set (otherwise there is nothing to prefetch).
+python3 colab/strataflow_colab.py --real-model --is-moe \
+  --hf-repo TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF \
+  --hf-file mixtral-8x7b-instruct-v0.1.Q3_K_M.gguf \
+  --expected-gb 19 --expert-slots 0 --cache-gb 6 --max-tokens 32 \
+  --async-prefetch on \
+  --prompt "The city of"
+```
+
+```bash
+%%bash
+cd /content/strataflow
+# RUN D - async prefetch OFF (synchronous warm path), SAME --cache-gb so it is a
+# true before/after. The .strata is already packed from RUN C, so this run skips
+# the download/pack and only re-decodes. Compare against RUN C:
+#   * decoded text: IDENTICAL (correctness invariant);
+#   * completed-before-use: 0 here (off) vs > 0 in RUN C (overlap firing);
+#   * tokens/sec: RUN C should be >= RUN D when the overlap hides real read
+#     latency (hardware/runtime-dependent - the mechanism is the overlap metric,
+#     the absolute speed depends on this runtime's disk vs compute balance).
+python3 colab/strataflow_colab.py --real-model --is-moe \
+  --hf-repo TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF \
+  --hf-file mixtral-8x7b-instruct-v0.1.Q3_K_M.gguf \
+  --expected-gb 19 --expert-slots 0 --cache-gb 6 --max-tokens 32 \
+  --async-prefetch off \
+  --prompt "The city of"
+```
+
+This async on-vs-off contrast on the real ~19 GB Mixtral is **Colab/hardware-
+dependent and the offline sandbox cannot run it** (no network to download
+Mixtral, and absolute tok/s depends on the runtime's disk and CPU). The sandbox
+proves the MECHANISM in-sandbox instead: `colab/strataflow_bench.py
+--layers-list 8 --experts-list 16 --slots-list 4 --async-list on,off` decodes a
+byte-identical sequence on vs off while `completed-before-use` goes from 0 (off)
+to > 0 (on), i.e. the background worker finishes predicted reads before the
+layer needs them. The CLI's own stats line also reports it directly:
+`build/release/bin/strataflow --model bench_moe-L8-E16.strata --expert-slots 4
+--max-tokens 16 --async-prefetch on` vs `off`.
+
+Note on `streamed_bytes` in this tiny-fixture contrast: on the generated MoE
+the resident pool is sized at about one layer's working set, so the speculative
+worker reads predicted experts into its staging buffer that the synchronous
+warm path (which reads straight into the pool slot, only on a miss) would often
+skip. async-on therefore streams MORE bytes than async-off here (about 1.5 GiB
+vs 1.0 GiB over 16 tokens), a roughly constant overhead independent of the slot
+count. That is the cost the overlap pays to hide read latency behind compute:
+on a disk-bound target (the real Mixtral) hiding the authoritative read latency
+is the win, and the extra speculative bytes are read on the idle I/O thread
+while compute runs. Output stays byte-identical regardless. Do not read the
+tiny-fixture `streamed_bytes` as a disk-traffic win; it is not, and the sandbox
+CPU is too fast relative to its disk for the wall-clock win to show - that is
+exactly why the absolute speed claim is reserved for the Colab Mixtral run.
+
 Sandbox-proven vs Colab-only, to be exact about what each part demonstrates:
 
 - **Sandbox-proven (offline, in CI):** the per-model AUTO residency policy, its
@@ -365,11 +438,30 @@ The table has one row per `(model size x expert-slots)` config, with columns:
   TTFT removed (`(max-tokens - 1) / (wall-clock - TTFT)`). This is the figure
   the harness targets; it is only reported when the CLI gives TTFT and
   `max-tokens > 1`.
+- `async` - `--async-prefetch` for the run (`on`/`off`, FEAT-003). Sweep both
+  with `--async-list on,off` to contrast the background I/O overlap on vs off at
+  the SAME bounded slot count.
 - `TTFT ms` - time-to-first-token.
 - `resident MiB` / `peak RSS MiB` - RAM held by the run.
 - `streamed MiB` / `bytes/tok` - SSD bytes streamed through `StrataReader`.
   `bytes/tok` is exact: it comes from the raw `streamed_bytes` uint64 the CLI
-  reports, not the 1-decimal `streamed MiB` display value.
+  reports, not the 1-decimal `streamed MiB` display value. Note: with
+  `--async-prefetch on` at a tight slot count this can be HIGHER than `off`,
+  because the background worker issues speculative reads that race eviction;
+  that is extra I/O work, not a correctness change (the authoritative experts
+  loaded, and thus the decoded text, are identical).
+- `cbu` - `completed-before-use` (FEAT-003 overlap signal): of the prefetched
+  experts the routing then used, how many the background I/O worker had fully
+  read AND installed BEFORE the layer's authoritative acquire needed them, i.e.
+  the overlap actually hid the disk read. `0` by construction when `async=off`;
+  `> 0` on `async=on` is the mechanism firing.
+
+When the sweep includes `--async-list on,off`, the exit-criteria block adds an
+ASYNC PREFETCH on-vs-off contrast per `(model, slots)`: it confirms the decoded
+text is byte-identical on vs off and reports `completed-before-use`, streamed
+bytes/token, decode tok/s and TTFT side by side. On a small sandbox CPU the
+per-layer compute window is tiny, so wall-clock gains are hardware-dependent and
+the overlap metric (`cbu > 0`) is the honest proof of the mechanism.
 
 Each row is a SINGLE run (no warmup or repeat), so `gen tok/s`, `decode tok/s`
 and `TTFT ms` are single noisy samples; treat them as indicative, not

@@ -33,11 +33,16 @@
 #include <llama.h>
 
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -113,9 +118,64 @@ struct Engine::Impl {
     std::unique_ptr<ExpertPredictor> predictor;
     uint64_t prefetch_warmed = 0;   // experts warmed by a prefetch
     uint64_t prefetch_used   = 0;   // of those, later confirmed resident-hit
+    // FEAT-003: of prefetch_used, how many were installed by the ASYNC worker's
+    // completed read (pf_drain_completed) before the layer's authoritative
+    // acquire needed them - the overlap actually hid the disk read.
+    uint64_t prefetch_completed_before_use = 0;
     // Experts warmed (by this token's prefetches) whose use we have not yet
     // scored. Cleared at the start of each forward().
     std::unordered_set<ExpertId, ExpertIdHash> warmed_this_token;
+    // FEAT-003: experts the async worker finished reading and
+    // pf_drain_completed installed into the pool this token (not yet scored).
+    // An expert in BOTH this set and warmed_this_token that the layer then
+    // routes is a completed-before-use overlap hit. Cleared each forward().
+    std::unordered_set<ExpertId, ExpertIdHash> async_installed_this_token;
+
+    // ---- FEAT-002: ASYNC/overlapped expert prefetch -----------------------
+    // A dedicated single I/O worker thread reads the next layer's predicted
+    // expert bundles off disk (StrataReader::read_blob) or out of the resident
+    // GGUF tensors CONCURRENTLY with the current layer's expert-segment ggml
+    // compute, so read latency hides behind compute. The ggml COMPUTE path
+    // stays single-threaded (backend n_threads=1); only this I/O thread is
+    // added.
+    //
+    // OWNERSHIP SPLIT (the core synchronization invariant):
+    //   - The worker thread touches ONLY: the disk (via reader, read-only),
+    //     the resident GGUF expert tensors (read-only, lifetime-stable), its
+    //     OWN per-request staging buffers, and the shared queue state below
+    //     (under `pf_mu`). It NEVER calls SlotPool::acquire / slot_data /
+    //     resident, so it never mutates the pool's LRU/map/buffers.
+    //   - The COMPUTE thread owns ALL SlotPool mutation. It drains completed
+    //     staging buffers (pf_drain_completed) and installs them into the pool
+    //     via SlotPool::acquire(load_fn = memcpy-from-staging). Because the
+    //     worker never writes a live pool slot, the compute thread can never
+    //     read a slot a prefetch is mid-write into, and eviction on the compute
+    //     thread can never tear a worker write.
+    //
+    // The synchronous ensure_layer_experts_resident() remains the authoritative
+    // load: a still-in-flight or mispredicted prefetch is simply a miss it
+    // loads synchronously, so decode is byte-identical to the oracle.
+    struct PrefetchCompleted {
+        ExpertId id;
+        std::vector<uint8_t> bytes;  // gate|up|down concatenated (slot_bytes)
+        bool ok = false;
+    };
+    std::thread              pf_thread;
+    std::mutex               pf_mu;
+    std::condition_variable  pf_cv;        // worker waits on new work / stop
+    std::deque<ExpertId>     pf_pending;   // requests the worker has not read yet
+    std::vector<PrefetchCompleted> pf_completed;  // read, awaiting install
+    // Ids currently queued, in-flight, or completed-but-not-yet-installed, so
+    // the compute thread does not enqueue the same expert twice before it is
+    // installed. Guarded by pf_mu.
+    std::unordered_set<ExpertId, ExpertIdHash> pf_tracked;
+    bool pf_stop    = false;   // teardown: worker exits its loop
+    bool pf_busy    = false;   // worker is mid-read of one request
+    bool pf_enabled = false;   // async prefetch active (bounded pool + env on)
+    uint64_t pf_slot_bytes = 0;  // bytes per staging buffer (== slot_bytes)
+    // Cap on outstanding prefetch work so it cannot run unbounded ahead across
+    // tokens; sized to a couple of layers' top-k worth of experts.
+    size_t pf_queue_cap = 0;
 
     // One CPU backend + gallocr reused across every segment and token (section
     // 3.5: reuse the allocator across tokens; also avoids re-initializing the
@@ -140,7 +200,24 @@ struct Engine::Impl {
     // the staging-tensor sizing can read their ne-shape and nb[2] stride.
     ggml_context *ectx = nullptr;
 
+    // Signal the prefetch worker to stop and JOIN it before freeing any buffer
+    // or reader it reads through, so there is no use-after-free. Safe to call
+    // when the worker was never started (joinable() is false then).
+    void pf_shutdown() {
+        {
+            std::lock_guard<std::mutex> lk(pf_mu);
+            pf_stop = true;
+        }
+        pf_cv.notify_all();
+        if (pf_thread.joinable()) pf_thread.join();
+    }
+
     ~Impl() {
+        // Join the I/O worker FIRST: it reads through `reader`, the resident
+        // GGUF expert tensors (wctx/wbuf), and its own staging buffers, all of
+        // which are freed below. Joining here guarantees no concurrent access
+        // during teardown.
+        pf_shutdown();
         if (galloc != nullptr) ggml_gallocr_free(galloc);
         if (backend != nullptr) ggml_backend_free(backend);
         if (estbuf != nullptr) ggml_backend_buffer_free(estbuf);
@@ -583,6 +660,10 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
 }
 
 void Engine::reset_kv() {
+    // FEAT-002: quiesce the prefetch worker so a new sequence starts clean (no
+    // stale staged bytes from the prior sequence's predictions). The worker
+    // thread itself stays alive to serve the next sequence.
+    pf_quiesce();
     if (impl_->kv != nullptr) impl_->kv->reset();
 }
 
@@ -1053,11 +1134,249 @@ void Engine::warm_expert(int il, int expert) {
 
 const EngineHParams &Engine::hp_() const { return impl_->hp; }
 
+// FEAT-002: read one expert bundle's gate|up|down bytes into `dst` (which must
+// hold slot_bytes). This is the SAME byte source warm_expert and
+// ensure_layer_experts_resident use: the .strata expert region via
+// StrataReader::read_blob when a .strata was loaded, else the per-expert nb02
+// slices of the resident GGUF weight tensors. Either source yields the SAME
+// verbatim bytes.
+//
+// THREAD-SAFETY: this is const and touches only read-only state - the
+// StrataReader (whose read_blob is const and whose streamed_bytes_ counter is
+// now atomic) and the resident GGUF expert tensors (lifetime-stable, never
+// written after load). It therefore runs safely on the I/O worker thread
+// concurrently with the compute thread's own reads. It does NOT touch the
+// SlotPool. Returns true only on a complete read of all three slices.
+bool Engine::pf_read_bundle(int il, int expert, void *dst) const {
+    const Impl &im = *impl_;
+    if (il < 0 || il >= hp_().n_layer) return false;
+    if (expert < 0 || expert >= hp_().n_expert) return false;
+
+    const uint64_t gb = im.gate_expert_bytes;
+    const uint64_t ub = im.up_expert_bytes;
+    const uint64_t db = im.down_expert_bytes;
+    uint8_t *d = static_cast<uint8_t *>(dst);
+    const uint32_t ul = static_cast<uint32_t>(il);
+    const uint32_t ue = static_cast<uint32_t>(expert);
+
+    if (im.reader != nullptr) {
+        const int64_t ng =
+            im.reader->read_blob(ul, ue, ExpertTensorKind::kGate, d);
+        const int64_t nu =
+            im.reader->read_blob(ul, ue, ExpertTensorKind::kUp, d + gb);
+        const int64_t nd =
+            im.reader->read_blob(ul, ue, ExpertTensorKind::kDown, d + gb + ub);
+        return ng == static_cast<int64_t>(gb) &&
+               nu == static_cast<int64_t>(ub) &&
+               nd == static_cast<int64_t>(db);
+    }
+
+    const std::string p = "blk." + std::to_string(il) + ".";
+    ggml_tensor *src_gate =
+        ggml_get_tensor(im.wctx, (p + "ffn_gate_exps.weight").c_str());
+    ggml_tensor *src_up =
+        ggml_get_tensor(im.wctx, (p + "ffn_up_exps.weight").c_str());
+    ggml_tensor *src_down =
+        ggml_get_tensor(im.wctx, (p + "ffn_down_exps.weight").c_str());
+    if (src_gate == nullptr || src_up == nullptr || src_down == nullptr) {
+        return false;
+    }
+    std::memcpy(d,
+                static_cast<const uint8_t *>(src_gate->data) +
+                    static_cast<size_t>(expert) * gb,
+                static_cast<size_t>(gb));
+    std::memcpy(d + gb,
+                static_cast<const uint8_t *>(src_up->data) +
+                    static_cast<size_t>(expert) * ub,
+                static_cast<size_t>(ub));
+    std::memcpy(d + gb + ub,
+                static_cast<const uint8_t *>(src_down->data) +
+                    static_cast<size_t>(expert) * db,
+                static_cast<size_t>(db));
+    return true;
+}
+
+// FEAT-002: lazily start the single I/O worker thread. Called the first time an
+// async prefetch is actually wanted. NOT started when the whole working set is
+// resident (nothing to stream) or when async prefetch is disabled by the
+// STRATAFLOW_ENGINE_ASYNC_PREFETCH env var - the fully-resident/dense fast path
+// then stays single-threaded with zero extra threads.
+//
+// Default-ON: the env var defaults to ENABLED when unset; set it to "0"/"false"
+// /"off" to force the synchronous warm_expert path (FEAT-003 wires the public
+// toggle through to this same env var; the oracle test drives both paths).
+void Engine::pf_maybe_start() {
+    Impl &im = *impl_;
+    if (im.pf_thread.joinable()) return;      // already running
+    if (im.pool == nullptr) return;
+    // Need a byte source: the .strata reader, or the resident GGUF tensors.
+    if (im.reader == nullptr && im.wctx == nullptr) return;
+
+    // Only stream when the pool is BOUNDED below the full working set; a pool
+    // that holds every expert never misses, so prefetch has nothing to do.
+    const uint32_t full_slots = static_cast<uint32_t>(hp_().n_layer) *
+                                static_cast<uint32_t>(hp_().n_expert);
+    if (im.pool->n_slots() >= full_slots) return;  // fully resident: fast path
+
+    // Env toggle (default ON). FEAT-003 adds the public param that sets this.
+    const char *env = std::getenv("STRATAFLOW_ENGINE_ASYNC_PREFETCH");
+    bool enabled = true;
+    if (env != nullptr && env[0] != '\0') {
+        enabled = !(std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 ||
+                    std::strcmp(env, "off") == 0 || std::strcmp(env, "OFF") == 0 ||
+                    std::strcmp(env, "FALSE") == 0);
+    }
+    if (!enabled) return;
+
+    im.pf_enabled    = true;
+    im.pf_slot_bytes = im.gate_expert_bytes + im.up_expert_bytes +
+                       im.down_expert_bytes;
+    // Cap outstanding work at a few layers' top-k so prefetch cannot run
+    // unbounded ahead of compute across tokens.
+    im.pf_queue_cap =
+        static_cast<size_t>(hp_().n_expert_used) * 4 + 4;
+    im.pf_stop = false;
+
+    // The worker loop: pop one request, read its bytes into a staging buffer,
+    // push the completed buffer back for the compute thread to install. It
+    // NEVER touches the SlotPool.
+    im.pf_thread = std::thread([this]() {
+        Impl &w = *impl_;
+        for (;;) {
+            ExpertId id{};
+            {
+                std::unique_lock<std::mutex> lk(w.pf_mu);
+                w.pf_cv.wait(lk, [&] {
+                    return w.pf_stop || !w.pf_pending.empty();
+                });
+                if (w.pf_stop) return;
+                id = w.pf_pending.front();
+                w.pf_pending.pop_front();
+                w.pf_busy = true;
+            }
+            // Read OUTSIDE the lock (disk I/O / big memcpy) into a private
+            // staging buffer. Reads are const/read-only, no SlotPool access.
+            Impl::PrefetchCompleted done;
+            done.id = id;
+            done.bytes.resize(static_cast<size_t>(w.pf_slot_bytes));
+            done.ok = pf_read_bundle(static_cast<int>(id.layer),
+                                     static_cast<int>(id.expert),
+                                     done.bytes.data());
+            {
+                std::lock_guard<std::mutex> lk(w.pf_mu);
+                w.pf_completed.push_back(std::move(done));
+                w.pf_busy = false;
+            }
+            // The compute thread polls pf_completed via pf_drain_completed; no
+            // need to notify it (it never blocks waiting on prefetch results -
+            // a missing result is just a synchronous miss).
+            w.pf_cv.notify_all();  // in case pf_quiesce is waiting on us
+        }
+    });
+}
+
+// FEAT-002: queue a predicted {layer,expert} for the worker (compute thread
+// only). Deduped against the pool (already resident) and against the
+// queued/in-flight/completed set, and capped so the queue cannot grow unbounded
+// across tokens.
+void Engine::pf_enqueue(int il, int expert) {
+    Impl &im = *impl_;
+    if (!im.pf_enabled || !im.pf_thread.joinable()) return;
+    if (il < 0 || il >= hp_().n_layer) return;
+    if (expert < 0 || expert >= hp_().n_expert) return;
+    ExpertId id{static_cast<uint32_t>(il), static_cast<uint32_t>(expert)};
+    if (im.pool->resident(id)) return;  // already warm, nothing to fetch
+    {
+        std::lock_guard<std::mutex> lk(im.pf_mu);
+        if (im.pf_tracked.count(id) != 0) return;         // already in flight
+        if (im.pf_pending.size() >= im.pf_queue_cap) return;  // cap reached
+        im.pf_tracked.insert(id);
+        im.pf_pending.push_back(id);
+    }
+    im.pf_cv.notify_one();
+}
+
+// FEAT-002: install any completed staging buffers into the SlotPool (compute
+// thread ONLY - this is the single point where prefetched bytes mutate the
+// pool). A result whose expert is already resident (a concurrent authoritative
+// acquire beat the prefetch) or that failed to read is dropped. Installing via
+// SlotPool::acquire(load_fn=memcpy-from-staging) makes the slot resident so a
+// later authoritative acquire of the same id becomes a cache hit.
+void Engine::pf_drain_completed() {
+    Impl &im = *impl_;
+    if (!im.pf_enabled) return;
+    std::vector<Impl::PrefetchCompleted> ready;
+    {
+        std::lock_guard<std::mutex> lk(im.pf_mu);
+        if (im.pf_completed.empty()) return;
+        ready.swap(im.pf_completed);
+        for (const auto &c : ready) im.pf_tracked.erase(c.id);
+    }
+    for (auto &c : ready) {
+        if (!c.ok) continue;
+        if (im.pool->resident(c.id)) continue;  // authoritative load beat us
+        // FEAT-003 (Issue 2 measurement): a speculative prefetch install goes
+        // through SlotPool::acquire, which can evict an LRU victim. We measured
+        // a "free-slot-only" guard (SlotPool::has_free_slot(); drop the install
+        // when the pool would need to evict). On the bounded fixtures the
+        // resident pool is sized at or near one layer's working set, so after
+        // warmup the pool is ALWAYS full (free_slots never refills: eviction
+        // reuses the victim's slot in place). The guard therefore dropped every
+        // post-warmup install, which (a) zeroed the overlap metric - no
+        // prefetch is ever installed-before-use - and (b) did NOT reduce
+        // streamed_bytes (async-on stayed ~1.5 GiB), because the worker still
+        // issued the speculative read into staging and the authoritative pass
+        // then re-read the dropped expert. Installing unconditionally (letting
+        // acquire evict) keeps the overlap mechanism live and does not increase
+        // streamed_bytes versus the guard. So we KEEP the authoritative-correct
+        // install here; the ~0.5 GiB async-on amplification is inherent to
+        // decoupled speculative reads at slots ~= working set and is documented
+        // in FEAT-003 findings. Correctness is unaffected either way (output
+        // byte-identical; the authoritative ensure_layer_experts_resident is
+        // the backstop). has_free_slot() remains available for a slots >>
+        // working-set config where free slots genuinely exist.
+        // Single-thread SlotPool mutation: copy the staged bytes into the slot
+        // the pool assigns (possibly evicting an LRU victim). Because the worker
+        // never touches the pool, this cannot race a worker write.
+        im.pool->acquire(c.id, [&](void *dst) {
+            std::memcpy(dst, c.bytes.data(),
+                        static_cast<size_t>(im.pf_slot_bytes));
+        });
+        // FEAT-003: the worker's read COMPLETED and we installed it here, i.e.
+        // before any authoritative acquire for this id. If the layer then
+        // routes this expert, that is a completed-before-use overlap hit.
+        im.async_installed_this_token.insert(c.id);
+    }
+}
+
+// FEAT-002: block new work, wait for the in-flight read to finish, and clear
+// the queue + completed results. Used at reset_kv() so a new sequence starts
+// with no stale staged bytes. The worker thread stays alive (it will service
+// the next sequence); only its outstanding work is cancelled/drained.
+void Engine::pf_quiesce() {
+    Impl &im = *impl_;
+    if (!im.pf_thread.joinable()) return;
+    std::unique_lock<std::mutex> lk(im.pf_mu);
+    im.pf_pending.clear();                 // cancel not-yet-started requests
+    im.pf_cv.wait(lk, [&] { return !im.pf_busy; });  // let the in-flight read finish
+    im.pf_completed.clear();               // drop staged results
+    im.pf_tracked.clear();
+    lk.unlock();
+    im.async_installed_this_token.clear();  // FEAT-003: drop overlap bookkeeping
+}
+
 bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     Impl &im = *impl_;
     const EngineHParams &hp = im.hp;
 
     im.warmed_this_token.clear();  // EC-6: fresh prefetch bookkeeping per token
+    im.async_installed_this_token.clear();  // FEAT-003: fresh overlap bookkeeping
+
+    // FEAT-002: lazily spin up the async prefetch worker on first use (no-op
+    // when the whole working set is resident or async is disabled). Results
+    // from a prior token's predictions stay valid across tokens (same
+    // {layer,expert} space), so they are kept, not discarded, at this boundary.
+    pf_maybe_start();
 
     ggml_tensor *tok_embd = ggml_get_tensor(im.wctx, "token_embd.weight");
     ggml_tensor *out_norm = ggml_get_tensor(im.wctx, "output_norm.weight");
@@ -1186,12 +1505,31 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
             if (!ok) return false;
         }
 
-        // --- EC-6: measure prefetch effectiveness + feed the predictor ---
-        // Before the authoritative residency pass, count how many of this
-        // layer's actually-routed experts a prior prefetch had already made
-        // resident (a prefetch "hit"). Then observe the real routing so the
-        // predictor learns. This read is pure bookkeeping; it does not change
-        // what gets computed.
+        // --- FEAT-002: LAYER boundary - install completed prefetches ---
+        // Before the authoritative residency pass, install any expert bundles
+        // the async worker has finished reading into the pool, so this layer's
+        // acquire tends to HIT on a successfully-overlapped prefetch. A
+        // still-in-flight or mispredicted prefetch is simply absent here and
+        // ensure_layer_experts_resident loads it synchronously - output is
+        // byte-identical either way. No-op when async prefetch is disabled.
+        //
+        // This drain MUST run BEFORE the completed-before-use scoring below:
+        // layer il's experts were enqueued at the end of layer il-1 and their
+        // background reads typically finish in time to be installed by THIS
+        // drain. Scoring the overlap metric before this drain (as an earlier
+        // revision did) structurally undercounts exactly those in-time
+        // prefetches, since async_installed_this_token would not yet carry the
+        // ids this very layer's drain is about to install.
+        pf_drain_completed();
+
+        // --- EC-6/FEAT-003: measure prefetch effectiveness + feed predictor --
+        // Now that this layer's completed prefetches are installed (above) but
+        // BEFORE the authoritative ensure_layer_experts_resident acquire, count
+        // how many of this layer's actually-routed experts a prior prefetch had
+        // already made resident (a prefetch "hit"), and of those how many were
+        // installed by a COMPLETED async read (the overlap genuinely hid the
+        // disk read). Then observe the real routing so the predictor learns.
+        // This read is pure bookkeeping; it does not change what gets computed.
         if (im.predictor != nullptr) {
             for (size_t i = 0; i < n_used; ++i) {
                 const int32_t e = ids_host[i];
@@ -1199,6 +1537,14 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
                 ExpertId id{static_cast<uint32_t>(il), static_cast<uint32_t>(e)};
                 if (im.warmed_this_token.count(id) != 0) {
                     ++im.prefetch_used;
+                    // FEAT-003: this used expert's bytes were read by the async
+                    // worker and installed (by a drain at or before this layer,
+                    // i.e. BEFORE the authoritative acquire just below) - the
+                    // overlap hid the disk read latency. Scored AFTER the drain
+                    // so this layer's own in-time prefetches are counted.
+                    if (im.async_installed_this_token.count(id) != 0) {
+                        ++im.prefetch_completed_before_use;
+                    }
                 }
                 im.predictor->observe(id);
             }
@@ -1210,11 +1556,18 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
             return false;
         }
 
-        // --- EC-6: prefetch the NEXT layer's predicted experts ---
-        // Warm layer il+1's likely experts into the pool now, while we are
-        // between layers, so its authoritative residency pass tends to hit.
-        // Correctness is unaffected: il+1's own router read-back is still
-        // authoritative and re-acquires exactly what it selects.
+        // --- EC-6/FEAT-002: prefetch the NEXT layer's predicted experts ---
+        // Warm layer il+1's likely experts into the pool so its authoritative
+        // residency pass tends to hit. Correctness is unaffected: il+1's own
+        // router read-back is still authoritative and re-acquires exactly what
+        // it selects.
+        //
+        // ASYNC (default): enqueue the predicted ids to the I/O worker NOW,
+        // BEFORE this layer's expert segment runs, so the disk read overlaps
+        // the expert-segment ggml compute below (the latency we hide).
+        // SYNCHRONOUS fallback (async disabled): warm inline via warm_expert as
+        // before. Both paths keep prefetch_warmed/warmed_this_token semantics
+        // so test_engine_prefetch_hit_rate still measures used-after-warm.
         if (im.predictor != nullptr && il + 1 < hp.n_layer) {
             const uint32_t k = static_cast<uint32_t>(hp.n_expert_used);
             std::vector<uint32_t> pred = im.predictor->predict(
@@ -1222,7 +1575,11 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
             for (uint32_t pe : pred) {
                 ExpertId id{static_cast<uint32_t>(il + 1), pe};
                 if (im.pool->resident(id)) continue;  // already warm
-                warm_expert(il + 1, static_cast<int>(pe));
+                if (im.pf_enabled) {
+                    pf_enqueue(static_cast<int>(il + 1), static_cast<int>(pe));
+                } else {
+                    warm_expert(il + 1, static_cast<int>(pe));
+                }
                 im.warmed_this_token.insert(id);
                 ++im.prefetch_warmed;
             }
@@ -1295,6 +1652,8 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
         im.cstats.evictions = cs.evictions;
         im.cstats.prefetch_warmed = im.prefetch_warmed;  // EC-6
         im.cstats.prefetch_used   = im.prefetch_used;
+        im.cstats.prefetch_completed_before_use =
+            im.prefetch_completed_before_use;  // FEAT-003 overlap signal
     }
     return true;
 }

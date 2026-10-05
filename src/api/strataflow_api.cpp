@@ -80,6 +80,7 @@ sf_context_params sf_context_default_params(void) {
     p.preferred_backend = SF_BACKEND_CPU;
     p.expert_slots      = 0;   // auto (hold the whole expert working set)
     p.cache_budget      = 0;   // auto (size experts from free RAM)
+    p.async_prefetch    = 1;   // async/overlapped expert prefetch ON (default)
     return p;
 }
 
@@ -127,6 +128,28 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
         _putenv_s("STRATAFLOW_ENGINE_EXPERT_SLOTS", "");
 #else
         unsetenv("STRATAFLOW_ENGINE_EXPERT_SLOTS");
+#endif
+    }
+
+    // FEAT-003: route the async-prefetch toggle to the engine via the env var
+    // the engine already reads (STRATAFLOW_ENGINE_ASYNC_PREFETCH), using the
+    // SAME clear-when-default discipline as expert_slots above. The engine's
+    // default is ON (prefetch enabled when the var is UNSET), so when the param
+    // is ON/default we UNSET the env - this prevents a stale "0" exported by a
+    // PRIOR explicit-OFF context in this process (the C ABI allows many
+    // contexts per process) or by a parent process from silently disabling
+    // overlap on an ON context. Only an explicit OFF writes "0".
+    if (params->async_prefetch == 0) {
+#if defined(_WIN32)
+        _putenv_s("STRATAFLOW_ENGINE_ASYNC_PREFETCH", "0");
+#else
+        setenv("STRATAFLOW_ENGINE_ASYNC_PREFETCH", "0", /*overwrite=*/1);
+#endif
+    } else {
+#if defined(_WIN32)
+        _putenv_s("STRATAFLOW_ENGINE_ASYNC_PREFETCH", "");
+#else
+        unsetenv("STRATAFLOW_ENGINE_ASYNC_PREFETCH");
 #endif
     }
 
@@ -248,6 +271,13 @@ sf_status sf_session_stats(sf_session *session, sf_runtime_stats *out) {
     // in the struct documents it for any future programmatic caller.
     out->streamed_bytes = have_model ? session->ctx->model->streamed_bytes() : 0;
     out->ttft_us = 0;
+    // FEAT-003 async-prefetch overlap signals (0 on non-streaming paths).
+    out->prefetch_completed_before_use =
+        have_model ? session->ctx->model->prefetch_completed_before_use() : 0;
+    out->prefetch_used =
+        have_model ? session->ctx->model->prefetch_used() : 0;
+    out->prefetch_warmed =
+        have_model ? session->ctx->model->prefetch_warmed() : 0;
     return SF_OK;
 }
 

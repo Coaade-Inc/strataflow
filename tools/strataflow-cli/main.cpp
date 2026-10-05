@@ -39,6 +39,11 @@ void print_usage(const char *argv0) {
         "                     bounded streaming - run a big model in little RAM).\n"
         "                     Precedence: --expert-slots > --cache-gb > auto.\n"
         "  --max-tokens N     generation cap (default 64)\n"
+        "  --async-prefetch on|off\n"
+        "                     overlap the next layer's expert disk reads with\n"
+        "                     the current layer's compute on a background I/O\n"
+        "                     thread (default on). off = synchronous warm path\n"
+        "                     (byte-identical output; only hides read latency).\n"
         "  --plan             print the placement plan and exit\n"
         "  --version          print version and exit\n"
         "  -h, --help         this help\n",
@@ -70,6 +75,7 @@ int main(int argc, char **argv) {
     uint32_t expert_slots = 0;
     int max_tokens = 64;
     bool plan_only = false;
+    bool async_prefetch = true;  // FEAT-003: overlap on by default
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -89,6 +95,20 @@ int main(int argc, char **argv) {
         else if (a == "--cache-gb")     { cache_gb = std::atof(next("--cache-gb")); }
         else if (a == "--expert-slots") { expert_slots = (uint32_t)std::strtoul(next("--expert-slots"), nullptr, 10); }
         else if (a == "--max-tokens")   { max_tokens = std::atoi(next("--max-tokens")); }
+        else if (a == "--async-prefetch") {
+            const char *v = next("--async-prefetch");
+            if (std::strcmp(v, "on") == 0 || std::strcmp(v, "1") == 0 ||
+                std::strcmp(v, "true") == 0) {
+                async_prefetch = true;
+            } else if (std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0 ||
+                       std::strcmp(v, "false") == 0) {
+                async_prefetch = false;
+            } else {
+                std::fprintf(stderr,
+                             "error: --async-prefetch expects on|off (got '%s')\n", v);
+                std::exit(2);
+            }
+        }
         else if (a == "--plan")         { plan_only = true; }
         else if (a == "--")             { // rest is the prompt
             prompt.clear();
@@ -116,6 +136,7 @@ int main(int argc, char **argv) {
     params.ram_budget   = gib(ram_gb);
     params.expert_slots = expert_slots;
     params.cache_budget = gib(cache_gb);  // 0 = auto; caps the auto slot choice
+    params.async_prefetch = async_prefetch ? 1 : 0;  // FEAT-003 overlap toggle
 
     sf_context *ctx = nullptr;
     sf_status st = sf_context_create(&params, &ctx);
@@ -179,6 +200,22 @@ int main(int argc, char **argv) {
                         static_cast<double>(rs.streamed_bytes) / mib);
             std::printf(", streamed_bytes = %llu",
                         static_cast<unsigned long long>(rs.streamed_bytes));
+        }
+        // FEAT-003: async-prefetch overlap signal. Appended as new ', key =
+        // value' fields so the existing Python parser (which keys off exact
+        // substrings) is unaffected. Printed only when a prefetch actually
+        // warmed something (bounded streaming path); on the fully-resident path
+        // there is nothing to prefetch so these stay absent. prefetch_used /
+        // prefetch_warmed is the hit rate; completed_before_use / prefetch_used
+        // is the overlap effectiveness (reads whose latency was hidden).
+        if (rs.prefetch_warmed > 0) {
+            std::printf(", prefetch_warmed = %llu",
+                        static_cast<unsigned long long>(rs.prefetch_warmed));
+            std::printf(", prefetch_used = %llu",
+                        static_cast<unsigned long long>(rs.prefetch_used));
+            std::printf(", prefetch_completed_before_use = %llu",
+                        static_cast<unsigned long long>(
+                            rs.prefetch_completed_before_use));
         }
         std::printf("\n");
     }

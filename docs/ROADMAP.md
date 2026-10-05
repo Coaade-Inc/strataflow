@@ -202,29 +202,37 @@ most are pure CPU/disk work.
   shared experts, sigmoid gating with group-limited top-k), and others are each
   a new oracle-gated graph builder per the arch-descriptor plan
   (`ENGINE_CORE_DESIGN.md` section 6.4).
-- [ ] **Async prefetch overlap (explicitly DEFERRED).** EC-6 does synchronous
-  cache-warming. True background-I/O overlap (load layer N+1's experts on a
-  thread while layer N computes) is deferred, along with per-layer graph-build
-  reuse across tokens (`ENGINE_CORE_DESIGN.md` section 3.5). Decision for the
-  auto-residency work: EC-6's predictor-driven prefetch warming is NOT adapted to
-  the auto-chosen residency in this scope, and that adaptation is DEFERRED with
-  the async-overlap item. Reason: the auto policy's win is already fully captured
-  by the resident-pool sizing itself (when RAM holds the working set, the whole
-  set is cached and nothing is re-streamed, so there is nothing left for prefetch
-  to hide; when RAM cannot hold it, the pool is bounded and correctness depends
-  on the synchronous warm path staying exactly as the oracle gate validates it).
-  Making prefetch warming residency-aware only pays off once I/O actually
-  overlaps compute on a background thread, so it belongs with async overlap, not
-  before it. Changing the warm path now would risk the byte-identical oracle
-  guarantee for no measured gain, so it is deferred rather than attempted. No
-  correctness regression: the auto path reuses the exact synchronous warm/stream
-  mechanism EC-3/EC-6 already prove against the oracle.
+- [x] **Async prefetch overlap (DONE).** A dedicated background I/O worker
+  thread now overlaps the next layer's predicted-expert disk reads with the
+  current layer's ggml compute, so read latency hides behind compute on the
+  bounded-RAM streaming path. The synchronous `ensure_layer_experts_resident`
+  stays the AUTHORITATIVE load: a mispredicted or still-in-flight prefetch is a
+  plain miss it corrects inline, so decode is byte-identical to the libllama
+  oracle including under bounded-pool eviction (the oracle gate's async sub-test
+  shows async-vs-sync `|delta| = 0.000e+00`, identical across repeated runs that
+  perturb prefetch timing). The ggml compute path stays single-threaded (only an
+  I/O thread was added); the worker never touches the non-thread-safe
+  `SlotPool`, reading into its own staging buffer and handing completed bytes to
+  the compute thread to install, which keeps it thread-safe/TSan-clean. A
+  default-ON runtime toggle (`sf_context_params.async_prefetch`, the CLI
+  `--async-prefetch on|off`, env `STRATAFLOW_ENGINE_ASYNC_PREFETCH`) lets a
+  misbehaving platform fall back to the synchronous warm path and lets the bench
+  contrast on vs off. An overlap metric (`completed-before-use`: prefetches the
+  worker finished and installed before the layer needed them) is surfaced
+  through `sf_runtime_stats` and the CLI stats line. In-sandbox the MECHANISM is
+  proven (`completed-before-use` goes from 0 with async off to > 0 with async
+  on, byte-identical output); absolute wall-clock speedup is hardware-dependent
+  and re-verifiable on Colab/real-Mixtral (see `colab/README.md`). Per-layer
+  graph-build reuse across tokens (`ENGINE_CORE_DESIGN.md` section 3.5) remains
+  a separate deferred item.
 
 ### From the original PLAN.md (Phases 4-7), as written
 
-- [~] **Phase 4 - predictor + pipelined prefetch.** Statistical predictor done
-  (EC-6); pipelined/async overlap not done, and residency-aware prefetch warming
-  is deferred with it (see "Async prefetch overlap" above for the reasoning).
+- [x] **Phase 4 - predictor + pipelined prefetch.** Statistical predictor done
+  (EC-6); background-I/O async overlap now DONE too (see "Async prefetch overlap"
+  above): a background thread loads layer N+1's predicted experts while layer N
+  computes, byte-identical to the oracle, with a default-ON toggle and an
+  overlap metric. Per-layer graph-build reuse across tokens remains deferred.
 - [ ] **Phase 5 - speculative decoding** (EAGLE / draft / n-gram / MTP). Not
   started.
 - [ ] **Phase 6 - quantization and kernels.** Mixed-precision `.strata` presets,

@@ -11,6 +11,9 @@
 #include <cstdint>
 #include <future>
 #include <string>
+#if defined(STRATAFLOW_PLATFORM_windows)
+#include <mutex>  // guards the stateful win_crt_ seek+read fallback in read_at
+#endif
 
 namespace sf {
 
@@ -74,6 +77,15 @@ private:
     Backend  backend_ = Backend::kSync;
 #if defined(STRATAFLOW_PLATFORM_windows)
     bool     win_crt_ = false;  // Windows: handle_ is a FILE* (sync fallback)
+    // Guards ONLY the win_crt_ sync-fallback branch of read_at, whose
+    // _fseeki64 + fread advance a SHARED, stateful file position on handle_.
+    // Once the async-prefetch worker and the compute thread both call read_blob
+    // (-> read_at) concurrently, two interleaved seek+read pairs on the same
+    // handle would race and return bytes from the wrong offset. A per-call lock
+    // around just the seek+read makes each positional read atomic. The POSIX
+    // pread path is positional/stateless and intentionally stays lock-free, so
+    // this member only exists on Windows. mutable because read_at is const.
+    mutable std::mutex win_crt_mu_;
 #endif
 };
 
