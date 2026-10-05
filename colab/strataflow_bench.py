@@ -431,8 +431,8 @@ def print_exit_criteria(records):
     print("layer's FULL expert count. So it does NOT track --expert-slots (the")
     print("peak-RSS column above does not shrink as slots shrink, unlike the")
     print("streamed-MiB column) and can EXCEED on-disk for small models. That is")
-    print("EXPECTED here, not a failure:")
-    print("these generated models are tiny, so the fixed floor dominates.")
+    print("EXPECTED here, not a failure: these generated models are tiny, so the")
+    print("fixed floor dominates.")
 
     # Explicitly flag, per row, where peak RSS >= on-disk instead of printing a
     # >100% figure as if it proved the mission.
