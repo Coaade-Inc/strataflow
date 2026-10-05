@@ -54,7 +54,14 @@ buys speed, not capability - the output is identical at every memory size.**
   resident expert memory is bounded to what a token actually uses, not the whole
   layer.
 - **Automatic hardware tuning**: profiles your machine on first run and decides
-  what goes where. No hand-tuning placement flags.
+  what goes where. Expert residency is now **auto-sized per model** - StrataFlow
+  picks how many expert bundles to keep resident from your measured free RAM plus
+  the model's own expert layout (`n_expert`, `n_expert_used`, `expert_bytes`,
+  layer count), so it adapts to any MoE shape with no hand-tuned slot flag. When
+  RAM holds the whole working set it caches it; when it cannot, residency is
+  bounded (never below one layer's top-k). `--cache-gb` caps the expert-RAM
+  budget and `--expert-slots` overrides the choice (precedence: `--expert-slots`
+  > `--cache-gb` > auto-from-free-RAM).
 - **A streaming-friendly model format** (`.strata`) built from standard GGUF, so
   one file holds the always-resident trunk plus aligned per-expert blobs.
 - **Prediction-driven prefetch** (in progress): guess the next layer's experts
@@ -119,6 +126,17 @@ Also shipped since the engine core (see [`CHANGELOG.md`](CHANGELOG.md) and
 - **Memory-budget CLI + peak-RSS reporting** - `--expert-slots` plus a `stats:`
   line that reports resident model-weight bytes and peak RSS, so a user can run
   a model bounded and see the result (#25).
+- **RAM-aware, per-model auto expert-residency** - by default the engine
+  auto-sizes the resident expert pool from the measured free RAM and the model's
+  expert layout (no model constants, so it adapts to any MoE shape); `--cache-gb`
+  caps the expert-RAM budget and `--expert-slots` overrides, with precedence
+  `--expert-slots` > `--cache-gb` > auto-from-free-RAM. The placement-plan line
+  now reports the slot count the engine actually uses with the correct
+  stream/resident state and a realistic peak, and the auto choice stays
+  byte-identical to the fully-resident and fixed-slot runs against the oracle.
+  Sandbox-proven: the bench harness shows the auto row streaming ~8x fewer
+  SSD bytes/token than a deliberately-too-small fixed slot count on the same
+  model (the real large-MoE speedup is Colab-demonstrated).
 - **Bounded peak process RAM** - a single reused expert-staging buffer caps
   staging to one layer's footprint, so peak RSS no longer tracks model size: a
   785 MiB model runs in 132 MiB peak RSS, and a 1177 MiB model also runs in

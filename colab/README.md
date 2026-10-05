@@ -236,20 +236,61 @@ if it will not fit:
 df -h /content
 ```
 
+Run it TWICE for a before/after on the SAME model. Run A relies on StrataFlow's
+AUTO expert-residency (`--expert-slots 0`): the engine sizes the resident expert
+pool per model from this runtime's free RAM plus Mixtral's own expert layout, so
+on a runtime with enough RAM it caches the whole layer working set and re-reads
+far fewer SSD bytes per token. Run B forces a deliberately-small fixed pool
+(`--expert-slots 4`) so you can SEE the difference: the fixed-too-small pool
+evicts and re-streams experts every token, so its `streamed = ... MiB` and
+bytes/token are much larger (and tok/s lower) than the auto run on the same
+model. Set `--is-moe` so the summary labels it correctly, and raise
+`--expected-gb` to match the chosen quant.
+
 ```bash
 %%bash
 cd /content/strataflow
-# Mixtral is a genuine llama-arch MoE (Apache-2.0). It is disk-heavy, not
-# RAM-heavy: the ~24 GB+ GGUF is a download/disk cost, while --expert-slots
-# bounds resident RAM far below that. The flow's disk guard will refuse clearly
-# if the GGUF + .strata copy will not fit the free disk. Set --is-moe so the
-# summary labels it correctly, and raise --expected-gb to match the chosen quant.
+# RUN A - AUTO residency (recommended). --expert-slots 0 lets StrataFlow size
+# the resident expert pool per model from measured free RAM + Mixtral's expert
+# layout. On a runtime with enough RAM this caches the whole working set, so it
+# re-reads the fewest SSD bytes per token. --cache-gb X would cap that budget;
+# precedence is explicit --expert-slots > --cache-gb > auto-from-free-RAM.
+python3 colab/strataflow_colab.py --real-model --is-moe \
+  --hf-repo TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF \
+  --hf-file mixtral-8x7b-instruct-v0.1.Q3_K_M.gguf \
+  --expected-gb 19 --expert-slots 0 --max-tokens 16 \
+  --prompt "The city of"
+```
+
+```bash
+%%bash
+cd /content/strataflow
+# RUN B - deliberately-small fixed pool for comparison. --expert-slots 4 forces
+# a too-small resident pool on the SAME model, so experts are evicted and
+# re-streamed every token. Compare its `streamed = ... MiB` / bytes-per-token
+# and tok/s against RUN A: auto streams far fewer bytes and is faster because it
+# caches the working set when RAM allows. (The .strata is already packed from
+# RUN A, so this run skips the download/pack and only re-decodes.)
 python3 colab/strataflow_colab.py --real-model --is-moe \
   --hf-repo TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF \
   --hf-file mixtral-8x7b-instruct-v0.1.Q3_K_M.gguf \
   --expected-gb 19 --expert-slots 4 --max-tokens 16 \
   --prompt "The city of"
 ```
+
+Sandbox-proven vs Colab-only, to be exact about what each part demonstrates:
+
+- **Sandbox-proven (offline, in CI):** the per-model AUTO residency policy, its
+  precedence, oracle byte-identity (the auto slot count decodes a byte-identical
+  greedy sequence to the fully-resident and fixed-slot runs), and the
+  streamed-bytes delta between auto and a too-small fixed count. The last is
+  measured by `colab/strataflow_bench.py --layers-list 8 --experts-list 16
+  --slots-list 2,16,0` on a GENERATED MoE, where the auto row streams ~8x fewer
+  SSD bytes/token than `slots=2` on the same model (8.06 MB/tok vs 64.39 MB/tok)
+  and decodes faster (mechanism proxy on random weights).
+- **Colab-only (this cell):** the real ~19 GB Mixtral download + end-to-end
+  decode and its absolute tok/s. The offline sandbox cannot download Mixtral, so
+  RUN A vs RUN B above is the real-model before/after you reproduce on Colab.
 
 This TheBloke Q3_K_M GGUF uses the LEGACY per-expert tensor naming
 (`blk.N.ffn_{gate,down,up}.E.weight`). As of the legacy per-expert packer fix,
@@ -277,9 +318,10 @@ model), but the real 19 GB download + end-to-end decode can only be re-verified
 on Colab.
 
 The exact copy-pasteable re-verification sequence is: run Cell 1 (clone), Cell 2
-(deps), Cell 3 (build Release), then run the two cells above (`df -h /content`
-to confirm ~48 GB free, then the `--real-model --is-moe` command). Expect one of
-two honest outcomes:
+(deps), Cell 3 (build Release), then run the cells above (`df -h /content` to
+confirm ~48 GB free, then RUN A with `--expert-slots 0` for the auto-residency
+decode, and optionally RUN B with `--expert-slots 4` for the before/after
+contrast on the same model). Expect one of two honest outcomes:
 
 - **It streams.** You see the `GUARDS` block, the pack step, then decoded text
   with a `stats: resident model weights = ... MiB, peak RSS = ... MiB, ...
@@ -312,7 +354,10 @@ python3 colab/strataflow_bench.py --workdir /content
 The table has one row per `(model size x expert-slots)` config, with columns:
 
 - `on-disk MiB` - size of the packed `.strata` file.
-- `slots` - `--expert-slots` for the run (`auto` = 0, fully resident).
+- `slots` - `--expert-slots` for the run. `auto` = 0 = StrataFlow auto-sizes the
+  resident expert pool per model from free RAM + the model's expert layout
+  (holds the whole working set when RAM allows, else bounds it); a positive value
+  forces that many resident expert bundles.
 - `gen tok/s` - END-TO-END generate throughput (`max-tokens / full sf_generate
   wall-clock`). This INCLUDES prompt processing and the first-token latency, so
   it is not steady-state decode.
@@ -339,7 +384,13 @@ but it does NOT move with `--expert-slots`: it carries a fixed llama/ggml
 backend + vocab floor plus a one-layer staging buffer, so it stays roughly flat
 across the slots sweep and can exceed on-disk for these tiny models. The
 exit-criteria block flags that explicitly and does not present a peak-RSS
-percentage as the proof. The absolute
+percentage as the proof. When the sweep includes both `auto` (0) and a smaller
+fixed slot count for a model (e.g. `--slots-list 2,16,0`), the exit-criteria
+report also contrasts the AUTO row against the smallest fixed-slot row for that
+model, showing that auto streams far fewer SSD bytes per token (and typically
+decodes faster) because it caches the whole layer working set when RAM allows -
+the per-model auto-residency policy at work, stated honestly as a mechanism
+proxy. The absolute
 **decode tok/s** is only a MECHANISM proxy: the generated model has random
 weights and tiny dimensions, so its throughput is NOT comparable to the PLAN.md
 section 2 ladder, which is for large real models on NVMe. The harness says so

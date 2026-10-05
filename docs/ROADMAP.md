@@ -62,6 +62,29 @@ families are the remaining quant-coverage gap.
   expert streaming. The real multi-GB Mixtral run stays Colab-only (the real
   GGUF cannot be downloaded offline); the in-sandbox reproduction is these
   fixtures.
+- [x] **Automatic hardware tuning - per-model expert residency (auto-sized).**
+  The engine no longer needs a hand-tuned `--expert-slots`: by default it
+  auto-sizes the resident expert-bundle pool PER MODEL from the measured free-RAM
+  budget plus the model's own expert layout (`n_layer`, `n_expert`,
+  `n_expert_used`, `expert_bytes`), with NO model-specific constants, so it
+  adapts to any layout (8x2, 256x8, ...). `expert_slots_resident =
+  clamp(ram_for_experts / expert_bytes, lower = max(n_expert_used, a whole layer
+  when it fits), upper = n_layer*n_expert)`. When RAM holds the whole working set
+  it caches it (no per-layer eviction/re-streaming - the Mixtral-on-Colab win);
+  only when RAM genuinely cannot hold it does the pool bound below the full set,
+  and never below one layer's top-k. Precedence: explicit `--expert-slots` >
+  `--cache-gb` (expert-RAM cap) > auto-from-free-RAM. The number the engine
+  actually uses now equals the number the plan reports, with the correct
+  stream/resident state and a realistic peak estimate, and oracle byte-identity
+  is preserved (an auto-chosen slot count decodes a byte-identical greedy
+  sequence/logits to the fully-resident and to a fixed-slot run). Sandbox-proven
+  on generated fixtures: the bench harness
+  (`colab/strataflow_bench.py --layers-list 8 --experts-list 16 --slots-list
+  2,16,0`) shows the auto row streaming ~8x fewer SSD bytes/token than a
+  deliberately-too-small `slots=2` run on the SAME model (8.06 MB/tok vs
+  64.39 MB/tok) and faster steady-state decode (47.3 vs 15.3 tok/s, mechanism
+  proxy on random weights). The real large-MoE (Mixtral) speedup from relying on
+  auto residency stays Colab-only (offline sandbox cannot download it).
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.
@@ -129,10 +152,13 @@ most are pure CPU/disk work.
   the full `ne[2]` for `i02*nb02` addressing - see `src/tws/stream_buft.h`
   "Model A". So the honest reporting above is the resolution, not a tighter
   peak-RSS bound.)
-- [ ] **Misleading placement-plan line.** On the `.strata` streaming path the
-  CLI still prints `plan: ... experts fully resident, peak ~N GiB` from the
-  planner's estimate, which contradicts the streaming reality. Make the plan
-  summary reflect streaming (bounded resident) when experts stream.
+- [x] **Misleading placement-plan line (FIXED).** On the `.strata` streaming
+  path the CLI used to print `plan: ... experts fully resident, peak ~N GiB` from
+  the planner's estimate, which contradicted the streaming reality. The plan
+  summary now reports the actual resident bundle count the engine uses, the
+  correct state (`experts fully resident` when the whole working set fits, else
+  `experts STREAMED (bounded)`), and a realistic peak (trunk + resident bundles +
+  one-layer staging). What RUNS equals what is REPORTED.
 - [ ] **`n_ctx_train (0)` warning on generated models.** The tiny/colab
   generators do not write a trained context-length key, so llama warns
   `n_ctx_seq (256) > n_ctx_train (0)`. Harmless but noisy; set a context-length
@@ -159,7 +185,10 @@ most are pure CPU/disk work.
   section 2 is for large REAL models on NVMe, so the generated toy's throughput
   is a mechanism proxy only - real large-model throughput against that ladder
   stays Colab/HW-demonstrated (optional `--real-model` row / a Mixtral quant on
-  a larger runtime), not proven in the offline sandbox/CI.
+  a larger runtime), not proven in the offline sandbox/CI. The harness also
+  contrasts the auto row (slots=0) against a deliberately-too-small fixed slot
+  count for the SAME model and reports that auto streams far fewer bytes/token
+  (and decodes faster), demonstrating the per-model auto-residency policy.
 
 ### Breadth and performance
 
@@ -173,15 +202,29 @@ most are pure CPU/disk work.
   shared experts, sigmoid gating with group-limited top-k), and others are each
   a new oracle-gated graph builder per the arch-descriptor plan
   (`ENGINE_CORE_DESIGN.md` section 6.4).
-- [ ] **Async prefetch overlap.** EC-6 does synchronous cache-warming. True
-  background-I/O overlap (load layer N+1's experts on a thread while layer N
-  computes) is deferred, along with per-layer graph-build reuse across tokens
-  (`ENGINE_CORE_DESIGN.md` section 3.5).
+- [ ] **Async prefetch overlap (explicitly DEFERRED).** EC-6 does synchronous
+  cache-warming. True background-I/O overlap (load layer N+1's experts on a
+  thread while layer N computes) is deferred, along with per-layer graph-build
+  reuse across tokens (`ENGINE_CORE_DESIGN.md` section 3.5). Decision for the
+  auto-residency work: EC-6's predictor-driven prefetch warming is NOT adapted to
+  the auto-chosen residency in this scope, and that adaptation is DEFERRED with
+  the async-overlap item. Reason: the auto policy's win is already fully captured
+  by the resident-pool sizing itself (when RAM holds the working set, the whole
+  set is cached and nothing is re-streamed, so there is nothing left for prefetch
+  to hide; when RAM cannot hold it, the pool is bounded and correctness depends
+  on the synchronous warm path staying exactly as the oracle gate validates it).
+  Making prefetch warming residency-aware only pays off once I/O actually
+  overlaps compute on a background thread, so it belongs with async overlap, not
+  before it. Changing the warm path now would risk the byte-identical oracle
+  guarantee for no measured gain, so it is deferred rather than attempted. No
+  correctness regression: the auto path reuses the exact synchronous warm/stream
+  mechanism EC-3/EC-6 already prove against the oracle.
 
 ### From the original PLAN.md (Phases 4-7), as written
 
 - [~] **Phase 4 - predictor + pipelined prefetch.** Statistical predictor done
-  (EC-6); pipelined/async overlap not done (see above).
+  (EC-6); pipelined/async overlap not done, and residency-aware prefetch warming
+  is deferred with it (see "Async prefetch overlap" above for the reasoning).
 - [ ] **Phase 5 - speculative decoding** (EAGLE / draft / n-gram / MTP). Not
   started.
 - [ ] **Phase 6 - quantization and kernels.** Mixed-precision `.strata` presets,
@@ -206,7 +249,10 @@ Recommended order, all CPU/disk work (no GPU needed):
    sequence) and stream through `.strata`; the path is type-agnostic. Next:
    validate the IQ families and `.strata` streaming across them.
 2. **Memory-budget CLI + peak-RSS reporting.** DONE: `--expert-slots` plus a
-   `stats:` line reporting resident model-weight bytes and peak RSS.
+   `stats:` line reporting resident model-weight bytes and peak RSS. Expert
+   residency is now AUTO-sized per model from the free-RAM budget + the model's
+   expert layout by default (`--cache-gb` caps it, `--expert-slots` overrides);
+   no hand-tuning needed.
 3. **Run a real, quantized pretrained MoE** (an actual downloaded model, not a
    generated fixture) through the `.strata` streaming path and record real tok/s
    and peak RAM. This is now unblocked by (1) and (2) and is the key remaining

@@ -452,12 +452,74 @@ def print_exit_criteria(records):
     # peak RSS to track --expert-slots (Defect 2).
     _print_peak_rss_flatness(gen_ok)
 
+    # Auto vs smallest fixed-slot contrast, per model. This is the FEAT-003
+    # exit-criteria point: for the SAME generated model, the auto row (slots=0)
+    # sizes residency from the free-RAM budget + the model's expert layout, so
+    # when RAM holds the whole working set it caches it and re-reads far fewer
+    # SSD bytes per token than a deliberately-too-small fixed slot count, which
+    # evicts and re-streams experts every token.
+    _print_auto_vs_small_contrast(gen_ok)
+
     print("\nPLAN.md section 2 - absolute tokens/sec ladder: this ladder is for")
     print("LARGE REAL models on NVMe. The generated toy has random weights and")
     print("tiny dimensions, so its decode tok/s is a MECHANISM proxy only, NOT a")
     print("comparable throughput figure. No comparison is fabricated here.")
     print("Run the optional --real-model row (or a Mixtral quant on a larger")
     print("runtime) to measure throughput against that ladder on real weights.")
+
+
+def _print_auto_vs_small_contrast(gen_ok):
+    """Contrast the auto row against the SMALLEST fixed-slot row per model.
+
+    For each generated model that was run at BOTH slots=auto (0) and at least
+    one positive fixed slot count, report the smallest fixed-slot row next to
+    the auto row so a reader sees, for the SAME model, that auto streams fewer
+    SSD bytes per token (and is typically faster). This is a MECHANISM proxy on
+    random weights, stated honestly: the win comes from auto caching the whole
+    layer working set when RAM allows, so experts are not re-read every token.
+    """
+    by_model = {}
+    for r in gen_ok:
+        by_model.setdefault(r["model"], []).append(r)
+
+    lines = []
+    for model, rows in by_model.items():
+        auto = next((r for r in rows if r["expert_slots"] == 0), None)
+        fixed = [r for r in rows if r["expert_slots"] and r["expert_slots"] > 0]
+        if auto is None or not fixed:
+            continue
+        smallest = min(fixed, key=lambda r: r["expert_slots"])
+        if (auto.get("bytes_per_token") is None
+                or smallest.get("bytes_per_token") is None):
+            continue
+        a_bpt = auto["bytes_per_token"]
+        s_bpt = smallest["bytes_per_token"]
+        ratio = (s_bpt / a_bpt) if a_bpt > 0 else None
+        ratio_s = f"{ratio:.1f}x more" if ratio is not None else "-"
+        lines.append(
+            f"    {model}: auto streams {a_bpt:.0f} bytes/tok vs "
+            f"slots={smallest['expert_slots']} streaming {s_bpt:.0f} "
+            f"bytes/tok ({ratio_s} on the too-small fixed count).")
+        a_dec = auto.get("decode_tokens_per_sec")
+        s_dec = smallest.get("decode_tokens_per_sec")
+        if a_dec is not None and s_dec is not None:
+            faster = ("faster" if a_dec >= s_dec else "slower")
+            lines.append(
+                f"      decode tok/s: auto {a_dec:.2f} vs "
+                f"slots={smallest['expert_slots']} {s_dec:.2f} "
+                f"(auto is {faster} here; single noisy sample).")
+
+    if not lines:
+        return
+    print("\nAUTO vs a deliberately-too-small fixed slot count (same model).")
+    print("The auto row (slots=auto) sizes expert residency per model from the")
+    print("measured free-RAM budget + the model's expert layout. When RAM holds")
+    print("the whole layer working set it CACHES it, so it re-reads far fewer")
+    print("SSD bytes per token than a too-small fixed count that evicts and")
+    print("re-streams experts every token. Mechanism proxy (random weights), so")
+    print("the decode tok/s is indicative, not an absolute throughput claim:")
+    for ln in lines:
+        print(ln)
 
 
 def _print_peak_rss_flatness(gen_ok):
