@@ -1,8 +1,6 @@
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "plan/planner.h"
 
-#include "common/log.h"
-
 #include <algorithm>
 #include <sstream>
 
@@ -140,7 +138,16 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
         plan.planned_peak_bytes = trunk_bytes;
     }
 
-    log_info("placement plan: " + plan.to_summary());
+    // NOTE: we intentionally do NOT log the plan summary here. plan_placement
+    // is a pure function called several times on a single load (a cheap GGUF
+    // metadata pre-pass plus the authoritative post-load plan), and on an
+    // explicit --expert-slots run the reconciliation to the forced resident
+    // count happens later in sf_context_create. Logging the raw auto value here
+    // would both duplicate the line and print a stale "fully resident N" for a
+    // run that actually holds fewer and streams -- the misleading-diagnostic
+    // divergence this feature eliminates. The authoritative summary is logged
+    // once by sf_context_create AFTER reconciliation (and the CLI prints it via
+    // sf_describe_plan), so the logged line always matches what the engine runs.
     return plan;
 }
 

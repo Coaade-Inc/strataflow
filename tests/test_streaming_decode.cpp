@@ -43,11 +43,13 @@
 #include "model/engine/engine.h"
 #include "model/model.h"
 #include "plan/planner.h"
+#include "strataflow/strataflow.h"
 #include "test_util.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -247,10 +249,34 @@ static void test_auto_path_plan_drives_engine() {
     CHECK(auto_bounded.size() == auto_full.size());
     CHECK(auto_bounded == auto_full);
 
+    // Issue 4: byte-identity holds for ANY count >= n_experts_used, so it alone
+    // does NOT prove the engine's SlotPool was actually sized to the bounded
+    // auto count. Read EngineCacheStats through the public engine seam (the same
+    // way test_streaming_bounded_and_deterministic does) with EXACTLY the
+    // plan-chosen bounded count and assert the pool is genuinely bounded: it
+    // holds fewer than the full working set AND evicts. This closes the gap
+    // between "the plan reports N" and "the engine ran with N".
+    engine::EngineCacheStats bounded_stats =
+        engine_stats_for(path, auto_bounded_slots, n_steps, nullptr);
+    CHECK(bounded_stats.slot_bytes > 0u);
+    CHECK_EQ(bounded_stats.n_slots, auto_bounded_slots);  // pool sized to plan
+    CHECK(bounded_stats.resident_bytes() < bounded_stats.full_bytes);  // < full
+    CHECK(bounded_stats.evictions > 0u);                  // actually streamed
+
+    // And the FULL-residency auto run holds the whole working set with no
+    // eviction, through the same seam, at the plan-chosen full count.
+    engine::EngineCacheStats full_stats =
+        engine_stats_for(path, auto_full_slots, n_steps, nullptr);
+    CHECK_EQ(full_stats.n_slots, auto_full_slots);
+    CHECK_EQ(full_stats.evictions, static_cast<uint64_t>(0));
+
     std::printf("[auto full-slots=%u (seq==forced-small=%s) bounded-slots=%u "
-                "(seq==full=%s)] ",
+                "(seq==full=%s, resident=%lluB<full=%lluB, evict=%llu)] ",
                 auto_full_slots, (auto_full == forced_small) ? "yes" : "no",
-                auto_bounded_slots, (auto_bounded == auto_full) ? "yes" : "no");
+                auto_bounded_slots, (auto_bounded == auto_full) ? "yes" : "no",
+                static_cast<unsigned long long>(bounded_stats.resident_bytes()),
+                static_cast<unsigned long long>(bounded_stats.full_bytes),
+                static_cast<unsigned long long>(bounded_stats.evictions));
 }
 
 static void test_streaming_bounded_and_deterministic() {
@@ -320,9 +346,100 @@ static void test_streaming_bounded_and_deterministic() {
     CHECK(small_stats.resident_bytes() < full_stats.resident_bytes());
 }
 
+// Collect `n_steps` greedy tokens from a session created via the public C ABI
+// (sf_context_create -> sf_session_create -> sf_generate). This is the exact
+// path the CLI/server hit, so it exercises sf_context_create's env handling.
+static int g_cb_count = 0;
+static int collect_cb(const char *text, void *user_data) {
+    (void)text;
+    int *n = static_cast<int *>(user_data);
+    if (++(*n) >= g_cb_count) return 1;  // stop after n_steps pieces
+    return 0;
+}
+
+// Issue 3 (env/auto divergence guard): the engine reads the slot count from the
+// process-global STRATAFLOW_ENGINE_EXPERT_SLOTS env, and forward_engine lets
+// that env OVERRIDE the plan's auto choice. If a prior EXPLICIT --expert-slots
+// context (or a parent-exported env) leaves a stale value behind, an AUTO
+// context in the SAME process would silently run that stale count while its
+// plan reports the auto number -- the "reported vs executed" divergence this
+// feature exists to kill. sf_context_create must CLEAR the env on an auto
+// (expert_slots == 0) context so plan_expert_slots_ is authoritative.
+//
+// Every other slot test calls set_expert_slots(0) first, which clears the env
+// and HIDES this bug; this test deliberately PRE-SETS a stale env (both the
+// "parent exported it" case and, via a prior explicit context, the
+// "multi-context in one process" case) and asserts the auto context neutralizes
+// it. We verify through the public C ABI (the production seam) that:
+//   (1) after an explicit-slots sf_context_create the env is set (routing), and
+//   (2) after an auto sf_context_create the env is CLEARED, so the stale value
+//       cannot leak into the engine; the auto plan then drives the engine.
+static void test_auto_context_clears_stale_env() {
+    const char *path = std::getenv("STRATAFLOW_TEST_MOE_GGUF");
+    if (path == nullptr || path[0] == '\0') {
+        std::printf("[skipped: set STRATAFLOW_TEST_MOE_GGUF] ");
+        return;
+    }
+
+    // Case A: a parent process exported a stale small count before we ran.
+    set_expert_slots(3);
+    CHECK(std::getenv("STRATAFLOW_ENGINE_EXPERT_SLOTS") != nullptr);
+
+    sf_context_params ap = sf_context_default_params();
+    ap.model_path   = path;
+    ap.expert_slots = 0;  // AUTO: the plan must drive the engine, not the env
+    sf_context *actx = nullptr;
+    CHECK_EQ(sf_context_create(&ap, &actx), SF_OK);
+    CHECK(actx != nullptr);
+    // THE FIX: the stale pre-exported env was cleared, so forward_engine falls
+    // through to plan_expert_slots_ (the auto count) rather than the stale 3.
+    const char *after_auto = std::getenv("STRATAFLOW_ENGINE_EXPERT_SLOTS");
+    CHECK(after_auto == nullptr || after_auto[0] == '\0');
+
+    // Case B: a PRIOR explicit-slots context in the SAME process sets the env
+    // (routing the forced count to the engine)...
+    sf_context_params ep = sf_context_default_params();
+    ep.model_path   = path;
+    ep.expert_slots = 3;  // explicit override -> routed via the env
+    sf_context *ectx = nullptr;
+    CHECK_EQ(sf_context_create(&ep, &ectx), SF_OK);
+    CHECK(ectx != nullptr);
+    const char *after_explicit = std::getenv("STRATAFLOW_ENGINE_EXPERT_SLOTS");
+    CHECK(after_explicit != nullptr && std::strcmp(after_explicit, "3") == 0);
+
+    // ...and a SUBSEQUENT auto context must again clear it, so the second
+    // (auto) engine run does not inherit the first context's forced 3.
+    sf_context *actx2 = nullptr;
+    CHECK_EQ(sf_context_create(&ap, &actx2), SF_OK);
+    CHECK(actx2 != nullptr);
+    const char *after_auto2 = std::getenv("STRATAFLOW_ENGINE_EXPERT_SLOTS");
+    CHECK(after_auto2 == nullptr || after_auto2[0] == '\0');
+
+    // Behavioral proof the auto context actually produces tokens on this path
+    // (the engine loaded and ran under the auto plan, not a stale env).
+    sf_session *sess = nullptr;
+    CHECK_EQ(sf_session_create(actx2, &sess), SF_OK);
+    sf_sampling_params sp = sf_sampling_default_params();
+    sp.max_tokens = 6;
+    g_cb_count = 6;
+    int produced = 0;
+    CHECK_EQ(sf_generate(sess, "hello world", &sp, collect_cb, &produced), SF_OK);
+    CHECK(produced > 0);
+
+    sf_session_free(sess);
+    sf_context_free(actx);
+    sf_context_free(ectx);
+    sf_context_free(actx2);
+    set_expert_slots(0);  // leave the knob clean for other tests
+
+    std::printf("[auto-ctx cleared stale env (A+B), produced=%d tokens] ",
+                produced);
+}
+
 static void run_all() {
     RUN(test_streaming_bounded_and_deterministic);
     RUN(test_auto_path_plan_drives_engine);
+    RUN(test_auto_context_clears_stale_env);
 }
 
 TEST_MAIN()

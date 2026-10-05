@@ -104,13 +104,29 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
     // Honor an explicit expert-slot budget by routing it to the engine via the
     // same env the engine already reads (STRATAFLOW_ENGINE_EXPERT_SLOTS). This
     // keeps load_model's signature stable while making the CLI flag effective.
-    // A caller-set env var still wins if the param is left at auto (0).
+    //
+    // CRITICAL: when the param is AUTO (0) we must CLEAR the env, not leave it
+    // alone. The engine's forward_engine lets this process-global env override
+    // the plan's auto choice, so a stale value from a PRIOR explicit-slots
+    // context in the same process (the C ABI allows many contexts per process)
+    // or a value exported by a parent process would silently make the engine
+    // run a different count than this context's plan reports -- exactly the
+    // "number reported vs number executed" divergence this feature eliminates.
+    // Unsetting here makes plan_expert_slots_ (the auto choice) authoritative on
+    // every auto context. Tests that drive the engine API directly still set
+    // the env themselves, so the test knob is preserved.
     if (params->expert_slots != 0) {
         const std::string v = std::to_string(params->expert_slots);
 #if defined(_WIN32)
         _putenv_s("STRATAFLOW_ENGINE_EXPERT_SLOTS", v.c_str());
 #else
         setenv("STRATAFLOW_ENGINE_EXPERT_SLOTS", v.c_str(), /*overwrite=*/1);
+#endif
+    } else {
+#if defined(_WIN32)
+        _putenv_s("STRATAFLOW_ENGINE_EXPERT_SLOTS", "");
+#else
+        unsetenv("STRATAFLOW_ENGINE_EXPERT_SLOTS");
 #endif
     }
 
@@ -157,6 +173,12 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
                 static_cast<uint64_t>(shape.n_experts_used) * shape.expert_bytes;
         }
     }
+
+    // Log the AUTHORITATIVE plan summary once, AFTER any explicit-slots
+    // reconciliation above, so the diagnostic line always matches the count the
+    // engine actually runs (plan_placement no longer logs the raw auto value,
+    // which was stale on the explicit-override path).
+    sf::log_info("placement plan: " + ctx->plan.to_summary());
 
     *out_ctx = ctx.release();
     return SF_OK;
