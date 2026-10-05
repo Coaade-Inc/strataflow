@@ -47,7 +47,11 @@ grouped by the pull request that merged them.
   via `ReadFile` with a per-call `OVERLAPPED` offset instead of a shared
   `_fseeki64`+`fread` guarded by a mutex, so concurrent compute and prefetch
   reads no longer serialize through one stateful handle (fixes the Windows-only
-  CI hang; reads stay byte-identical).
+  CI hang; reads stay byte-identical). A new unconditional concurrent-read
+  stress test in `test_async_io` reads one `BlockFile` handle from multiple
+  threads at once and asserts byte-equality, so this positional path is now
+  exercised under contention on all four CI platforms (including Windows, where
+  the fixture-gated engine/oracle tests skip).
 - RAM-aware, per-model AUTO expert-residency. StrataFlow now chooses the
   resident expert-bundle pool size automatically per model, from the measured
   free-RAM budget plus the model's own expert layout (`n_layer`, `n_expert`,
