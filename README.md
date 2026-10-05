@@ -109,22 +109,50 @@ and Windows (MSVC):
 - **Two architectures**: the llama-arch MoE and dense llama, each gated on
   reproducing the oracle.
 
+Also shipped since the engine core (see [`CHANGELOG.md`](CHANGELOG.md) and
+[`docs/ROADMAP.md`](docs/ROADMAP.md)):
+
+- **Quantized-weight support** - the engine stages each expert tensor at its
+  source ggml type, so quantized experts stream and compute natively. Q8_0 is
+  validated against the libllama oracle; the **K-quant families (Q4_K/Q6_K)**
+  are validated too (byte-identical greedy sequence) (#26, #30).
+- **Memory-budget CLI + peak-RSS reporting** - `--expert-slots` plus a `stats:`
+  line that reports resident model-weight bytes and peak RSS, so a user can run
+  a model bounded and see the result (#25).
+- **Bounded peak process RAM** - a single reused expert-staging buffer caps
+  staging to one layer's footprint, so peak RSS no longer tracks model size: a
+  785 MiB model runs in 132 MiB peak RSS, and a 1177 MiB model also runs in
+  132 MiB (peak RSS flat as on-disk size grows) (#27).
+- **Benchmark harness with real numbers** - reports measured tok/s, TTFT, peak
+  RSS, resident weights, on-disk size and bytes-per-token across a config
+  matrix, with JSON/CSV artifacts (#31).
+- **A real DOWNLOADED quantized model runs end to end** via the Colab flow:
+  download a GGUF, pack to `.strata`, decode bounded. A dense TinyLlama is proven
+  on the free tier; a real llama-arch MoE (Mixtral) runs the same path but is
+  disk-bound on the free tier, so it is Colab-demonstrated.
+
 In progress / next (see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full,
 honest list of what is done and what is open):
 
-- **Run a real, large MoE end to end** - everything so far is verified on a
-  2-layer toy fixture; the mission is not *proven* until an actual multi-GB MoE
-  runs end to end in a bounded RAM budget on a real machine.
-- **Memory-budget CLI + peak-RSS reporting** - so a user can say "run this model
-  in 8 GB" and see the result.
-- **Benchmark harness** with real tok/s and RAM numbers against the exit criteria.
+- **Capture real large-MoE numbers end to end** - the mechanism is proven and a
+  real dense model runs through it, but running a real *large MoE* (vs dense) end
+  to end with captured tok/s + peak RSS is still Colab/hardware-demonstrated, not
+  sandbox/CI-proven.
+- **Broaden quant coverage** - the IQ quant families are not yet validated.
+- **More architectures** - Qwen2-MoE and DeepSeek-MoE are different, unimplemented
+  architectures; only llama-arch MoE and dense llama are supported today.
 - GPU / multi-backend execution (optional accelerator; needs GPU hardware to
-  validate), more architectures, and async prefetch overlap.
+  validate) and async prefetch overlap.
+- **Release engineering** - no release tag and no OpenAI-compatible HTTP server
+  front-end yet; only the CLI is wired to the engine.
 
-> **Honest status:** the engine works and the bounded-RAM mechanism is
-> unit-proven, but it has not yet been run on a real large model, and there is
-> no user-facing memory-budget CLI or benchmark yet. See
-> [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`CHANGELOG.md`](CHANGELOG.md).
+> **Honest status:** the engine works on CPU with the bounded-RAM mechanism
+> proven, quantized weights (incl. K-quant) validated, a memory-budget CLI and a
+> benchmark harness shipping real numbers, and a real downloaded quantized model
+> running end to end via Colab. Still open: capturing real *large-MoE* numbers
+> (Colab/HW-demonstrated, not sandbox-proven), IQ-quant validation, non-llama MoE
+> architectures, GPU backends (need hardware), and a release tag / HTTP server.
+> See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`CHANGELOG.md`](CHANGELOG.md).
 
 See [`docs/ENGINE_CORE_DESIGN.md`](docs/ENGINE_CORE_DESIGN.md) for the engine
 design and the EC-1..EC-7 breakdown, and [`docs/PLAN.md`](docs/PLAN.md) for the

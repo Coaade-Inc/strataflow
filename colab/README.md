@@ -25,18 +25,49 @@ GPU" path on a real machine. There are two flows:
     experts, per-expert gate, group-limited sigmoid gating) that are not yet
     implemented, so do not point the real-model flow at them.
   - First build compiles llama.cpp/ggml: a few minutes.
-  - Free Colab is ~12 GB RAM, ~70-100 GB ephemeral disk. Keep the model
-    (generated or downloaded) well under the disk size, and use
-    `--expert-slots` to keep resident weights far below the on-disk size.
+  - Free Colab is ~12 GB RAM, ~70-100 GB ephemeral disk. The limiter here is
+    **disk, not RAM**: keep the model (generated or downloaded) under the disk
+    size, and `--expert-slots` keeps resident weights far below the on-disk size
+    (see "Big model, small RAM" just below).
+
+### Big model, small RAM (how a model bigger than your RAM runs)
+
+This is the exact question people ask: "this model is 24 GB, how can it run on
+12 GB (or 8 GB) of RAM?" The answer is that **RAM holds only the working set,
+not the whole model.**
+
+For a Mixture-of-Experts model, only a small fraction of the weights (the trunk
+plus the top-k active experts per layer) is used for any one token. StrataFlow
+keeps just that working set resident and streams the cold experts from disk per
+token. The full model only has to be **reachable on disk**, not held in memory.
+Resident RAM is bounded by `--expert-slots`, so it stays flat even as the
+on-disk model grows.
+
+Measured in this repo (see [`../docs/ROADMAP.md`](../docs/ROADMAP.md) and
+[`../CHANGELOG.md`](../CHANGELOG.md)): a 785 MiB model runs at ~132 MiB peak RSS,
+and a 1177 MiB model also runs in ~132 MiB - peak RSS is **flat as the on-disk
+model grows**. So on an 8 GB machine the constraints are (1) enough disk for the
+model file and its `.strata` copy, and (2) streaming speed (SSD read throughput
+sets tok/s). RAM size does not gate capability - **more memory buys speed, not
+capability; the output is identical at every memory size.**
 
 ### Which real model, and why
 
 The engine runs **llama-architecture** models only. That drives the choice:
 
 - The natural real llama-arch MoE is **Mixtral** (mistralai, Apache-2.0, genuine
-  llama arch). But the smallest useful Mixtral-8x7B GGUF is ~24 GB+ even at a low
-  K-quant, which strains the Colab free tier. You can still point the flow at a
-  Mixtral quant on a larger runtime via `--hf-repo/--hf-file --is-moe`.
+  llama arch). Its ~24 GB+ figure (even at a low K-quant) is a **disk/download**
+  number, NOT a RAM number. StrataFlow holds only the trunk plus a bounded number
+  of expert slots resident and streams the rest from disk per token, so resident
+  RAM is bounded by `--expert-slots`, not by model size - a Mixtral quant does
+  NOT need ~24 GB of RAM. The real free-tier limiters are **disk space** (you
+  need room for the ~24 GB GGUF plus a similar-size `.strata` copy, roughly
+  ~48 GB, which free Colab's ~70-100 GB ephemeral disk CAN hold) and
+  **download time + streaming throughput** (SSD read speed sets tok/s). So a
+  Mixtral quant IS runnable on free Colab, just slow: a long download and pack,
+  disk-heavy, with `--expert-slots` keeping resident RAM low. See Cell 8. You can
+  also point the flow at a Mixtral quant on a larger runtime via
+  `--hf-repo/--hf-file --is-moe`.
 - **Qwen2-MoE** and **DeepSeek-MoE** are different architectures the engine does
   not implement; do not use them (they would hit the unsupported-arch path).
 - So the **default** `--real-model` is a small, real, downloaded, **quantized
@@ -172,13 +203,30 @@ Watch for, in the output:
 
 ### Cell 8 (optional) - point it at a real llama-arch MoE (Mixtral)
 
+Mixtral's ~24 GB is a **disk** number, not a RAM number: `--expert-slots` keeps
+resident RAM bounded regardless of model size, so this is NOT gated by free
+Colab's ~12 GB RAM. The real limiter is **disk** - you need room for the
+~24 GB GGUF plus a similar-size `.strata` copy (~48 GB), which free Colab's
+~70-100 GB ephemeral disk CAN hold - plus the long download/pack and SSD
+streaming throughput (which sets tok/s). So this runs on free Colab, just
+slowly. Check free disk FIRST, because the flow's disk guard will refuse clearly
+if it will not fit:
+
+```bash
+%%bash
+# How much ephemeral disk is free on this runtime? Mixtral needs ~48 GB free
+# (the ~24 GB GGUF plus a similar-size .strata copy).
+df -h /content
+```
+
 ```bash
 %%bash
 cd /content/strataflow
-# Mixtral is a genuine llama-arch MoE (Apache-2.0). The smallest useful GGUF is
-# ~24 GB+, so this needs a LARGE runtime (not the free tier). The flow's disk
-# guard will refuse if it will not fit. Set --is-moe so the summary labels it
-# correctly, and raise --expected-gb to match the chosen quant.
+# Mixtral is a genuine llama-arch MoE (Apache-2.0). It is disk-heavy, not
+# RAM-heavy: the ~24 GB+ GGUF is a download/disk cost, while --expert-slots
+# bounds resident RAM far below that. The flow's disk guard will refuse clearly
+# if the GGUF + .strata copy will not fit the free disk. Set --is-moe so the
+# summary labels it correctly, and raise --expected-gb to match the chosen quant.
 python3 colab/strataflow_colab.py --real-model --is-moe \
   --hf-repo TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF \
   --hf-file mixtral-8x7b-instruct-v0.1.Q3_K_M.gguf \
@@ -188,10 +236,11 @@ python3 colab/strataflow_colab.py --real-model --is-moe \
 
 As with the generated demo, `--expert-slots` bounds how many experts are held
 resident at once, so a multi-GB MoE decodes with peak RAM far below the on-disk
-size - the whole mission on a real, downloaded, quantized MoE, once you run this
-cell on a large-enough runtime. Nothing in the sandbox or CI executes this cell
-(both are offline), so the real-downloaded-MoE result is Colab-demonstrated
-here, not proven by an in-sandbox/CI run.
+size - the whole mission on a real, downloaded, quantized MoE. On the free tier
+expect it to be slow (long download + pack, disk-bound streaming), not blocked
+by RAM; a larger/faster runtime mainly buys you speed. Nothing in the sandbox or
+CI executes this cell (both are offline), so the real-downloaded-MoE result is
+Colab-demonstrated here, not proven by an in-sandbox/CI run.
 
 ### Cell 9 - benchmark harness (real numbers, free-tier sized)
 
@@ -267,11 +316,14 @@ clear message; only Cell 10 on a networked Colab produces that row.
   Q4_K/Q6_K validated by the generated-fixture oracle gate).
 - **Honest caveat - architecture coverage.** The engine implements **llama-arch
   MoE and dense llama only**. The default real-model run uses a **dense** llama
-  (TinyLlama) because the smallest llama-arch MoE (Mixtral) is too large for the
-  free tier; the dense path exercises the same download -> pack -> stream ->
-  bounded-RAM mechanism. Running a real llama-arch **MoE** (Mixtral) needs a
-  larger runtime (Cell 8). Qwen2-MoE / DeepSeek-MoE are different architectures
-  and are not yet implemented. See [`../docs/ROADMAP.md`](../docs/ROADMAP.md).
+  (TinyLlama) because it is small to download and exercises the same download ->
+  pack -> stream -> bounded-RAM mechanism end to end. Running a real llama-arch
+  **MoE** (Mixtral, Cell 8) is also possible on the free tier - it is **disk-
+  bound, not RAM-bound** (its ~24 GB is a disk/download cost; `--expert-slots`
+  keeps resident RAM bounded) - just slow (long download/pack + SSD streaming),
+  so a larger runtime mainly buys speed. Qwen2-MoE / DeepSeek-MoE are different
+  architectures and are not yet implemented. See
+  [`../docs/ROADMAP.md`](../docs/ROADMAP.md).
 - **Benchmark harness (Cells 9-10).** A benchmark harness now exists
   (`colab/strataflow_bench.py`) and emits measured numbers - tok/s, TTFT, peak
   RSS, resident weights, on-disk size, SSD streamed MiB and bytes/token - as a
