@@ -237,6 +237,23 @@ void measure_ssd_bandwidth(const std::string &model_dir, bool quick,
 
 } // namespace
 
+std::string containing_dir(const std::string &path) {
+    if (path.empty()) return {};
+    // Scan for the last path separator. On Windows both '/' and '\\' separate
+    // components; on POSIX only '/'. A bare filename (no separator) maps to the
+    // current working directory ("").
+    std::string::size_type sep = path.find_last_of('/');
+#if defined(STRATAFLOW_PLATFORM_windows)
+    const std::string::size_type bsep = path.find_last_of('\\');
+    if (bsep != std::string::npos &&
+        (sep == std::string::npos || bsep > sep)) {
+        sep = bsep;
+    }
+#endif
+    if (sep == std::string::npos) return {};
+    return path.substr(0, sep);
+}
+
 HardwareProfile profile_hardware(const std::string &model_dir, bool quick) {
     HardwareProfile p;
 

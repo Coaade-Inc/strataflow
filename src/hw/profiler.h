@@ -44,4 +44,10 @@ struct HardwareProfile {
 // `quick` skips the longer bandwidth micro-benchmarks (used in tests/CI).
 HardwareProfile profile_hardware(const std::string &model_dir = {}, bool quick = false);
 
+// Returns the directory component of a path: everything up to (but not
+// including) the last separator ('/' on all platforms, also '\\' on Windows).
+// A path with no separator (a bare filename) returns "" (the current working
+// directory). Used to turn a model FILE path into the directory to SSD-probe.
+std::string containing_dir(const std::string &path);
+
 } // namespace sf

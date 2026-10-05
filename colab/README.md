@@ -40,16 +40,25 @@ For a Mixture-of-Experts model, only a small fraction of the weights (the trunk
 plus the top-k active experts per layer) is used for any one token. StrataFlow
 keeps just that working set resident and streams the cold experts from disk per
 token. The full model only has to be **reachable on disk**, not held in memory.
-Resident RAM is bounded by `--expert-slots`, so it stays flat even as the
-on-disk model grows.
+StrataFlow's **resident model weights** (trunk only) stay far below the on-disk
+size, and the **SSD bytes streamed per token** are bounded by `--expert-slots`:
+a tighter slot budget streams fewer bytes. Those two quantities are the bound.
 
-Measured in this repo (see [`../docs/ROADMAP.md`](../docs/ROADMAP.md) and
-[`../CHANGELOG.md`](../CHANGELOG.md)): a 785 MiB model runs at ~132 MiB peak RSS,
-and a 1177 MiB model also runs in ~132 MiB - peak RSS is **flat as the on-disk
-model grows**. So on an 8 GB machine the constraints are (1) enough disk for the
-model file and its `.strata` copy, and (2) streaming speed (SSD read throughput
-sets tok/s). RAM size does not gate capability - **more memory buys speed, not
-capability; the output is identical at every memory size.**
+What this does and does NOT mean for whole-process peak RSS. Measured in this
+repo (see [`../docs/ROADMAP.md`](../docs/ROADMAP.md) and
+[`../CHANGELOG.md`](../CHANGELOG.md)): a 785 MiB model and a 1177 MiB model both
+run at ~132 MiB peak RSS. That ~132 MiB is essentially a **fixed** llama/ggml
+backend + vocab process floor (reproduced by a 3.9 MiB model and by a
+`--plan-only` run with no decode), plus a one-layer expert staging buffer sized
+to a layer's full expert count, plus the ggml compute buffer. So peak RSS is
+roughly flat across model size for similar layer counts, but it does **not**
+move with `--expert-slots` and can **exceed** on-disk for small models - that is
+the fixed floor, not an unbounded leak, and not proof of the mission by itself.
+The mission is carried by the bounded resident weights + streamed bytes above.
+So on an 8 GB machine the constraints are (1) enough disk for the model file and
+its `.strata` copy, and (2) streaming speed (SSD read throughput sets tok/s).
+**More memory buys speed, not capability; the output is identical at every
+memory size.**
 
 ### Which real model, and why
 
@@ -57,10 +66,12 @@ The engine runs **llama-architecture** models only. That drives the choice:
 
 - The natural real llama-arch MoE is **Mixtral** (mistralai, Apache-2.0, genuine
   llama arch). Its ~24 GB+ figure (even at a low K-quant) is a **disk/download**
-  number, NOT a RAM number. StrataFlow holds only the trunk plus a bounded number
-  of expert slots resident and streams the rest from disk per token, so resident
-  RAM is bounded by `--expert-slots`, not by model size - a Mixtral quant does
-  NOT need ~24 GB of RAM. The real free-tier limiters are **disk space** (you
+  number, NOT a resident-RAM number. StrataFlow holds only the trunk resident
+  and streams the experts from disk per token, so the resident model weights and
+  the streamed bytes per token are bounded by `--expert-slots`, not by model
+  size - a Mixtral quant does NOT need ~24 GB of resident RAM (whole-process peak
+  RSS still carries the fixed backend + vocab floor plus one-layer staging, as
+  above). The real free-tier limiters are **disk space** (you
   need room for the ~24 GB GGUF plus a similar-size `.strata` copy, roughly
   ~48 GB, which free Colab's ~70-100 GB ephemeral disk CAN hold) and
   **download time + streaming throughput** (SSD read speed sets tok/s). So a
@@ -159,8 +170,11 @@ python3 colab/strataflow_colab.py --layers 24 --experts 64 --max-tokens 8
 ls -lh /content/colab_moe.strata
 ```
 
-As `--experts` grows, the `.strata` file (on disk) grows a lot while peak RAM
-stays close to the trunk size - that is StrataFlow doing its job.
+As `--experts` grows, the `.strata` file (on disk) grows a lot while
+StrataFlow's resident model weights stay close to the trunk size - that is
+StrataFlow doing its job. (Whole-process peak RSS carries the fixed backend +
+vocab floor plus one-layer staging, so it does not shrink to the trunk; the
+resident-weights line is the bounded quantity. See "Big model, small RAM".)
 
 ### Cell 6 (optional) - run the unit tests on Colab's real hardware
 
@@ -203,9 +217,12 @@ Watch for, in the output:
 
 ### Cell 8 (optional) - point it at a real llama-arch MoE (Mixtral)
 
-Mixtral's ~24 GB is a **disk** number, not a RAM number: `--expert-slots` keeps
-resident RAM bounded regardless of model size, so this is NOT gated by free
-Colab's ~12 GB RAM. The real limiter is **disk** - you need room for the
+Mixtral's ~24 GB is a **disk** number, not a resident-RAM number: `--expert-slots`
+keeps StrataFlow's resident model weights and streamed bytes per token bounded
+regardless of model size, so this is NOT gated by free Colab's ~12 GB RAM.
+(Whole-process peak RSS still carries the fixed llama/ggml backend + vocab floor
+plus one-layer staging and does not move with `--expert-slots`; see "Big model,
+small RAM" above.) The real limiter is **disk** - you need room for the
 ~24 GB GGUF plus a similar-size `.strata` copy (~48 GB), which free Colab's
 ~70-100 GB ephemeral disk CAN hold - plus the long download/pack and SSD
 streaming throughput (which sets tok/s). So this runs on free Colab, just
@@ -235,12 +252,32 @@ python3 colab/strataflow_colab.py --real-model --is-moe \
 ```
 
 As with the generated demo, `--expert-slots` bounds how many experts are held
-resident at once, so a multi-GB MoE decodes with peak RAM far below the on-disk
-size - the whole mission on a real, downloaded, quantized MoE. On the free tier
-expect it to be slow (long download + pack, disk-bound streaming), not blocked
-by RAM; a larger/faster runtime mainly buys you speed. Nothing in the sandbox or
-CI executes this cell (both are offline), so the real-downloaded-MoE result is
-Colab-demonstrated here, not proven by an in-sandbox/CI run.
+resident at once, so a multi-GB MoE decodes with StrataFlow's resident model
+weights and streamed bytes far below the on-disk size - the whole mission on a
+real, downloaded, quantized MoE. On the free tier expect it to be slow (long
+download + pack, disk-bound streaming), not blocked by RAM; a larger/faster
+runtime mainly buys you speed. Nothing in the sandbox or CI executes this cell
+(both are offline), so **this Mixtral run is the one remaining Colab-only step**:
+the packer, the loader, the fail-loud classification check, the bounded resident
+weights/streamed bytes, both-compiler builds and the full test suite are all
+proven in-sandbox on a Mixtral-faithful generated fixture, but the real 19 GB
+download + end-to-end decode can only be re-verified on Colab.
+
+The exact copy-pasteable re-verification sequence is: run Cell 1 (clone), Cell 2
+(deps), Cell 3 (build Release), then run the two cells above (`df -h /content`
+to confirm ~48 GB free, then the `--real-model --is-moe` command). Expect one of
+two honest outcomes:
+
+- **It streams.** You see the `GUARDS` block, the pack step, then decoded text
+  with a `stats: resident model weights = ... MiB, peak RSS = ... MiB, ...
+  streamed = ... MiB` line - resident weights far below the ~19 GB on-disk size.
+- **It fails LOUDLY at pack time** (NOT an OOM at decode). With the packer fix on
+  this branch, if Mixtral's expert tensors do not classify (metadata says MoE but
+  zero experts were matched), `strata-pack` now aborts with a diagnostic listing
+  the expert-tensor names/shapes it found, instead of silently writing a
+  0-expert `.strata` that the engine then tries to hold whole-model-resident and
+  gets SIGKILLed (rc=-9). So a classification miss is a clear, actionable error
+  at pack time, not a mysterious decode-time OOM.
 
 ### Cell 9 - benchmark harness (real numbers, free-tier sized)
 
@@ -278,9 +315,15 @@ and `TTFT ms` are single noisy samples; treat them as indicative, not
 statistically tight.
 
 What the generated numbers prove and do not prove: the **bounded-RAM**
-property is real - with `--expert-slots` set below the expert count, peak RSS
-and resident weights stay far below the on-disk size and move with the slot
-count (the Phase 3 "big model, small RAM" exit criterion). The absolute
+property is real - with `--expert-slots` set below the expert count,
+StrataFlow's resident model weights stay far below the on-disk size and the
+SSD **streamed bytes per token move with the slot count** (the Phase 3 "big
+model, small RAM" exit criterion). Whole-process **peak RSS** is reported too,
+but it does NOT move with `--expert-slots`: it carries a fixed llama/ggml
+backend + vocab floor plus a one-layer staging buffer, so it stays roughly flat
+across the slots sweep and can exceed on-disk for these tiny models. The
+exit-criteria block flags that explicitly and does not present a peak-RSS
+percentage as the proof. The absolute
 **decode tok/s** is only a MECHANISM proxy: the generated model has random
 weights and tiny dimensions, so its throughput is NOT comparable to the PLAN.md
 section 2 ladder, which is for large real models on NVMe. The harness says so
@@ -308,7 +351,10 @@ clear message; only Cell 10 on a networked Colab produces that row.
 
 - **Proves:** StrataFlow builds and runs on a real CPU-only Linux box, decodes
   through its own ggml forward pass (no `llama_decode`, no GPU), and streams
-  experts from a `.strata` file so the on-disk model is larger than peak RAM.
+  experts from a `.strata` file so the on-disk model is far larger than
+  StrataFlow's resident model weights, with the streamed bytes per token bounded
+  by `--expert-slots` (whole-process peak RSS additionally carries a fixed
+  backend + vocab floor plus one-layer staging; see "Big model, small RAM").
   With `--real-model` it does this on a **real downloaded, quantized** GGUF with
   its real tokenizer producing real output text, and reports measured
   tokens/sec and peak RSS. Quantized weights run through the engine's

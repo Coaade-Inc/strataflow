@@ -9,6 +9,43 @@ grouped by the pull request that merged them.
 
 ## Unreleased
 
+### Correctness and honesty fixes
+
+- Packer FAILS LOUDLY on a misclassified MoE instead of writing an OOM-bomb
+  `.strata`. If the GGUF metadata says MoE (`llama.expert_count` > 0) but zero
+  expert tensors classify, `strata-pack` now aborts with a diagnostic listing
+  the expert-tensor names/shapes it found, rather than silently emitting a
+  0-expert `.strata` that the engine then tries to hold whole-model-resident and
+  gets SIGKILLed at decode. A Mixtral-faithful generated fixture + regression
+  test guard it.
+- Bounded-RAM reporting is now HONEST about what moves with `--expert-slots`.
+  The quantities that are bounded and DO move with the slot budget are
+  StrataFlow's own resident model weights (trunk only) and the SSD bytes
+  streamed per token. Whole-process peak RSS (`getrusage` `ru_maxrss`) is a
+  SEPARATE figure: it carries a FIXED llama/ggml backend + vocab process floor
+  (~132 MiB; reproduced in-sandbox by a 3.9 MiB model and by a `--plan-only`
+  run with no decode) plus a one-layer expert staging buffer sized to a layer's
+  FULL expert count (not the slot budget) plus the ggml compute buffer. So peak
+  RSS does NOT move with `--expert-slots` and can exceed on-disk for small
+  models. The earlier "785 MiB -> 132 MiB, peak RSS flat vs model size" result
+  measured the removal of the per-LAYER staging growth, NOT a slot-driven peak
+  RSS bound; the record in `docs/ROADMAP.md` and `colab/README.md` is corrected
+  accordingly. The CLI `stats:` line wording is unchanged (Python parser stable).
+- Benchmark exit-criteria (`colab/strataflow_bench.py print_exit_criteria`) no
+  longer presents a peak-RSS percentage of on-disk as the proof of "big model,
+  small RAM" (it previously printed 128% / 113% as if that proved the mission).
+  It now reports resident weights + streamed bytes per slot setting as the
+  bounded quantities that move with `--expert-slots`, reports peak RSS
+  separately with the fixed-floor + one-layer-staging caveat, explicitly flags
+  rows where peak RSS >= on-disk, and shows the peak-RSS spread across the slots
+  sweep so the slots-vs-peak invariance is visible.
+- SSD-probe path fix: the API passed the model FILE path to `profile_hardware`,
+  so the profiler tried to write `<file>/.strataflow_ssd_probe.tmp` and emitted
+  a cosmetic `profiler: cannot write SSD probe` warning. It now derives the
+  containing directory (`sf::containing_dir`, portable across POSIX `/` and
+  Windows `\\`) and probes that; bandwidth still measures and the warning is
+  gone.
+
 ### Benchmarking and instrumentation
 
 - Benchmark harness `colab/strataflow_bench.py`: runs a config MATRIX (model
