@@ -162,7 +162,10 @@ int64_t StrataReader::read_blob(uint32_t layer, uint32_t expert,
     // total. read_at() (the one-time trunk fill in Engine::load_strata_weights)
     // is intentionally NOT counted here, so streamed_bytes() reflects per-token
     // expert streaming rather than the trunk load.
-    if (n > 0) streamed_bytes_ += static_cast<uint64_t>(n);
+    if (n > 0) {
+        streamed_bytes_.fetch_add(static_cast<uint64_t>(n),
+                                  std::memory_order_relaxed);
+    }
     return n;
 }
 

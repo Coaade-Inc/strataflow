@@ -193,6 +193,18 @@ public:
         return engine_ != nullptr ? engine_->streamed_bytes() : 0;
     }
 
+    uint64_t prefetch_warmed() const override {
+        return engine_ != nullptr ? engine_->cache_stats().prefetch_warmed : 0;
+    }
+    uint64_t prefetch_used() const override {
+        return engine_ != nullptr ? engine_->cache_stats().prefetch_used : 0;
+    }
+    uint64_t prefetch_completed_before_use() const override {
+        return engine_ != nullptr
+                   ? engine_->cache_stats().prefetch_completed_before_use
+                   : 0;
+    }
+
 private:
     // The engine inference path (EC-5: the ONLY inference path): run OUR OWN
     // ggml graph for one token at position n_past_ and take the greedy argmax.

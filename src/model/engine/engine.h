@@ -77,6 +77,18 @@ struct EngineCacheStats {
     double prefetch_hit_rate() const {
         return prefetch_warmed ? double(prefetch_used) / double(prefetch_warmed) : 0.0;
     }
+    // FEAT-003 async-overlap signal: of the prefetch_used experts, how many had
+    // their bytes fully read by the background I/O worker AND installed into the
+    // pool (by pf_drain_completed) BEFORE the layer's authoritative acquire
+    // needed them - i.e. the overlap actually hid the disk read behind the prior
+    // layer's compute. On the synchronous fallback path (async disabled) this
+    // stays 0 (the warm is inline, not overlapped). It is a lower bound on the
+    // reads whose latency was hidden; the fraction over prefetch_used is the
+    // overlap effectiveness.
+    uint64_t prefetch_completed_before_use = 0;
+    double completed_before_use_rate() const {
+        return prefetch_used ? double(prefetch_completed_before_use) / double(prefetch_used) : 0.0;
+    }
     // Resident expert RAM upper bound; bounded by top-k per layer when the pool
     // is sized below the expert count.
     uint64_t resident_bytes() const { return n_slots * slot_bytes; }
@@ -162,6 +174,32 @@ private:
     // authoritative residency pass re-acquires exactly what the router selects).
     void warm_expert(int il, int expert);
     const EngineHParams &hp_() const;
+
+    // FEAT-002: async/overlapped expert prefetch. All defined in
+    // model/engine/engine.cpp. See the Impl prefetch members for the full
+    // ownership/synchronization contract (worker reads into its own staging
+    // buffer; the COMPUTE thread owns all SlotPool mutation).
+    //
+    // pf_maybe_start: lazily spawn the single I/O worker thread the first time
+    //   prefetch is actually wanted (bounded pool + async enabled). No-op when
+    //   the whole working set is resident or async is disabled.
+    // pf_read_bundle: read one expert's gate|up|down bytes into `dst`
+    //   (slot_bytes). Used by BOTH the worker (into its staging buffer) and is
+    //   the same byte source warm_expert/ensure_layer_experts_resident use.
+    //   Returns true on a complete read. Thread-safe (read-only on reader +
+    //   resident tensors).
+    // pf_enqueue: queue a predicted {layer,expert} for the worker, deduped
+    //   against the pool and the in-flight/queued set. Compute thread only.
+    // pf_drain_completed: install any completed staging buffers into the pool
+    //   (compute thread only; this is the single SlotPool mutation point for
+    //   prefetched bytes). Drops results for ids no longer wanted.
+    // pf_quiesce: block new work, wait for the in-flight read to finish, and
+    //   clear the queue + completed results. Used at reset_kv().
+    void pf_maybe_start();
+    bool pf_read_bundle(int il, int expert, void *dst) const;
+    void pf_enqueue(int il, int expert);
+    void pf_drain_completed();
+    void pf_quiesce();
 
     // EC-4: open a .strata single file, parse its embedded GGUF metadata into
     // im.gc, build the resident weight context (im.wctx) from that metadata,

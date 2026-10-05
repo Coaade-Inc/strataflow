@@ -111,6 +111,24 @@ typedef struct sf_context_params {
        else cache_budget (> 0) caps the choice; else auto from free RAM.
        Appended for ABI compatibility; default 0. */
     uint64_t cache_budget;
+
+    /* Async/overlapped expert prefetch toggle (FEAT-003). When non-zero
+       (the DEFAULT), the engine overlaps the next layer's predicted-expert disk
+       reads with the current layer's compute on a background I/O thread, hiding
+       read latency behind compute on the bounded-RAM streaming path. Set to 0
+       to DISABLE it and fall back to the synchronous warm_expert path (the
+       authoritative ensure_layer_experts_resident load is identical either way,
+       so output is byte-identical; only WHEN the bytes arrive differs). This is
+       a safety/benchmark dial: a misbehaving platform can turn overlap off, and
+       the bench harness runs on-vs-off to measure the overlap. It only matters
+       on a BOUNDED pool (a fully-resident working set never streams).
+       CAVEAT: like expert_slots, this setting rides a process-global env var
+       that the engine reads at context creation, so do NOT create contexts
+       with DIFFERING async_prefetch settings concurrently from multiple
+       threads (the env read/write would race); create such contexts serially,
+       or keep the setting uniform across concurrent creations. Appended
+       for ABI compatibility; default 1 (enabled). */
+    int32_t async_prefetch;
 } sf_context_params;
 
 /* Returns params filled with safe defaults (auto_plan on, CPU backend). */
@@ -178,6 +196,25 @@ typedef struct sf_runtime_stats {
      * expert streaming). On the plain-GGUF path, where experts are resident,
      * this stays 0. Excludes the one-time trunk load. 0 if not applicable. */
     uint64_t streamed_bytes;
+    /* FEAT-003 async-prefetch overlap signal: of the experts a prior prefetch
+     * warmed and the routing then USED (prefetch_used), how many the background
+     * I/O worker had fully read AND installed BEFORE the layer's authoritative
+     * acquire needed them - i.e. the overlap actually hid the disk read behind
+     * the prior layer's compute. 0 on the synchronous-fallback / fully-resident
+     * / plain-GGUF / dry-run paths. Paired with prefetch_used it is the overlap
+     * effectiveness (completed_before_use / used). Appended for ABI
+     * backward-compatibility (END of struct only). */
+    uint64_t prefetch_completed_before_use;
+    /* FEAT-003: experts a prefetch warmed that the routing then used (the EC-6
+     * prefetch hit count). Denominator for the completed-before-use rate above
+     * and for the prefetch hit rate. 0 when not applicable. Appended for ABI
+     * backward-compatibility (END of struct only). */
+    uint64_t prefetch_used;
+    /* FEAT-003: experts speculatively warmed ahead of a layer (the EC-6
+     * prefetch attempts). Denominator for the prefetch hit rate
+     * (prefetch_used / prefetch_warmed). 0 when not applicable. Appended for ABI
+     * backward-compatibility (END of struct only). */
+    uint64_t prefetch_warmed;
 } sf_runtime_stats;
 
 /* Fill `out` with current runtime stats. Call after sf_generate to see the

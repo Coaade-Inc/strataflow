@@ -11,6 +11,47 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- Async/overlapped expert prefetch (hide disk reads behind compute). A dedicated
+  background I/O worker thread now loads the next layer's predicted experts off
+  disk CONCURRENTLY with the current layer's ggml compute, so read latency hides
+  behind compute on the bounded-RAM streaming path. The synchronous
+  `ensure_layer_experts_resident` stays the AUTHORITATIVE load: a mispredicted or
+  still-in-flight prefetch is a plain miss it corrects inline, so decode is
+  byte-identical to the libllama oracle, including under bounded-pool eviction
+  (the oracle gate's new async sub-test shows async-vs-sync `|delta| =
+  0.000e+00`, identical across repeated runs that perturb prefetch timing). The
+  ggml compute path stays single-threaded (only an I/O thread was added); the
+  worker never touches the non-thread-safe `SlotPool` (it reads into its own
+  staging buffer and the compute thread installs the bytes), so it is
+  thread-safe and TSan-clean. A default-ON runtime toggle flows through
+  `sf_context_params.async_prefetch` (appended at the END of the struct for ABI
+  backward-compatibility; default 1), the CLI `--async-prefetch on|off`, and the
+  `STRATAFLOW_ENGINE_ASYNC_PREFETCH` env var; `off` falls back to the
+  synchronous warm path. A new overlap metric, `completed-before-use` (of the
+  prefetched experts the routing then used, how many the worker had fully read
+  AND installed BEFORE the layer's authoritative acquire needed them), is
+  surfaced through `sf_runtime_stats` (three fields appended at the END of the
+  struct) and printed on the CLI stats line (appended as new `, key = value`
+  fields, so the existing parser is unaffected). `colab/strataflow_bench.py`
+  gains an `--async-list on,off` sweep and an on-vs-off contrast that confirms
+  byte-identical decoded text while reporting `completed-before-use`, streamed
+  bytes/token, decode tok/s and TTFT. In-sandbox the MECHANISM is proven on the
+  generated MoE (`--layers-list 8 --experts-list 16 --slots-list 4 --async-list
+  on,off`): `completed-before-use` goes from 0 (async off) to > 0 (async on) with
+  byte-identical output; absolute wall-clock speedup is hardware-dependent and
+  stays Colab-only on the real Mixtral (exact `--async-prefetch on`/`off`
+  re-verify commands added to `colab/README.md`, auto residency bounded by
+  `--cache-gb`). `docs/ROADMAP.md` flips the async-overlap and Phase 4 items to
+  done. The Windows buffered fallback of `BlockFile::read_at` is now positional
+  and stateless like POSIX `pread`: it opens a buffered Win32 `HANDLE` and reads
+  via `ReadFile` with a per-call `OVERLAPPED` offset instead of a shared
+  `_fseeki64`+`fread` guarded by a mutex, so concurrent compute and prefetch
+  reads no longer serialize through one stateful handle (fixes the Windows-only
+  CI hang; reads stay byte-identical). A new unconditional concurrent-read
+  stress test in `test_async_io` reads one `BlockFile` handle from multiple
+  threads at once and asserts byte-equality, so this positional path is now
+  exercised under contention on all four CI platforms (including Windows, where
+  the fixture-gated engine/oracle tests skip).
 - RAM-aware, per-model AUTO expert-residency. StrataFlow now chooses the
   resident expert-bundle pool size automatically per model, from the measured
   free-RAM budget plus the model's own expert layout (`n_layer`, `n_expert`,

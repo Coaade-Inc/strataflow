@@ -49,6 +49,17 @@ public:
     // path where experts are resident, or the dry-run model. Excludes the
     // one-time trunk load.
     virtual uint64_t streamed_bytes() const { return 0; }
+
+    // FEAT-003 async-prefetch overlap signals, surfaced from the engine's
+    // EngineCacheStats. prefetch_warmed = experts speculatively warmed ahead of
+    // a layer; prefetch_used = of those, how many that layer then routed;
+    // prefetch_completed_before_use = of the used ones, how many the background
+    // I/O worker had fully read AND installed before the authoritative acquire
+    // (i.e. the overlap actually hid the disk read). All 0 when not applicable
+    // (plain-GGUF/dry-run, or a fully-resident pool with no streaming).
+    virtual uint64_t prefetch_warmed() const { return 0; }
+    virtual uint64_t prefetch_used() const { return 0; }
+    virtual uint64_t prefetch_completed_before_use() const { return 0; }
 };
 
 // Factory: inspects `path` and returns the right implementation.
