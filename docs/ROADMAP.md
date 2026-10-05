@@ -44,6 +44,24 @@ families are the remaining quant-coverage gap.
 - [x] **Bounded-RAM fix** - the `.strata` path holds only the trunk resident;
   the full expert footprint is never allocated (#21). Proven by test: 103 KB
   trunk resident vs 393 KB experts not resident on the tiny MoE.
+- [x] **Legacy per-expert Mixtral GGUF support (packer-only).** Real TheBloke
+  Mixtral GGUFs name routed-expert FFN weights with the LEGACY, UN-STACKED,
+  PER-EXPERT convention `blk.N.ffn_{gate,down,up}.E.weight`, not the stacked
+  `blk.N.ffn_{gate,down,up}_exps.weight` 3-D form. Confirmed against vendored
+  llama.cpp b11379: the runtime loader does NOT stack legacy tensors (the
+  legacy -> stacked regroup happens only in the Python convert script, never at
+  GGUF load), so the smallest correct fix is PACKER-ONLY: `strata-pack` now
+  recognizes the legacy per-expert names, GROUPS them per (layer, expert) into
+  the existing stacked `.strata` expert region (verbatim bytes, no requant), and
+  SYNTHESIZES the embedded GGUF metadata to declare stacked `_exps` tensors. The
+  engine, `StrataReader`, `strata_format`, and the `mul_mat_id` addressing are
+  UNCHANGED (they still see only stacked names). Oracle-gated on generated
+  legacy fixtures (incl. a Q3_K variant mirroring the real Mixtral Q3_K_M) with
+  a matched stacked-equivalent oracle: the legacy-sourced `.strata` decodes
+  byte-identically to the libllama oracle on the stacked model, with bounded
+  expert streaming. The real multi-GB Mixtral run stays Colab-only (the real
+  GGUF cannot be downloaded offline); the in-sandbox reproduction is these
+  fixtures.
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.
