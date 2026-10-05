@@ -31,3 +31,10 @@ sf_add_test(test_mixtral_faithful_pack)
 target_link_libraries(test_mixtral_faithful_pack PRIVATE ggml)
 target_include_directories(test_mixtral_faithful_pack SYSTEM PRIVATE
     $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>)
+
+# test_legacy_per_expert_pack packs the FEAT-002 legacy per-expert fixture to a
+# .strata and decodes it through the engine against the libllama oracle on the
+# matched stacked fixture (the FEAT-003 core-fix gate). It only drives the
+# library (pack + engine + oracle) and reads pre-generated fixtures from disk,
+# so it needs no ggml writer headers - a plain sf_add_test suffices.
+sf_add_test(test_legacy_per_expert_pack)

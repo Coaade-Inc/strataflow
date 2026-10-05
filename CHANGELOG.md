@@ -9,6 +9,28 @@ grouped by the pull request that merged them.
 
 ## Unreleased
 
+### Features
+
+- Legacy per-expert Mixtral GGUFs now PACK and STREAM. Real TheBloke Mixtral
+  GGUFs name routed-expert FFN weights per expert
+  (`blk.N.ffn_{gate,down,up}.E.weight`), not stacked
+  (`blk.N.ffn_{gate,down,up}_exps.weight`). Confirmed against vendored llama.cpp
+  b11379 that the runtime loader does NOT stack legacy tensors (that regroup is
+  a Python-convert-time step), so the fix is PACKER-ONLY: `strata-pack` now
+  recognizes the legacy per-expert names, GROUPS them per (layer, expert) into
+  the stacked `.strata` expert region with the bytes copied VERBATIM (no
+  requant, no reshape), and SYNTHESIZES the embedded GGUF metadata (fresh
+  `gguf_init_empty` + all source KV + trunk tensor-infos + one synthesized
+  stacked `_exps` 3-D tensor-info per (layer, kind)) so the engine sees only
+  stacked names. `parse_expert_tensor_name` in `stream_buft.*`, the engine,
+  `StrataReader`, `strata_format`, and the `mul_mat_id` addressing are
+  UNCHANGED. Already-stacked inputs keep the verbatim metadata fast-path, so
+  their behavior is unchanged. Oracle-gated by `test_legacy_per_expert_pack` on
+  generated legacy fixtures (incl. a Q3_K variant mirroring the real Mixtral
+  Q3_K_M) with a matched stacked-equivalent oracle: the legacy-sourced `.strata`
+  decodes byte-identically (max|logit delta| == 0) to the libllama oracle run on
+  the stacked model, with bounded expert streaming below `n_expert`.
+
 ### Correctness and honesty fixes
 
 - Packer FAILS LOUDLY on a misclassified MoE instead of writing an OOM-bomb

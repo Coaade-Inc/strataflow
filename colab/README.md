@@ -247,9 +247,19 @@ cd /content/strataflow
 python3 colab/strataflow_colab.py --real-model --is-moe \
   --hf-repo TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF \
   --hf-file mixtral-8x7b-instruct-v0.1.Q3_K_M.gguf \
-  --expected-gb 20.4 --expert-slots 2 \
-  --prompt "Explain mixture of experts in one sentence:" --max-tokens 24
+  --expected-gb 19 --expert-slots 4 --max-tokens 16 \
+  --prompt "The city of"
 ```
+
+This TheBloke Q3_K_M GGUF uses the LEGACY per-expert tensor naming
+(`blk.N.ffn_{gate,down,up}.E.weight`). As of the legacy per-expert packer fix,
+`strata-pack` recognizes those names, GROUPS them into the stacked `.strata`
+expert region (verbatim bytes), and synthesizes stacked `_exps` metadata, so the
+engine streams and decodes it the same as any stacked MoE - it no longer fails
+to classify. The in-sandbox proof is a generated legacy fixture (plus a Q3_K
+variant mirroring this exact file) packed, streamed, and decoded byte-identical
+to the libllama oracle on a matched stacked model; the real ~19 GB download +
+end-to-end decode stays Colab-only.
 
 As with the generated demo, `--expert-slots` bounds how many experts are held
 resident at once, so a multi-GB MoE decodes with StrataFlow's resident model
@@ -260,8 +270,11 @@ runtime mainly buys you speed. Nothing in the sandbox or CI executes this cell
 (both are offline), so **this Mixtral run is the one remaining Colab-only step**:
 the packer, the loader, the fail-loud classification check, the bounded resident
 weights/streamed bytes, both-compiler builds and the full test suite are all
-proven in-sandbox on a Mixtral-faithful generated fixture, but the real 19 GB
-download + end-to-end decode can only be re-verified on Colab.
+proven in-sandbox on a Mixtral-faithful generated fixture AND on a generated
+legacy per-expert fixture (incl. a Q3_K variant mirroring this exact file,
+packed and decoded byte-identical to the libllama oracle on a matched stacked
+model), but the real 19 GB download + end-to-end decode can only be re-verified
+on Colab.
 
 The exact copy-pasteable re-verification sequence is: run Cell 1 (clone), Cell 2
 (deps), Cell 3 (build Release), then run the two cells above (`df -h /content`
@@ -271,13 +284,16 @@ two honest outcomes:
 - **It streams.** You see the `GUARDS` block, the pack step, then decoded text
   with a `stats: resident model weights = ... MiB, peak RSS = ... MiB, ...
   streamed = ... MiB` line - resident weights far below the ~19 GB on-disk size.
-- **It fails LOUDLY at pack time** (NOT an OOM at decode). With the packer fix on
-  this branch, if Mixtral's expert tensors do not classify (metadata says MoE but
-  zero experts were matched), `strata-pack` now aborts with a diagnostic listing
-  the expert-tensor names/shapes it found, instead of silently writing a
-  0-expert `.strata` that the engine then tries to hold whole-model-resident and
-  gets SIGKILLed (rc=-9). So a classification miss is a clear, actionable error
-  at pack time, not a mysterious decode-time OOM.
+- **It fails LOUDLY at pack time** (NOT an OOM at decode). The packer now
+  classifies BOTH stacked `_exps` and legacy per-expert
+  (`blk.N.ffn_{gate,down,up}.E.weight`) expert tensors, so a correctly-formed
+  Mixtral quant streams. If some OTHER expert layout is encountered such that
+  the metadata declares a MoE (`llama.expert_count` > 0) but zero experts match
+  either form, `strata-pack` aborts with a diagnostic listing the expert-tensor
+  names/shapes it found, instead of silently writing a 0-expert `.strata` that
+  the engine then tries to hold whole-model-resident and gets SIGKILLed (rc=-9).
+  So a classification miss is a clear, actionable error at pack time, not a
+  mysterious decode-time OOM.
 
 ### Cell 9 - benchmark harness (real numbers, free-tier sized)
 
