@@ -88,16 +88,29 @@ most are pure CPU/disk work.
 - [x] **Memory-budget CLI + resident/peak-RSS reporting.** DONE (#25): the CLI
   takes `--expert-slots` and prints `stats: resident model weights = X MiB,
   peak RSS = Y MiB` via `sf_session_stats`.
-- [x] **PEAK PROCESS RAM is now bounded (was CRITICAL).** Root cause found and
-  fixed: the engine allocated the per-layer staging stacked expert tensors at
-  full size for EVERY layer (`n_layer x 3 x n_embd x n_ff x n_expert`), which
-  equalled ~the whole model - so peak RSS tracked model size, not the budget.
+- [x] **Per-layer staging no longer scales with model size (was CRITICAL).**
+  Root cause found and fixed: the engine allocated the per-layer staging stacked
+  expert tensors at full size for EVERY layer
+  (`n_layer x 3 x n_embd x n_ff x n_expert`), which equalled ~the whole model.
   Fix: use ONE staging buffer reused across layers (segments run sequentially),
-  bounding staging to a single layer's expert footprint. Measured: a 785 MiB
-  model dropped from 806 MiB -> 132 MiB peak RSS; a 1177 MiB model also runs in
-  132 MiB (peak RSS now flat vs model size). The "big model, small RAM" claim is
-  provable by process RAM. (Further: shrink staging to n_expert_used instead of
-  n_expert for another cut; optional.)
+  bounding staging to a SINGLE layer's expert footprint. Measured: a 785 MiB
+  model dropped from 806 MiB -> ~132 MiB peak RSS; a 1177 MiB model also runs in
+  ~132 MiB. What this fix bounds, precisely: it removes the per-LAYER growth of
+  the staging buffer. It does NOT make whole-process peak RSS move with
+  `--expert-slots`. The ~132 MiB is essentially the FIXED llama/ggml backend +
+  vocab process floor (reproduced in-sandbox: a 3.9 MiB model AND a `--plan-only`
+  run with no decode both measure ~132 MiB), plus a one-layer staging buffer
+  sized to the layer's FULL `n_expert` (not to the slot budget) plus the ggml
+  compute buffer. So peak RSS is roughly flat across model size for these
+  layer-count-similar models and does NOT shrink as `--expert-slots` shrinks.
+  The quantities that ARE bounded and DO move with `--expert-slots` are
+  StrataFlow's own resident model weights (trunk only) and the SSD bytes
+  streamed per token; those are what make "big model, small RAM" true, not the
+  peak-RSS figure. (Shrinking staging to the slot budget is NOT safely possible
+  without a custom `mul_mat_id` kernel: the stacked staging tensor must carry
+  the full `ne[2]` for `i02*nb02` addressing - see `src/tws/stream_buft.h`
+  "Model A". So the honest reporting above is the resolution, not a tighter
+  peak-RSS bound.)
 - [ ] **Misleading placement-plan line.** On the `.strata` streaming path the
   CLI still prints `plan: ... experts fully resident, peak ~N GiB` from the
   planner's estimate, which contradicts the streaming reality. Make the plan
