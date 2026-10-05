@@ -26,6 +26,11 @@ target_include_directories(strata-pack PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # inherit it via StrataFlow::strataflow). The project forbids a global
 # CMAKE_CXX_STANDARD, so this tool must link it too rather than rely on the
 # compiler default.
+add_executable(make-mixtral-faithful-gguf testdata/make_mixtral_faithful_gguf.cpp)
+target_link_libraries(make-mixtral-faithful-gguf PRIVATE ggml strataflow_cxx strataflow_warnings)
+target_include_directories(make-mixtral-faithful-gguf SYSTEM PRIVATE
+    $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>)
+
 add_executable(make-kquant-moe-gguf testdata/make_kquant_moe_gguf.cpp)
 target_link_libraries(make-kquant-moe-gguf PRIVATE ggml strataflow_cxx strataflow_warnings)
 target_include_directories(make-kquant-moe-gguf SYSTEM PRIVATE

@@ -91,6 +91,31 @@ bool pack_gguf_to_strata(const std::string &in_path,
     const uint64_t data_offset = gguf_get_data_offset(gc);
     const int64_t  n_tensors   = gguf_get_n_tensors(gc);
 
+    // --- MoE metadata (authoritative) ---------------------------------------
+    // The GGUF declares whether this is a MoE and how many experts/layers it
+    // has via '<arch>.expert_count' / '<arch>.block_count' (mirroring how
+    // src/model/ggml_model.cpp read_shape_from_gguf reads them; fall back to
+    // the 'llama' prefix when general.architecture is absent). We treat these
+    // as the ground truth and cross-check the name-based classifier against
+    // them below, so a model that declares experts but whose expert tensors
+    // all miss the name match is caught LOUDLY instead of silently producing a
+    // 0-expert .strata the engine then loads fully resident (the Mixtral OOM).
+    auto gguf_get_str = [&](const char *key) -> std::string {
+        const int64_t id = gguf_find_key(gc, key);
+        if (id < 0) return std::string();
+        const char *v = gguf_get_val_str(gc, id);
+        return v != nullptr ? std::string(v) : std::string();
+    };
+    auto gguf_get_u32 = [&](const std::string &key, uint32_t fallback) -> uint32_t {
+        const int64_t id = gguf_find_key(gc, key.c_str());
+        if (id < 0) return fallback;
+        return gguf_get_val_u32(gc, id);
+    };
+    std::string arch = gguf_get_str("general.architecture");
+    if (arch.empty()) arch = "llama";
+    const uint32_t meta_expert_count = gguf_get_u32(arch + ".expert_count", 0);
+    const uint32_t meta_block_count  = gguf_get_u32(arch + ".block_count", 0);
+
     // Metadata region = everything before the tensor data blob. The verbatim
     // on-disk metadata size is exactly gguf_get_data_offset(): the file begins
     // with header+KV+tensor-info padded to the data offset. Copying [0,
@@ -116,9 +141,26 @@ bool pack_gguf_to_strata(const std::string &in_path,
                                        ? static_cast<uint64_t>(ne[2])
                                        : 0;
             if (n_exp == 0 || t.size % n_exp != 0) {
+                // Report the exact shape so a real-model shape surprise is
+                // diagnosable: ne dims, ggml type, and byte size.
+                const ggml_type gt = gguf_get_tensor_type(gc, i);
+                const char *tn = ggml_type_name(gt);
+                std::string ne_str = "[";
+                if (ne != nullptr) {
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                        if (d != 0) ne_str += ",";
+                        ne_str += std::to_string(ne[d]);
+                    }
+                }
+                ne_str += "]";
                 gguf_free(gc);
                 return fail(err, "expert tensor '" + t.name +
-                                     "' has an unexpected shape");
+                                     "' has an unexpected shape: ne=" + ne_str +
+                                     " type=" + (tn != nullptr ? tn : "?") +
+                                     " size=" + std::to_string(t.size) +
+                                     " (expected a 3-D stacked tensor whose "
+                                     "ne[2] (expert count) divides the byte "
+                                     "size)");
             }
             t.is_expert = true;
             t.layer = id.layer;
@@ -134,6 +176,49 @@ bool pack_gguf_to_strata(const std::string &in_path,
     }
 
     const uint32_t n_layers = experts.empty() ? 0 : (max_layer + 1);
+
+    // --- Metadata cross-check: FAIL LOUDLY on a misclassified MoE -----------
+    // The classifier recognizes experts by tensor name only. On the real
+    // Mixtral every expert tensor missed that match, so experts stayed empty
+    // and the packer wrote a structurally-valid 0-expert .strata; the engine
+    // then held the whole ~19 GB model resident -> SIGKILL (OOM). The GGUF
+    // metadata is authoritative: if it DECLARES a MoE (expert_count > 0) but
+    // the name-based classifier recognized ZERO streamable expert tensors,
+    // refuse to write an OOM-bomb .strata and emit an actionable diagnostic
+    // that names the declared counts and lists a few of the tensor names
+    // actually seen, so an operator can see WHY the match failed.
+    if (meta_expert_count > 0 && experts.empty()) {
+        std::string sample;
+        int shown = 0;
+        for (const TensorInfo &t : trunk) {
+            // Prefer the ffn_*/blk.* tensors an operator would expect to be
+            // the experts, so the sample is maximally diagnostic.
+            if (t.name.find("ffn_") != std::string::npos ||
+                t.name.compare(0, 4, "blk.") == 0) {
+                if (shown != 0) sample += ", ";
+                sample += "'" + t.name + "'";
+                if (++shown >= 8) break;
+            }
+        }
+        if (shown == 0) {
+            // No ffn_/blk. names at all; just list the first few tensors.
+            for (const TensorInfo &t : trunk) {
+                if (shown != 0) sample += ", ";
+                sample += "'" + t.name + "'";
+                if (++shown >= 8) break;
+            }
+        }
+        gguf_free(gc);
+        return fail(err,
+                    "GGUF metadata declares a MoE (" + arch +
+                        ".expert_count=" + std::to_string(meta_expert_count) +
+                        ", " + arch +
+                        ".block_count=" + std::to_string(meta_block_count) +
+                        ") but zero streamable expert tensors were recognized "
+                        "by name; refusing to write a 0-expert .strata that "
+                        "would load fully resident (OOM). Tensor names seen: " +
+                        (sample.empty() ? "(none)" : sample));
+    }
 
     // Group the three (gate/up/down) kinds per (layer,expert). Index the
     // experts vector by {layer, kind} for quick slice lookup.
