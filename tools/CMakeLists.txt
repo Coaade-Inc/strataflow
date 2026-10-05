@@ -35,3 +35,15 @@ add_executable(make-kquant-moe-gguf testdata/make_kquant_moe_gguf.cpp)
 target_link_libraries(make-kquant-moe-gguf PRIVATE ggml strataflow_cxx strataflow_warnings)
 target_include_directories(make-kquant-moe-gguf SYSTEM PRIVATE
     $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>)
+
+# make-legacy-moe-gguf: emits a llama-arch MoE GGUF using the LEGACY,
+# un-stacked, PER-EXPERT routed-expert tensor naming (blk.N.ffn_{gate,down,up}
+# .E.weight, 2-D each) that the real TheBloke Mixtral GGUFs use and that the
+# existing make-mixtral-faithful-gguf never emitted. It ALSO emits a matched
+# STACKED-equivalent GGUF whose per-expert nb02 slices are byte-identical to the
+# legacy standalone tensors (the oracle target llama can load). Same ggml
+# K-quant path and SYSTEM include seam as make-kquant-moe-gguf.
+add_executable(make-legacy-moe-gguf testdata/make_legacy_moe_gguf.cpp)
+target_link_libraries(make-legacy-moe-gguf PRIVATE ggml strataflow_cxx strataflow_warnings)
+target_include_directories(make-legacy-moe-gguf SYSTEM PRIVATE
+    $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>)
