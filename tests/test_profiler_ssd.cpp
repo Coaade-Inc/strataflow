@@ -42,10 +42,32 @@ static void test_no_probe_file_left() {
     if (f != nullptr) std::fclose(f);
 }
 
+// containing_dir turns a model FILE path into the directory to SSD-probe, so a
+// '.strata' path no longer makes the profiler write '<file>/.tmp' (the old
+// cosmetic 'cannot write SSD probe' warning). A bare filename maps to "" (cwd).
+static void test_containing_dir() {
+    CHECK(containing_dir("/x/y/model.strata") == "/x/y");
+    CHECK(containing_dir("model.strata") == "");
+    CHECK(containing_dir("/model.strata") == "");
+    CHECK(containing_dir("./sub/model.strata") == "./sub");
+    CHECK(containing_dir("") == "");
+}
+
+// A model FILE path must still yield a non-zero bandwidth measurement: the
+// derived directory is writable, so the probe succeeds and no warning fires.
+static void test_file_path_probes_its_dir() {
+    const std::string dir = containing_dir("./model.strata");  // -> "" (cwd)
+    HardwareProfile p = profile_hardware(dir, /*quick=*/true);
+    CHECK(p.ssd_seq_gbps > 0.0);
+    CHECK(p.ssd_rand_gbps > 0.0);
+}
+
 static void run_all() {
     RUN(test_ssd_bandwidth_measured);
     RUN(test_ssd_bandwidth_quick);
     RUN(test_no_probe_file_left);
+    RUN(test_containing_dir);
+    RUN(test_file_path_probes_its_dir);
 }
 
 TEST_MAIN()

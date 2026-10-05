@@ -113,7 +113,14 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
 #endif
     }
 
-    ctx->hw = sf::profile_hardware(params->model_path, /*quick=*/false);
+    // profile_hardware benchmarks the DISK the model sits on, so it needs the
+    // containing DIRECTORY, not the model FILE path. Deriving it here keeps the
+    // SSD probe from trying to write '<file>/.strataflow_ssd_probe.tmp' (which
+    // fails and warns). Strip the trailing component after the last separator
+    // ('/' on POSIX, '/' or '\\' on Windows); if there is no separator, use ""
+    // (the current working directory).
+    const std::string model_dir = sf::containing_dir(params->model_path);
+    ctx->hw = sf::profile_hardware(model_dir, /*quick=*/false);
 
     // The planner runs INSIDE load_model now, so the chosen placement actually
     // drives how the GGUF backend loads the model (VRAM layers + expert
