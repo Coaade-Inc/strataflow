@@ -32,6 +32,13 @@ struct PlacementPlan {
     uint32_t expert_slots_vram = 0;
     uint32_t expert_slots_ram  = 0;
 
+    // The TOTAL expert BUNDLE slot count the engine will ACTUALLY make resident
+    // across ALL layers (one bundle = gate+up+down for one (layer,expert)). This
+    // is the number the engine's SlotPool is sized to and the number the plan
+    // summary reports; it is derived model-adaptively from the shape + budget
+    // (see plan_placement). 0 only for a non-MoE/dense model (no experts).
+    uint32_t expert_slots_resident = 0;
+
     bool     stream_experts    = false;  // true when experts don't all fit
     uint64_t planned_peak_bytes = 0;
 
@@ -39,9 +46,17 @@ struct PlacementPlan {
 };
 
 // Build a plan from the hardware profile, model shape, and budgets (0 = auto).
+//
+// `cache_budget` is an optional user-facing cap (in bytes) on the RAM used for
+// resident expert bundles (the --cache-gb dial). 0 = unused. When > 0 it caps
+// the RAM-for-experts before the slot count is derived, so a user can force a
+// bounded, smaller resident expert footprint than free RAM would otherwise
+// allow. It never raises the choice above what free RAM / the working set
+// support; it only lowers it. See plan_placement for the exact precedence.
 PlacementPlan plan_placement(const HardwareProfile &hw,
                              const ModelShape &model,
                              uint64_t vram_budget,
-                             uint64_t ram_budget);
+                             uint64_t ram_budget,
+                             uint64_t cache_budget = 0);
 
 } // namespace sf

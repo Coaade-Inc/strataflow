@@ -95,7 +95,8 @@ bool ends_with_ci(const std::string &s, const std::string &suffix) {
 
 sf_status load_model(const std::string &path, const HardwareProfile &hw,
                      uint64_t vram_budget, uint64_t ram_budget,
-                     std::unique_ptr<Model> &out, PlacementPlan *out_plan) {
+                     std::unique_ptr<Model> &out, PlacementPlan *out_plan,
+                     uint64_t cache_budget) {
     // Real weights: an existing *.gguf file goes to the llama.cpp backend. Any
     // failure there (unreadable file, bad GGUF) degrades to the dry-run model
     // rather than failing the whole context -- load_model never crashes on a
@@ -110,7 +111,8 @@ sf_status load_model(const std::string &path, const HardwareProfile &hw,
     if (exists && (ends_with_ci(path, ".gguf") ||
                    ends_with_ci(path, ".strata"))) {
         sf_status st =
-            load_ggml_model(path, hw, vram_budget, ram_budget, out, out_plan);
+            load_ggml_model(path, hw, vram_budget, ram_budget, out, out_plan,
+                            cache_budget);
         if (st == SF_OK && out) {
             return SF_OK;
         }
@@ -126,7 +128,8 @@ sf_status load_model(const std::string &path, const HardwareProfile &hw,
     // The dry-run model has no real tensors to place, but the planner still
     // runs over its representative shape so the C API can describe a plan.
     if (out_plan != nullptr) {
-        *out_plan = plan_placement(hw, out->shape(), vram_budget, ram_budget);
+        *out_plan = plan_placement(hw, out->shape(), vram_budget, ram_budget,
+                                   cache_budget);
     }
     return SF_OK;
 }

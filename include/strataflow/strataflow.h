@@ -102,6 +102,15 @@ typedef struct sf_context_params {
        count forces bounded streaming with LRU eviction - the "run it in a small
        budget" dial. Appended for ABI compatibility; default 0. */
     uint32_t expert_slots;
+
+    /* User-facing cap (in BYTES) on the RAM used for resident expert bundles -
+       the --cache-gb dial. 0 = unused (auto from free RAM). When > 0 the
+       planner sizes the resident expert pool to fit within this cap (it only
+       LOWERS the auto choice, never raises it above what the working set / free
+       RAM support). Precedence: an explicit expert_slots (!= 0) wins outright;
+       else cache_budget (> 0) caps the choice; else auto from free RAM.
+       Appended for ABI compatibility; default 0. */
+    uint64_t cache_budget;
 } sf_context_params;
 
 /* Returns params filled with safe defaults (auto_plan on, CPU backend). */

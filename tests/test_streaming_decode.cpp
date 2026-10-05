@@ -154,6 +154,105 @@ static engine::EngineCacheStats engine_stats_for(const char *path,
     return stats;
 }
 
+// Decode `n_steps` greedy tokens through the DEFAULT sf::Model inference path
+// with the engine's slot count driven by the PLANNER (the AUTO path a user
+// hits: no explicit --expert-slots, so GgmlModel uses
+// PlacementPlan::expert_slots_resident). `hw` and `cache_budget` are the dials
+// the planner reads; the env override is cleared so the plan truly drives it.
+// Writes the auto-chosen slot count the plan picked to `out_auto_slots`.
+static std::vector<int32_t> decode_sequence_auto(const char *path,
+                                                 const HardwareProfile &hw,
+                                                 uint64_t cache_budget,
+                                                 int n_steps,
+                                                 uint32_t *out_auto_slots) {
+    set_expert_slots(0);  // clear the explicit-override env: plan drives it
+
+    std::unique_ptr<Model> m;
+    PlacementPlan plan;
+    std::vector<int32_t> out;
+    if (load_model(path, hw, 0, 0, m, &plan, cache_budget) != SF_OK ||
+        m == nullptr) {
+        return out;
+    }
+    if (out_auto_slots != nullptr) *out_auto_slots = plan.expert_slots_resident;
+
+    auto ids = m->tokenize("hello world");
+    int32_t tok = ids.empty() ? 1 : ids.back();
+    for (int i = 0; i < n_steps; ++i) {
+        tok = m->forward(tok);
+        out.push_back(tok);
+    }
+    return out;
+}
+
+// End-to-end AUTO-path gate (FEAT-002): prove the plan-driven slot count is
+// ACTUALLY used by the engine through the public load_model/sf::Model seam.
+//   (1) A generous profile makes the planner choose FULL residency (auto slots
+//       == full_slots, stream=false), and that run's sequence is byte-identical
+//       to a deliberately-too-small FORCED --expert-slots run.
+//   (2) A tiny forced expert-RAM cap makes the planner choose a BOUNDED count
+//       (< full_slots, >= n_experts_used) that STILL decodes byte-identically.
+// This exercises the real plumbing (plan -> GgmlModel -> Engine slot count) a
+// user hits, not just the engine API.
+static void test_auto_path_plan_drives_engine() {
+    const char *path = std::getenv("STRATAFLOW_TEST_MOE_GGUF");
+    if (path == nullptr || path[0] == '\0') {
+        std::printf("[skipped: set STRATAFLOW_TEST_MOE_GGUF] ");
+        return;
+    }
+
+    const int n_steps = 12;
+    const uint32_t full_slots = 16;         // fixture: 2 layers x 8 experts
+    const uint32_t n_experts_used = 2;
+
+    // (1) Generous profile -> auto chooses full residency.
+    HardwareProfile generous;
+    generous.ram_total_bytes = 64ull * 1024 * 1024 * 1024;
+    generous.ram_free_bytes = 60ull * 1024 * 1024 * 1024;
+    uint32_t auto_full_slots = 0;
+    std::vector<int32_t> auto_full =
+        decode_sequence_auto(path, generous, /*cache_budget=*/0, n_steps,
+                             &auto_full_slots);
+    CHECK(!auto_full.empty());
+    CHECK_EQ(auto_full_slots, full_slots);  // plan held the whole working set
+
+    // Reference: a deliberately-too-small FORCED --expert-slots run (3 slots)
+    // through the same sf::Model path. Byte-identical output is the determinism
+    // gate: the plan-driven full-residency run must match it exactly.
+    std::vector<int32_t> forced_small = decode_sequence(path, 3, n_steps);
+    CHECK(!forced_small.empty());
+    CHECK(auto_full.size() == forced_small.size());
+    CHECK(auto_full == forced_small);
+
+    // (2) Tiny forced expert-RAM cap -> auto chooses a BOUNDED count.
+    HardwareProfile tiny = generous;
+    // Cap experts to ~4 bundles. The fixture's expert_bytes is estimated by the
+    // loader from the on-disk size; use a byte cap small enough to force bounding
+    // yet large enough to leave >= n_experts_used slots. 4 * (one expert bundle)
+    // is well under the 16-bundle working set. We size the cap off the engine's
+    // slot_bytes measured on this fixture.
+    engine::EngineCacheStats probe =
+        engine_stats_for(path, /*slots=*/full_slots, n_steps, nullptr);
+    CHECK(probe.slot_bytes > 0u);
+    const uint64_t cache_budget = 4 * probe.slot_bytes;
+    uint32_t auto_bounded_slots = 0;
+    std::vector<int32_t> auto_bounded =
+        decode_sequence_auto(path, tiny, cache_budget, n_steps,
+                             &auto_bounded_slots);
+    CHECK(!auto_bounded.empty());
+    CHECK(auto_bounded_slots < full_slots);
+    CHECK(auto_bounded_slots >= n_experts_used);
+
+    // The bounded AUTO run must STILL decode byte-identically to the full run.
+    CHECK(auto_bounded.size() == auto_full.size());
+    CHECK(auto_bounded == auto_full);
+
+    std::printf("[auto full-slots=%u (seq==forced-small=%s) bounded-slots=%u "
+                "(seq==full=%s)] ",
+                auto_full_slots, (auto_full == forced_small) ? "yes" : "no",
+                auto_bounded_slots, (auto_bounded == auto_full) ? "yes" : "no");
+}
+
 static void test_streaming_bounded_and_deterministic() {
     const char *path = std::getenv("STRATAFLOW_TEST_MOE_GGUF");
     if (path == nullptr || path[0] == '\0') {
@@ -223,6 +322,7 @@ static void test_streaming_bounded_and_deterministic() {
 
 static void run_all() {
     RUN(test_streaming_bounded_and_deterministic);
+    RUN(test_auto_path_plan_drives_engine);
 }
 
 TEST_MAIN()

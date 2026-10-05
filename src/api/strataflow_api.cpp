@@ -79,6 +79,7 @@ sf_context_params sf_context_default_params(void) {
     p.auto_plan         = 1;
     p.preferred_backend = SF_BACKEND_CPU;
     p.expert_slots      = 0;   // auto (hold the whole expert working set)
+    p.cache_budget      = 0;   // auto (size experts from free RAM)
     return p;
 }
 
@@ -127,8 +128,35 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
     // offload). An explicit budget of 0 means "auto from the profile".
     sf_status st = sf::load_model(params->model_path, ctx->hw,
                                   params->vram_budget, params->ram_budget,
-                                  ctx->model, &ctx->plan);
+                                  ctx->model, &ctx->plan,
+                                  params->cache_budget);
     if (st != SF_OK) return st;
+
+    // Keep the reported plan HONEST under an explicit --expert-slots override:
+    // the engine will run with params.expert_slots (routed via the env above),
+    // so reconcile the plan's resident count + stream flag to that same number
+    // (clamped exactly like the engine: up to n_expert_used, down to the whole
+    // working set) instead of leaving the auto choice in the summary. Precedence
+    // explicit > cache-gb > auto is thus reflected in both what runs AND what is
+    // reported, so the two never diverge (the old misleading-plan-line bug).
+    if (params->expert_slots != 0 && ctx->model != nullptr) {
+        const auto &shape = ctx->model->shape();
+        if (shape.is_moe && shape.n_experts > 0 && shape.n_layers > 0) {
+            const uint32_t full_slots = shape.n_layers * shape.n_experts;
+            uint32_t slots = params->expert_slots;
+            if (slots < shape.n_experts_used) slots = shape.n_experts_used;
+            if (slots > full_slots) slots = full_slots;
+            ctx->plan.expert_slots_resident = slots;
+            ctx->plan.stream_experts = slots < full_slots;
+            // Recompute the peak to match the forced resident count: trunk +
+            // resident bundles + a one-layer staging footprint (same shape as
+            // the planner's own estimate), so the reported peak stays honest.
+            ctx->plan.planned_peak_bytes =
+                shape.trunk_bytes +
+                static_cast<uint64_t>(slots) * shape.expert_bytes +
+                static_cast<uint64_t>(shape.n_experts_used) * shape.expert_bytes;
+        }
+    }
 
     *out_ctx = ctx.release();
     return SF_OK;

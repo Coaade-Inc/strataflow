@@ -91,9 +91,11 @@ public:
     // is kept for logging/diagnostics; both a plain GGUF and a .strata now
     // run inference through the engine (libllama is never used to decode).
     GgmlModel(llama_model *model, llama_context *ctx, const ModelShape &shape,
-              llama_token eos, std::string path, bool is_strata)
+              llama_token eos, std::string path, bool is_strata,
+              uint32_t plan_expert_slots)
         : model_(model), ctx_(ctx), vocab_(llama_model_get_vocab(model)),
-          shape_(shape), eos_(eos), path_(std::move(path)) {
+          shape_(shape), eos_(eos), path_(std::move(path)),
+          plan_expert_slots_(plan_expert_slots) {
         log_debug(std::string("GgmlModel: inference via engine (EC-5) on ") +
                   (is_strata ? ".strata" : "GGUF") + " '" + path_ + "'");
     }
@@ -204,12 +206,20 @@ private:
     // then appends `last_token` at n_past_ and attends over 0..n_past_.
     int32_t forward_engine(int32_t last_token) {
         if (engine_ == nullptr) {
-            // EC-3: STRATAFLOW_ENGINE_EXPERT_SLOTS bounds the top-k residency
-            // SlotPool (expert bundles). 0/unset = auto (full working set, no
-            // eviction). A value below the expert count forces bounded
-            // streaming with LRU eviction/reload. The default path leaves this
-            // auto; only an operator/test opting into a budget sets it.
-            uint32_t slots = 0;
+            // Expert-residency SlotPool size (expert bundles) the engine runs
+            // with. Precedence (matches the planner/API precedence):
+            //   1. STRATAFLOW_ENGINE_EXPERT_SLOTS env, set from an EXPLICIT
+            //      --expert-slots / params.expert_slots - the user forced it, so
+            //      it wins outright.
+            //   2. plan_expert_slots_ (PlacementPlan::expert_slots_resident):
+            //      the RAM-aware, --cache-gb-capped AUTO choice the planner made
+            //      for this model+budget. This is the DEFAULT path and ensures
+            //      the engine uses EXACTLY the number the plan reports.
+            //   3. 0 = engine auto (full working set, no eviction) when neither
+            //      is set (e.g. the dry-run model has no plan slots).
+            // 0 means auto in the engine; a positive value is clamped up to
+            // n_expert_used so a single layer's top-k always fits.
+            uint32_t slots = plan_expert_slots_;
             const char *s = std::getenv("STRATAFLOW_ENGINE_EXPERT_SLOTS");
             if (s != nullptr && s[0] != '\0') {
                 slots = static_cast<uint32_t>(std::strtoul(s, nullptr, 10));
@@ -241,6 +251,11 @@ private:
     llama_token          eos_    = 0;
     int32_t              n_past_ = 0;
     std::string          path_;
+    // The RAM-aware expert-residency slot count the planner chose for this
+    // model+budget (PlacementPlan::expert_slots_resident). Drives the engine's
+    // SlotPool on the default (no explicit --expert-slots) path so the number
+    // the engine USES equals the number the plan REPORTS. 0 = engine auto.
+    uint32_t             plan_expert_slots_ = 0;
     std::unique_ptr<engine::Engine> engine_;
 };
 
@@ -439,7 +454,7 @@ void enumerate_gpus(std::vector<GpuInfo> &out) {
 sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
                             uint64_t vram_budget, uint64_t ram_budget,
                             std::unique_ptr<Model> &out,
-                            PlacementPlan *out_plan) {
+                            PlacementPlan *out_plan, uint64_t cache_budget) {
     StrataReader reader;
     if (!reader.open(path)) {
         log_warn("load_strata_model: cannot open .strata '" + path + "'");
@@ -542,7 +557,8 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
         if (shape.n_experts == 0) shape.n_experts = sb.n_experts;
     }
 
-    PlacementPlan plan = plan_placement(hw, shape, vram_budget, ram_budget);
+    PlacementPlan plan =
+        plan_placement(hw, shape, vram_budget, ram_budget, cache_budget);
     if (out_plan != nullptr) *out_plan = plan;
 
     log_info("GgmlModel loaded .strata '" + shape.name + "': " +
@@ -553,13 +569,15 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
              " (engine owns inference; no llama_decode on the .strata)");
 
     out = std::unique_ptr<Model>(
-        new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/true));
+        new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/true,
+                      plan.expert_slots_resident));
     return SF_OK;
 }
 
 sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
                           uint64_t vram_budget, uint64_t ram_budget,
-                          std::unique_ptr<Model> &out, PlacementPlan *out_plan) {
+                          std::unique_ptr<Model> &out, PlacementPlan *out_plan,
+                          uint64_t cache_budget) {
     ensure_backend();
     llama_log_set(sf_llama_log_cb, nullptr);
 
@@ -567,7 +585,7 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
     // NEVER handed to llama_model_load_from_file (the TASK5_BLOCKER root cause).
     if (is_strata_file(path)) {
         return load_strata_model(path, hw, vram_budget, ram_budget, out,
-                                 out_plan);
+                                 out_plan, cache_budget);
     }
 
     llama_model_params mp = llama_model_default_params();
@@ -587,7 +605,8 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
     // entry's pattern at its c_str().
     std::string expert_pattern;
     if (read_shape_from_gguf(path, pre_shape)) {
-        plan = plan_placement(hw, pre_shape, vram_budget, ram_budget);
+        plan = plan_placement(hw, pre_shape, vram_budget, ram_budget,
+                              cache_budget);
         place = derive_llama_placement(plan, pre_shape, hw.gpus);
 
         mp.n_gpu_layers = place.n_gpu_layers;
@@ -688,15 +707,19 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
                            : std::string("dense")) +
              ", " + std::to_string(shape.total_bytes) + " bytes");
 
-    // Report the plan that was applied. Prefer re-planning from the loaded
-    // model's authoritative shape so the summary matches reality exactly; it
-    // agrees with the pre-pass plan used for the load params.
-    if (out_plan != nullptr) {
-        *out_plan = plan_placement(hw, shape, vram_budget, ram_budget);
-    }
+    // Re-plan from the loaded model's authoritative shape so the summary and
+    // the engine's slot count both match reality exactly; it agrees with the
+    // pre-pass plan used for the load params. The engine is driven by this
+    // plan's expert_slots_resident (unless an explicit --expert-slots forces a
+    // value via the env the engine also reads), so the number the engine USES
+    // equals the number the plan REPORTS.
+    PlacementPlan final_plan =
+        plan_placement(hw, shape, vram_budget, ram_budget, cache_budget);
+    if (out_plan != nullptr) *out_plan = final_plan;
 
     out = std::unique_ptr<Model>(
-        new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/false));
+        new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/false,
+                      final_plan.expert_slots_resident));
     return SF_OK;
 }
 
