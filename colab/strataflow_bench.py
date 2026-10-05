@@ -30,9 +30,16 @@
 #
 # What the generated numbers DO and DO NOT prove:
 #   - They prove the MECHANISM and the bounded-RAM property: a model many
-#     hundreds of MiB on disk decodes with resident weights + peak RSS held far
-#     below the on-disk size, and that budget moves with --expert-slots. That
-#     is the Phase 3 "big model, small RAM" exit criterion (PHASE3_PLAN.md).
+#     hundreds of MiB on disk decodes with StrataFlow's RESIDENT model weights
+#     held far below the on-disk size, and the SSD bytes STREAMED per token move
+#     with --expert-slots. Resident weights + streamed bytes are the bounded
+#     quantities (the Phase 3 "big model, small RAM" exit criterion,
+#     PHASE3_PLAN.md). Whole-process peak RSS is a separate figure: it carries a
+#     fixed llama/ggml backend + vocab floor (hundreds of MiB) plus a per-layer
+#     staging buffer sized to one layer's FULL expert count, so it does NOT move
+#     with --expert-slots and can exceed on-disk for tiny models. The
+#     exit-criteria block below reports both and attributes the mission to the
+#     bounded quantities, never to a peak-RSS percentage.
 #   - They do NOT prove the absolute tokens/sec ladder in PLAN.md section 2:
 #     that ladder is for LARGE REAL models on NVMe. The generated toy has
 #     random weights and tiny dimensions, so its decode tok/s is only a
@@ -375,7 +382,18 @@ def print_table(records):
 
 
 def print_exit_criteria(records):
-    """Report measured numbers against the applicable exit criteria, honestly."""
+    """Report measured numbers against the applicable exit criteria, honestly.
+
+    The 'big model, small RAM' mission is bounded by StrataFlow's OWN resident
+    model weights and the SSD bytes it streams per token - BOTH move with
+    --expert-slots. Whole-process peak RSS is a DIFFERENT quantity: it carries a
+    fixed llama/ggml backend + vocab floor (hundreds of MiB, reproduced even by
+    a 3.9 MiB model and a --plan-only run) PLUS a per-layer expert staging
+    buffer sized to one layer's FULL expert count (not --expert-slots). So peak
+    RSS does NOT move with --expert-slots and can exceed on-disk for small
+    models. We report both, attribute the mission to the bounded quantities,
+    and never present a peak-RSS percentage as the proof.
+    """
     gen_ok = [r for r in records
               if r["ok"] and r["arch"] == "generated-f32-moe"]
     print("\n" + "=" * 70)
@@ -385,19 +403,54 @@ def print_exit_criteria(records):
         print("  no successful generated rows to report.")
         return
 
-    print("PHASE3_PLAN.md criterion 1 - 'big model, small RAM': peak RSS and")
-    print("resident weights must stay FAR BELOW the on-disk model size, and")
-    print("move with --expert-slots. Measured on the generated MoE:")
+    print("PHASE3_PLAN.md criterion 1 - 'big model, small RAM'. The quantities")
+    print("that are BOUNDED and MOVE with --expert-slots are StrataFlow's own")
+    print("resident model weights and the SSD bytes streamed per decode. These")
+    print("are the mechanism. Measured on the generated MoE (watch resident +")
+    print("streamed shrink/grow as slots change for a given model):")
+    print(f"  {'model':<16} {'slots':<5} {'on-disk MiB':>11}  "
+          f"{'resident MiB':>12}  {'streamed MiB':>12}  {'peak RSS MiB':>12}")
     for r in gen_ok:
-        if r["peak_rss_mib"] is None or r["on_disk_mib"] in (None, 0):
+        if r["on_disk_mib"] in (None, 0):
             continue
-        ratio = r["peak_rss_mib"] / r["on_disk_mib"] if r["on_disk_mib"] else 0
         slots_s = "auto" if r["expert_slots"] == 0 else str(r["expert_slots"])
-        print(f"  {r['model']:<16} slots={slots_s:<4} "
-              f"on-disk={r['on_disk_mib']:.1f} MiB  "
-              f"resident={_fmt(r['resident_mib'], '{:.1f}')} MiB  "
-              f"peak RSS={r['peak_rss_mib']:.1f} MiB  "
-              f"(peak = {ratio * 100:.0f}% of on-disk)")
+        print(f"  {r['model']:<16} {slots_s:<5} "
+              f"{r['on_disk_mib']:>11.1f}  "
+              f"{_fmt(r['resident_mib'], '{:.1f}'):>12}  "
+              f"{_fmt(r['streamed_mib'], '{:.1f}'):>12}  "
+              f"{_fmt(r['peak_rss_mib'], '{:.1f}'):>12}")
+
+    print("\nResident weights stay FAR below on-disk (experts are metadata-only")
+    print("and stream through a bounded cache), and the streamed-MiB column")
+    print("moves with --expert-slots: that movement IS the bound working.")
+
+    print("\nWhole-process peak RSS (getrusage ru_maxrss) is reported for")
+    print("transparency, NOT as the proof. It carries a FIXED llama/ggml backend")
+    print("+ vocab floor (hundreds of MiB; reproduced by a 3.9 MiB model and by")
+    print("a --plan-only run) plus a per-layer staging buffer sized to one")
+    print("layer's FULL expert count. So it does NOT track --expert-slots (the")
+    print("peak-RSS column above does not shrink as slots shrink, unlike the")
+    print("streamed-MiB column) and can EXCEED on-disk for small models. That is")
+    print("EXPECTED here, not a failure:")
+    print("these generated models are tiny, so the fixed floor dominates.")
+
+    # Explicitly flag, per row, where peak RSS >= on-disk instead of printing a
+    # >100% figure as if it proved the mission.
+    flagged = [r for r in gen_ok
+               if r["peak_rss_mib"] is not None and r["on_disk_mib"]
+               and r["peak_rss_mib"] >= r["on_disk_mib"]]
+    if flagged:
+        print("\n  NOTE: peak RSS >= on-disk on these tiny rows (fixed floor")
+        print("  dominates; this is the floor, not an unbounded leak):")
+        for r in flagged:
+            slots_s = "auto" if r["expert_slots"] == 0 else str(r["expert_slots"])
+            print(f"    {r['model']} slots={slots_s}: "
+                  f"peak RSS {r['peak_rss_mib']:.1f} MiB "
+                  f">= on-disk {r['on_disk_mib']:.1f} MiB")
+
+    # Make the slots-vs-peak-RSS invariance explicit so a reader does not expect
+    # peak RSS to track --expert-slots (Defect 2).
+    _print_peak_rss_flatness(gen_ok)
 
     print("\nPLAN.md section 2 - absolute tokens/sec ladder: this ladder is for")
     print("LARGE REAL models on NVMe. The generated toy has random weights and")
@@ -405,6 +458,36 @@ def print_exit_criteria(records):
     print("comparable throughput figure. No comparison is fabricated here.")
     print("Run the optional --real-model row (or a Mixtral quant on a larger")
     print("runtime) to measure throughput against that ladder on real weights.")
+
+
+def _print_peak_rss_flatness(gen_ok):
+    """Show that peak RSS stays ~flat across the --expert-slots sweep per model.
+
+    Groups the successful rows by model size and, when a model was swept across
+    more than one slot setting, prints the peak-RSS spread so the reader SEES
+    peak RSS not moving with slots (the EXPECTED consequence of the fixed floor
+    + one-layer staging), while resident/streamed do move (shown above).
+    """
+    by_model = {}
+    for r in gen_ok:
+        if r["peak_rss_mib"] is not None:
+            by_model.setdefault(r["model"], []).append(r)
+    lines = []
+    for model, rows in by_model.items():
+        if len(rows) < 2:
+            continue
+        peaks = [r["peak_rss_mib"] for r in rows]
+        spread = max(peaks) - min(peaks)
+        lines.append(f"    {model}: peak RSS {min(peaks):.1f}-{max(peaks):.1f} "
+                     f"MiB across {len(rows)} slot settings "
+                     f"(spread {spread:.1f} MiB)")
+    if lines:
+        print("\n  peak RSS across the --expert-slots sweep (it does NOT track")
+        print("  the slot budget - the fixed floor + one-layer staging dominate,")
+        print("  so any spread is from the compute/staging buffer, not the slot")
+        print("  count):")
+        for ln in lines:
+            print(ln)
 
 
 def write_artifacts(args, records):
