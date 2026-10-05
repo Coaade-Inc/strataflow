@@ -11,9 +11,6 @@
 #include <cstdint>
 #include <future>
 #include <string>
-#if defined(STRATAFLOW_PLATFORM_windows)
-#include <mutex>  // guards the stateful win_crt_ seek+read fallback in read_at
-#endif
 
 namespace sf {
 
@@ -46,6 +43,10 @@ public:
     // Synchronous read of `len` bytes at `offset` into `dst`.
     // Returns bytes read, or -1 on error. For direct-I/O backends unaligned
     // requests are served through an aligned bounce buffer transparently.
+    // Positional and thread-safe for concurrent callers on every path: POSIX
+    // uses pread, and both Windows paths (direct no-buffering and the buffered
+    // fallback) use ReadFile with a per-call OVERLAPPED offset, so two threads
+    // can read the same open handle at once without sharing a file position.
     int64_t read_at(void *dst, size_t len, uint64_t offset) const;
 
     // Asynchronous read; wraps read_at on a thread so callers (the residency
@@ -71,21 +72,13 @@ private:
     int64_t read_direct_aligned(void *dst, size_t len, uint64_t offset) const;
 
     int   fd_ = -1;             // POSIX file descriptor
-    void *handle_ = nullptr;    // Win32 HANDLE (or CRT FILE* fallback)
+    void *handle_ = nullptr;    // Win32 HANDLE (direct or buffered fallback)
     uint64_t size_ = 0;
     size_t   alignment_ = 1;    // required I/O alignment for the active backend
     Backend  backend_ = Backend::kSync;
 #if defined(STRATAFLOW_PLATFORM_windows)
-    bool     win_crt_ = false;  // Windows: handle_ is a FILE* (sync fallback)
-    // Guards ONLY the win_crt_ sync-fallback branch of read_at, whose
-    // _fseeki64 + fread advance a SHARED, stateful file position on handle_.
-    // Once the async-prefetch worker and the compute thread both call read_blob
-    // (-> read_at) concurrently, two interleaved seek+read pairs on the same
-    // handle would race and return bytes from the wrong offset. A per-call lock
-    // around just the seek+read makes each positional read atomic. The POSIX
-    // pread path is positional/stateless and intentionally stays lock-free, so
-    // this member only exists on Windows. mutable because read_at is const.
-    mutable std::mutex win_crt_mu_;
+    bool     win_crt_ = false;  // Windows: handle_ is a buffered Win32 HANDLE
+                                // fallback (positional ReadFile, no lock needed)
 #endif
 };
 

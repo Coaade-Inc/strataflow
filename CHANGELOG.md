@@ -42,7 +42,12 @@ grouped by the pull request that merged them.
   stays Colab-only on the real Mixtral (exact `--async-prefetch on`/`off`
   re-verify commands added to `colab/README.md`, auto residency bounded by
   `--cache-gb`). `docs/ROADMAP.md` flips the async-overlap and Phase 4 items to
-  done.
+  done. The Windows buffered fallback of `BlockFile::read_at` is now positional
+  and stateless like POSIX `pread`: it opens a buffered Win32 `HANDLE` and reads
+  via `ReadFile` with a per-call `OVERLAPPED` offset instead of a shared
+  `_fseeki64`+`fread` guarded by a mutex, so concurrent compute and prefetch
+  reads no longer serialize through one stateful handle (fixes the Windows-only
+  CI hang; reads stay byte-identical).
 - RAM-aware, per-model AUTO expert-residency. StrataFlow now chooses the
   resident expert-bundle pool size automatically per model, from the measured
   free-RAM budget plus the model's own expert layout (`n_layer`, `n_expert`,

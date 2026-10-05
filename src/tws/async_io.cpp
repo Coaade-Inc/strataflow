@@ -90,18 +90,28 @@ bool BlockFile::open(const std::string &path) {
         ::CloseHandle(h);
     }
 #  endif  // STRATAFLOW_WIN_DIRECT_IO
-    // Default Windows path: portable CRT (buffered, synchronous), correct
-    // everywhere. The no-buffering path above is opt-in until hardware-verified.
-    FILE *f = nullptr;
-    if (fopen_s(&f, path.c_str(), "rb") != 0 || f == nullptr) {
+    // Default Windows path: a BUFFERED Win32 HANDLE (no FILE_FLAG_NO_BUFFERING,
+    // so no alignment constraint), correct everywhere. We read via ReadFile
+    // with a per-call OVERLAPPED offset, which is positional and stateless like
+    // POSIX pread, so concurrent compute + prefetch reads never share a file
+    // position and need no lock. The no-buffering path above is opt-in until
+    // hardware-verified.
+    HANDLE h = ::CreateFileA(
+        path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
         log_error("BlockFile: cannot open " + path);
         return false;
     }
-    _fseeki64(f, 0, SEEK_END);
-    size_ = static_cast<uint64_t>(_ftelli64(f));
-    _fseeki64(f, 0, SEEK_SET);
-    handle_ = f;
+    LARGE_INTEGER li{};
+    if (!::GetFileSizeEx(h, &li)) {
+        log_error("BlockFile: cannot size " + path);
+        ::CloseHandle(h);
+        return false;
+    }
+    handle_ = h;
     win_crt_ = true;
+    size_ = static_cast<uint64_t>(li.QuadPart);
     alignment_ = 1;
     backend_ = Backend::kSync;
     return true;
@@ -185,11 +195,9 @@ bool BlockFile::open(const std::string &path) {
 void BlockFile::close() {
 #if defined(STRATAFLOW_PLATFORM_windows)
     if (handle_ != nullptr) {
-        if (win_crt_) {
-            std::fclose(static_cast<FILE *>(handle_));
-        } else {
-            ::CloseHandle(static_cast<HANDLE>(handle_));
-        }
+        // Both Windows paths (direct no-buffering and the buffered fallback)
+        // now hold a Win32 HANDLE, so the close logic converges on CloseHandle.
+        ::CloseHandle(static_cast<HANDLE>(handle_));
         handle_ = nullptr;
     }
     win_crt_ = false;
@@ -299,17 +307,47 @@ int64_t BlockFile::read_at(void *dst, size_t len, uint64_t offset) const {
     if (!win_crt_) {
         return read_direct_aligned(dst, len, offset);
     }
-    FILE *f = static_cast<FILE *>(handle_);
-    // _fseeki64 + fread advance a SHARED, stateful file position on `f`. The
-    // async-prefetch worker and the compute thread can both reach here via
-    // read_blob concurrently, so serialize the seek+read as one atomic
-    // positional read. The POSIX pread path below needs no lock (positional and
-    // stateless). This Windows CRT fallback is not exercised on the Linux CI
-    // sandbox; the lock is a correctness guard for the concurrent streaming
-    // build on Windows.
-    std::lock_guard<std::mutex> lk(win_crt_mu_);
-    if (_fseeki64(f, static_cast<long long>(offset), SEEK_SET) != 0) return -1;
-    return static_cast<int64_t>(std::fread(dst, 1, len, f));
+    if (len == 0) return 0;
+    // Buffered fallback. Read positionally via ReadFile with a per-call
+    // OVERLAPPED whose Offset/OffsetHigh carry `offset`. This is stateless like
+    // POSIX pread: each call carries its own offset, so the async-prefetch
+    // worker and the compute thread can read concurrently with no shared file
+    // position and no lock. Buffered reads serve arbitrary offset/len directly,
+    // so there is no alignment constraint and no bounce buffer; read straight
+    // into dst for exactly len bytes.
+    HANDLE h = static_cast<HANDLE>(handle_);
+    size_t done = 0;
+    while (done < len) {
+        OVERLAPPED ov{};
+        const uint64_t pos = offset + static_cast<uint64_t>(done);
+        ov.Offset = static_cast<DWORD>(pos & 0xFFFFFFFFu);
+        ov.OffsetHigh = static_cast<DWORD>(pos >> 32);
+        DWORD chunk = static_cast<DWORD>(
+            len - done > 0x40000000u ? 0x40000000u : (len - done));
+        DWORD got_now = 0;
+        if (!::ReadFile(h, static_cast<char *>(dst) + done, chunk, &got_now,
+                        &ov)) {
+            DWORD err = ::GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                if (!::GetOverlappedResult(h, &ov, &got_now, TRUE)) {
+                    err = ::GetLastError();
+                    if (err == ERROR_HANDLE_EOF) {
+                        done += got_now;
+                        break;
+                    }
+                    return done > 0 ? static_cast<int64_t>(done) : -1;
+                }
+            } else if (err == ERROR_HANDLE_EOF) {
+                done += got_now;
+                break;
+            } else {
+                return done > 0 ? static_cast<int64_t>(done) : -1;
+            }
+        }
+        if (got_now == 0) break; // EOF
+        done += got_now;
+    }
+    return static_cast<int64_t>(done);
 #else
     if (fd_ < 0) return -1;
     if (backend_ == Backend::kDirect || backend_ == Backend::kIoUring) {
