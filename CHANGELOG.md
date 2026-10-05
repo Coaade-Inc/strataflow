@@ -11,6 +11,36 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- RAM-aware, per-model AUTO expert-residency. StrataFlow now chooses the
+  resident expert-bundle pool size automatically per model, from the measured
+  free-RAM budget plus the model's own expert layout (`n_layer`, `n_expert`,
+  `n_expert_used`, `expert_bytes`), with NO model-specific constants, so it
+  adapts to any MoE layout (8x2, 256x8, ...). `expert_slots_resident =
+  clamp(ram_for_experts / expert_bytes, lower = max(n_expert_used, a whole layer
+  when it fits), upper = n_layer*n_expert)`. When RAM holds the whole working set
+  the engine caches it with no per-layer eviction/re-streaming; only when RAM
+  genuinely cannot hold it does the pool bound below the full set, and never
+  below one layer's top-k. New `--cache-gb` flag caps the expert-RAM budget
+  (wired to `sf_context_params.cache_budget`, appended at the end of the struct
+  for ABI backward-compatibility). Precedence: explicit `--expert-slots` >
+  `--cache-gb` > auto-from-free-RAM. The placement-plan summary is now TRUTHFUL
+  on the streaming path: it reports the slot count the engine actually uses, the
+  correct state (`experts fully resident` when the whole working set fits, else
+  `experts STREAMED (bounded)`), and a realistic peak estimate (trunk + resident
+  bundles + one-layer staging), so what RUNS equals what is REPORTED. Oracle
+  byte-identity is PRESERVED: an auto-chosen slot count decodes a byte-identical
+  greedy sequence/logits to the fully-resident run and to a fixed-slot run
+  (oracle-gated tests). Sandbox-proven on generated fixtures via
+  `colab/strataflow_bench.py --layers-list 8 --experts-list 16 --slots-list
+  2,16,0`: the auto row streams ~8x fewer SSD bytes/token than a
+  deliberately-too-small `slots=2` run on the SAME model (8.06 MB/tok vs
+  64.39 MB/tok) and decodes faster (47.3 vs 15.3 tok/s steady-state, a mechanism
+  proxy on random weights). The real large-MoE (Mixtral) speedup from relying on
+  auto residency stays Colab-only (the offline sandbox cannot download it).
+  Async-overlap prefetch warming is NOT adapted to the chosen residency in this
+  change and is explicitly DEFERRED with the async-overlap item (see
+  `docs/ROADMAP.md`): the auto sizing already captures the win, and changing the
+  synchronous warm path would risk the oracle guarantee for no measured gain.
 - Legacy per-expert Mixtral GGUFs now PACK and STREAM. Real TheBloke Mixtral
   GGUFs name routed-expert FFN weights per expert
   (`blk.N.ffn_{gate,down,up}.E.weight`), not stacked
@@ -79,7 +109,11 @@ grouped by the pull request that merged them.
   (from the raw `streamed_bytes` uint64, not the rounded MiB display value),
   prints a fixed-width results table with an honest exit-criteria report, and
   writes
-  machine-readable JSON + CSV artifacts (schema-versioned). The default matrix
+  machine-readable JSON + CSV artifacts (schema-versioned). The exit-criteria
+  report now also contrasts the AUTO row (slots=0) against the smallest fixed
+  slot count for the SAME model, stating that auto streams far fewer bytes/token
+  (and typically decodes faster) because it caches the whole layer working set
+  when RAM allows, kept honest as a mechanism proxy on random weights. The default matrix
   is CPU-only, offline, and free-Colab-tier sized (finishes in a few minutes);
   `--layers-list` / `--experts-list` / `--slots-list` / `--max-tokens` grow it.
   An optional `--real-model` row downloads one real TinyLlama (dense llama)

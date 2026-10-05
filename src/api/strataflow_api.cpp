@@ -79,6 +79,7 @@ sf_context_params sf_context_default_params(void) {
     p.auto_plan         = 1;
     p.preferred_backend = SF_BACKEND_CPU;
     p.expert_slots      = 0;   // auto (hold the whole expert working set)
+    p.cache_budget      = 0;   // auto (size experts from free RAM)
     return p;
 }
 
@@ -103,13 +104,29 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
     // Honor an explicit expert-slot budget by routing it to the engine via the
     // same env the engine already reads (STRATAFLOW_ENGINE_EXPERT_SLOTS). This
     // keeps load_model's signature stable while making the CLI flag effective.
-    // A caller-set env var still wins if the param is left at auto (0).
+    //
+    // CRITICAL: when the param is AUTO (0) we must CLEAR the env, not leave it
+    // alone. The engine's forward_engine lets this process-global env override
+    // the plan's auto choice, so a stale value from a PRIOR explicit-slots
+    // context in the same process (the C ABI allows many contexts per process)
+    // or a value exported by a parent process would silently make the engine
+    // run a different count than this context's plan reports -- exactly the
+    // "number reported vs number executed" divergence this feature eliminates.
+    // Unsetting here makes plan_expert_slots_ (the auto choice) authoritative on
+    // every auto context. Tests that drive the engine API directly still set
+    // the env themselves, so the test knob is preserved.
     if (params->expert_slots != 0) {
         const std::string v = std::to_string(params->expert_slots);
 #if defined(_WIN32)
         _putenv_s("STRATAFLOW_ENGINE_EXPERT_SLOTS", v.c_str());
 #else
         setenv("STRATAFLOW_ENGINE_EXPERT_SLOTS", v.c_str(), /*overwrite=*/1);
+#endif
+    } else {
+#if defined(_WIN32)
+        _putenv_s("STRATAFLOW_ENGINE_EXPERT_SLOTS", "");
+#else
+        unsetenv("STRATAFLOW_ENGINE_EXPERT_SLOTS");
 #endif
     }
 
@@ -127,8 +144,41 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
     // offload). An explicit budget of 0 means "auto from the profile".
     sf_status st = sf::load_model(params->model_path, ctx->hw,
                                   params->vram_budget, params->ram_budget,
-                                  ctx->model, &ctx->plan);
+                                  ctx->model, &ctx->plan,
+                                  params->cache_budget);
     if (st != SF_OK) return st;
+
+    // Keep the reported plan HONEST under an explicit --expert-slots override:
+    // the engine will run with params.expert_slots (routed via the env above),
+    // so reconcile the plan's resident count + stream flag to that same number
+    // (clamped exactly like the engine: up to n_expert_used, down to the whole
+    // working set) instead of leaving the auto choice in the summary. Precedence
+    // explicit > cache-gb > auto is thus reflected in both what runs AND what is
+    // reported, so the two never diverge (the old misleading-plan-line bug).
+    if (params->expert_slots != 0 && ctx->model != nullptr) {
+        const auto &shape = ctx->model->shape();
+        if (shape.is_moe && shape.n_experts > 0 && shape.n_layers > 0) {
+            const uint32_t full_slots = shape.n_layers * shape.n_experts;
+            uint32_t slots = params->expert_slots;
+            if (slots < shape.n_experts_used) slots = shape.n_experts_used;
+            if (slots > full_slots) slots = full_slots;
+            ctx->plan.expert_slots_resident = slots;
+            ctx->plan.stream_experts = slots < full_slots;
+            // Recompute the peak to match the forced resident count: trunk +
+            // resident bundles + a one-layer staging footprint (same shape as
+            // the planner's own estimate), so the reported peak stays honest.
+            ctx->plan.planned_peak_bytes =
+                shape.trunk_bytes +
+                static_cast<uint64_t>(slots) * shape.expert_bytes +
+                static_cast<uint64_t>(shape.n_experts_used) * shape.expert_bytes;
+        }
+    }
+
+    // Log the AUTHORITATIVE plan summary once, AFTER any explicit-slots
+    // reconciliation above, so the diagnostic line always matches the count the
+    // engine actually runs (plan_placement no longer logs the raw auto value,
+    // which was stale on the explicit-override path).
+    sf::log_info("placement plan: " + ctx->plan.to_summary());
 
     *out_ctx = ctx.release();
     return SF_OK;

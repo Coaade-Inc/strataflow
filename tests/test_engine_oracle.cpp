@@ -28,7 +28,9 @@
 //       tools/testdata/make_tiny_moe_gguf.py /projects/sandbox/moe.gguf
 //   STRATAFLOW_TEST_MOE_GGUF=/projects/sandbox/moe.gguf ctest -R test_engine_oracle
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
+#include "hw/profiler.h"
 #include "model/engine/engine.h"
+#include "plan/planner.h"
 #include "test_util.h"
 
 #include <cmath>
@@ -586,10 +588,147 @@ static void test_engine_kquant_matches_oracle() {
     if (q6k != nullptr && q6k[0] != '\0') run_kquant_oracle(q6k, "Q6_K", 2.5e-1);
 }
 
+// AUTO-path oracle gate (FEAT-002): the RAM-aware slot count the PLANNER picks
+// must sit on the oracle gate exactly like the fully-resident and fixed-slot
+// runs. Decode the SAME prompt + N tokens three ways:
+//   (a) fully-resident (Engine::load(path, 0)),
+//   (b) a fixed small slot count (3, below the fixture's 8 experts/layer),
+//   (c) the AUTO slot count plan_placement() chooses for a representative
+//       hardware profile on the fixture's own ModelShape.
+// The token SEQUENCE and per-step logits must be byte-identical across (a),
+// (b), (c) and match the libllama oracle (F32 tol < 1e-3). This proves the auto
+// policy changes only HOW MANY/WHEN experts are resident, never which bytes
+// compute.
+static void test_engine_auto_slots_matches_oracle() {
+    const char *path = std::getenv("STRATAFLOW_TEST_MOE_GGUF");
+    if (path == nullptr || path[0] == '\0') {
+        std::printf("[skipped: set STRATAFLOW_TEST_MOE_GGUF] ");
+        return;
+    }
+
+    const std::string prompt = "hello world";
+    const int n_generate = 8;
+
+    // Oracle sequence (the hard gate all three engine runs must reproduce).
+    std::vector<int32_t> oracle_tokens;
+    std::vector<std::vector<float>> oracle_step_logits;
+    CHECK(engine::run_oracle_sequence(path, prompt, n_generate, oracle_tokens,
+                                      &oracle_step_logits));
+    CHECK_EQ(oracle_tokens.size(), static_cast<size_t>(n_generate));
+    if (oracle_tokens.size() != static_cast<size_t>(n_generate)) return;
+
+    // Compute the AUTO slot count the planner picks for this fixture's shape.
+    // The tiny MoE is 2 layers x 8 experts, top-2. Under a tiny forced
+    // expert-RAM cap the policy must choose a BOUNDED count (< full_slots=16,
+    // >= n_experts_used=2) so the auto path actually exercises eviction here.
+    sf::ModelShape shape;
+    shape.name = "tiny-moe-fixture";
+    shape.n_layers = 2;
+    shape.is_moe = true;
+    shape.n_experts = 8;
+    shape.n_experts_used = 2;
+    shape.trunk_bytes = 1 * 1024 * 1024;
+    shape.expert_bytes = 1 * 1024 * 1024;  // 1 MiB per bundle (shape-only sizing)
+    shape.total_bytes = shape.trunk_bytes +
+        static_cast<uint64_t>(shape.n_experts) * shape.n_layers * shape.expert_bytes;
+
+    sf::HardwareProfile hw;
+    hw.ram_total_bytes = 16ull * 1024 * 1024 * 1024;
+    hw.ram_free_bytes = 14ull * 1024 * 1024 * 1024;
+    // Cap expert RAM to ~4 bundles so the auto choice is bounded below the
+    // 16-bundle working set (forces eviction, like a small machine would).
+    const uint64_t cache_budget = 4 * shape.expert_bytes;
+    sf::PlacementPlan plan =
+        sf::plan_placement(hw, shape, /*vram=*/0, /*ram=*/0, cache_budget);
+    const uint32_t full_slots =
+        static_cast<uint32_t>(uint64_t(shape.n_layers) * shape.n_experts);
+    const uint32_t auto_slots = plan.expert_slots_resident;
+    CHECK(auto_slots > 0);
+    CHECK(auto_slots < full_slots);                 // bounded for this profile
+    CHECK(auto_slots >= shape.n_experts_used);       // top-k always fits
+    CHECK(plan.stream_experts);                      // eviction will happen
+
+    // Decode three ways: (a) fully resident, (b) fixed small, (c) auto.
+    engine::EngineCacheStats full_stats{}, fixed_stats{}, auto_stats{};
+    std::vector<std::vector<float>> full_logits, fixed_logits, auto_logits;
+    std::vector<int32_t> full_tokens = engine_decode_sequence(
+        path, prompt, n_generate, /*slots=*/0, full_stats, full_logits);
+    std::vector<int32_t> fixed_tokens = engine_decode_sequence(
+        path, prompt, n_generate, /*slots=*/3, fixed_stats, fixed_logits);
+    std::vector<int32_t> auto_tokens = engine_decode_sequence(
+        path, prompt, n_generate, auto_slots, auto_stats, auto_logits);
+
+    CHECK_EQ(full_tokens.size(), static_cast<size_t>(n_generate));
+    CHECK_EQ(fixed_tokens.size(), static_cast<size_t>(n_generate));
+    CHECK_EQ(auto_tokens.size(), static_cast<size_t>(n_generate));
+
+    // (a) HARD gate: auto sequence == fixed == full == oracle.
+    bool seq_match = auto_tokens.size() == oracle_tokens.size();
+    for (size_t i = 0; i < auto_tokens.size() && i < oracle_tokens.size(); ++i) {
+        CHECK_EQ(auto_tokens[i], oracle_tokens[i]);
+        CHECK_EQ(auto_tokens[i], full_tokens[i]);
+        CHECK_EQ(auto_tokens[i], fixed_tokens[i]);
+        if (auto_tokens[i] != oracle_tokens[i] ||
+            auto_tokens[i] != full_tokens[i] ||
+            auto_tokens[i] != fixed_tokens[i]) {
+            seq_match = false;
+        }
+    }
+
+    // (b) auto logits byte-identical to the fully-resident run (same bytes,
+    // same ops; the slot count changes only WHEN experts become resident).
+    double max_af = 0.0;
+    const size_t steps = full_logits.size() < auto_logits.size()
+                             ? full_logits.size()
+                             : auto_logits.size();
+    for (size_t s = 0; s < steps; ++s) {
+        const size_t n = full_logits[s].size() < auto_logits[s].size()
+                             ? full_logits[s].size()
+                             : auto_logits[s].size();
+        for (size_t i = 0; i < n; ++i) {
+            const double d = std::fabs(static_cast<double>(full_logits[s][i]) -
+                                       static_cast<double>(auto_logits[s][i]));
+            if (d > max_af) max_af = d;
+        }
+    }
+
+    // (c) auto logits vs the oracle within the F32 tolerance.
+    double max_ao = 0.0;
+    const size_t osteps = oracle_step_logits.size() < auto_logits.size()
+                              ? oracle_step_logits.size()
+                              : auto_logits.size();
+    for (size_t s = 0; s < osteps; ++s) {
+        const size_t n = oracle_step_logits[s].size() < auto_logits[s].size()
+                             ? oracle_step_logits[s].size()
+                             : auto_logits[s].size();
+        for (size_t i = 0; i < n; ++i) {
+            const double d = std::fabs(
+                static_cast<double>(oracle_step_logits[s][i]) -
+                static_cast<double>(auto_logits[s][i]));
+            if (d > max_ao) max_ao = d;
+        }
+    }
+
+    std::printf("[auto slots=%u (full=%u) seq match=%s auto-vs-full|delta|=%.3e "
+                "auto-vs-oracle|delta|=%.3e auto(hits=%llu miss=%llu evict=%llu)] ",
+                auto_slots, full_slots, seq_match ? "yes" : "no", max_af, max_ao,
+                static_cast<unsigned long long>(auto_stats.hits),
+                static_cast<unsigned long long>(auto_stats.misses),
+                static_cast<unsigned long long>(auto_stats.evictions));
+
+    CHECK(seq_match);
+    CHECK(max_af == 0.0);     // auto vs fully-resident: bit-for-bit identical
+    CHECK(max_ao < 1e-3);     // auto vs oracle: within F32 tolerance
+    // The bounded auto pool actually evicted (it is below the working set).
+    CHECK(auto_stats.evictions > 0);
+    CHECK(auto_stats.resident_bytes() < auto_stats.full_bytes);
+}
+
 static void run_all() {
     RUN(test_engine_matches_oracle);
     RUN(test_engine_sequence_matches_oracle);
     RUN(test_engine_bounded_pool_byte_identical);
+    RUN(test_engine_auto_slots_matches_oracle);
     RUN(test_engine_prefetch_hit_rate);
     RUN(test_engine_dense_matches_oracle);
     RUN(test_engine_quant_matches_oracle);

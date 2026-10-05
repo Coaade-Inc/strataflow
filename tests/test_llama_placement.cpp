@@ -85,14 +85,12 @@ static void test_small_gpu_big_moe_offloads_experts() {
     CHECK(!p.expert_override_pattern.empty());
 }
 
-// (c) GPU big enough to hold the whole model => no streaming and every expert
-// Even with a huge GPU, the current engine (EC-5, CPU) ALWAYS streams MoE
-// experts through the bounded per-layer staging buffer - it never holds the
-// whole expert set resident. So the planner marks MoE as streamed regardless of
-// VRAM, and the derived placement still pins trunk layers on the GPU. (A future
-// GPU-resident path that keeps all experts in VRAM when they fit is tracked in
-// docs/ROADMAP.md; when it lands, this test gains a non-streaming branch.)
-static void test_huge_gpu_still_streams_experts() {
+// (c) When memory comfortably holds the WHOLE expert working set, the RAM-aware
+// policy keeps every expert bundle resident (no per-layer eviction/re-stream):
+// expert_slots_resident == n_layer*n_expert and stream_experts == false (the
+// Mixtral-on-Colab win). The derived placement still pins trunk layers on the
+// GPU, and with every expert fitting in VRAM there is no expert CPU-offload.
+static void test_huge_memory_holds_whole_working_set() {
     HardwareProfile hw;
     hw.ram_total_bytes = 128 * GiB;
     hw.ram_free_bytes = 120 * GiB;
@@ -102,10 +100,14 @@ static void test_huge_gpu_still_streams_experts() {
     hw.gpus.push_back(gpu(m.total_bytes + 32 * GiB));
 
     PlacementPlan plan = plan_placement(hw, m, /*vram=*/0, /*ram=*/0);
-    CHECK(plan.stream_experts);                // MoE always streams today
+    const uint32_t full_slots =
+        static_cast<uint32_t>(uint64_t(m.n_layers) * m.n_experts);
+    CHECK_EQ(plan.expert_slots_resident, full_slots);  // whole working set held
+    CHECK(!plan.stream_experts);                        // no eviction/re-stream
 
     LlamaPlacement p = derive_llama_placement(plan, m, hw.gpus);
     CHECK(p.n_gpu_layers > 0);                 // trunk still pinned on the GPU
+    CHECK(!p.offload_experts_to_cpu);          // every expert fits in VRAM
 }
 
 // A dense model never gets an expert override regardless of VRAM pressure
@@ -139,7 +141,7 @@ static void test_ngl_clamped_to_layers() {
 static void run_all() {
     RUN(test_no_gpu_is_cpu_only);
     RUN(test_small_gpu_big_moe_offloads_experts);
-    RUN(test_huge_gpu_still_streams_experts);
+    RUN(test_huge_memory_holds_whole_working_set);
     RUN(test_dense_never_offloads_experts);
     RUN(test_ngl_clamped_to_layers);
 }

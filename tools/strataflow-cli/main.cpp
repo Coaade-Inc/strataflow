@@ -32,10 +32,12 @@ void print_usage(const char *argv0) {
         "  --prompt TEXT      prompt text (or pass after --)\n"
         "  --vram-gb X        VRAM budget in GiB (0 = auto)\n"
         "  --ram-gb X         RAM budget in GiB (0 = auto)\n"
-        "  --cache-gb X       (reserved) expert-cache RAM budget in GiB\n"
+        "  --cache-gb X       cap resident expert RAM to X GiB (0 = auto from\n"
+        "                     free RAM). Caps the auto slot choice.\n"
         "  --expert-slots N   bound streamed experts to N bundles (0 = auto;\n"
         "                     a value below the model's expert count forces\n"
-        "                     bounded streaming - run a big model in little RAM)\n"
+        "                     bounded streaming - run a big model in little RAM).\n"
+        "                     Precedence: --expert-slots > --cache-gb > auto.\n"
         "  --max-tokens N     generation cap (default 64)\n"
         "  --plan             print the placement plan and exit\n"
         "  --version          print version and exit\n"
@@ -113,7 +115,7 @@ int main(int argc, char **argv) {
     params.vram_budget  = gib(vram_gb);
     params.ram_budget   = gib(ram_gb);
     params.expert_slots = expert_slots;
-    (void)cache_gb;  // reserved: byte-budget -> slot derivation lands with the planner wiring
+    params.cache_budget = gib(cache_gb);  // 0 = auto; caps the auto slot choice
 
     sf_context *ctx = nullptr;
     sf_status st = sf_context_create(&params, &ctx);

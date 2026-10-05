@@ -65,7 +65,8 @@ public:
 // so the C API can describe exactly what was decided.
 sf_status load_model(const std::string &path, const HardwareProfile &hw,
                      uint64_t vram_budget, uint64_t ram_budget,
-                     std::unique_ptr<Model> &out, PlacementPlan *out_plan);
+                     std::unique_ptr<Model> &out, PlacementPlan *out_plan,
+                     uint64_t cache_budget = 0);
 
 // Phase 1b/2 llama.cpp backend. Loads a GGUF file via the llama.cpp C API and
 // implements the Model interface with real tokenize/detokenize and a real
@@ -81,6 +82,7 @@ sf_status load_model(const std::string &path, const HardwareProfile &hw,
 // leaves `out` untouched -- load_model() then substitutes the dry-run model.
 sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
                           uint64_t vram_budget, uint64_t ram_budget,
-                          std::unique_ptr<Model> &out, PlacementPlan *out_plan);
+                          std::unique_ptr<Model> &out, PlacementPlan *out_plan,
+                          uint64_t cache_budget = 0);
 
 } // namespace sf
