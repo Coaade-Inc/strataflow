@@ -187,6 +187,11 @@ bool pack_gguf_to_strata(const std::string &in_path,
     // refuse to write an OOM-bomb .strata and emit an actionable diagnostic
     // that names the declared counts and lists a few of the tensor names
     // actually seen, so an operator can see WHY the match failed.
+    //
+    // Scope: this cross-check targets the TOTAL-MISS case (metadata declares a
+    // MoE but zero expert tensors were classified), which is the condition that
+    // produced the real-Mixtral fully-resident OOM. A PARTIAL misclassification
+    // (some expert tensors matched, some did not) is out of scope here.
     if (meta_expert_count > 0 && experts.empty()) {
         std::string sample;
         int shown = 0;

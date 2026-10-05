@@ -42,7 +42,29 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#  include <process.h>
+#else
+#  include <unistd.h>
+#endif
+
 using namespace sf;
+
+// A temp filename in the current working directory (the test's build tree,
+// inside the workspace), never an absolute path or /tmp - matches the repo
+// convention in tests/test_async_io.cpp so the test is portable across runners
+// (CI, the GitHub Actions matrix, dev boxes) where /projects/sandbox/ may be
+// absent or read-only. Unique per process so parallel ctest runs don't collide.
+static std::string temp_filename(const char *stem) {
+    return std::string(stem) + "_" +
+           std::to_string(
+#if defined(_WIN32)
+               static_cast<unsigned long>(_getpid())
+#else
+               static_cast<unsigned long>(::getpid())
+#endif
+               );
+}
 
 static int32_t argmax(const std::vector<float> &v) {
     int32_t best = 0;
@@ -258,8 +280,11 @@ static bool write_misnamed_moe_gguf(const std::string &path) {
 // misnamed must make pack_gguf_to_strata return false with a non-empty err
 // that names the declared expert count - NOT silently emit a 0-expert .strata.
 static void test_pack_fails_loudly_on_misclassified_moe() {
-    const std::string gguf_path = "/projects/sandbox/misnamed_moe.gguf";
-    const std::string strata_path = "/projects/sandbox/misnamed_moe.strata";
+    // CWD-relative temp files (build tree, inside the workspace), NOT an
+    // absolute /projects/sandbox/ path: the fixture is synthesized here and
+    // removed below via std::remove, matching tests/test_async_io.cpp.
+    const std::string gguf_path = temp_filename("sf_misnamed_moe") + ".gguf";
+    const std::string strata_path = temp_filename("sf_misnamed_moe") + ".strata";
     std::remove(strata_path.c_str());
 
     const bool wrote = write_misnamed_moe_gguf(gguf_path);
