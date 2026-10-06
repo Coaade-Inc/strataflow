@@ -63,10 +63,19 @@ buys speed, not capability - the output is identical at every memory size.**
   budget and `--expert-slots` overrides the choice (precedence: `--expert-slots`
   > `--cache-gb` > auto-from-free-RAM).
 - **A streaming-friendly model format** (`.strata`) built from standard GGUF, so
-  one file holds the always-resident trunk plus aligned per-expert blobs.
-- **Prediction-driven prefetch** (in progress): guess the next layer's experts
-  and load them while the current layer computes, so disk reads hide behind
-  compute.
+  one file holds the always-resident trunk plus aligned per-expert blobs. The
+  packer also handles **real Mixtral GGUFs that use the legacy per-expert tensor
+  layout** (`blk.N.ffn_{gate,down,up}.E.weight`): `strata-pack` groups them into
+  the stacked `.strata` expert region (verbatim bytes, no requant) and
+  synthesizes the stacked metadata, so a real downloaded Mixtral packs and runs.
+- **Prediction-driven prefetch with async overlap.** The router read-back feeds
+  a predictor, and a background I/O worker loads the next layer's predicted
+  experts while the current layer computes, so disk reads hide behind compute.
+  The synchronous load stays the authoritative backstop, so decode is
+  byte-identical to the oracle even under eviction; ggml compute stays
+  single-threaded (only an I/O thread is added), the path is thread-safe /
+  TSan-clean, and the overlap is default-ON (`--async-prefetch on|off`) with a
+  `completed-before-use` overlap metric surfaced on the stats line.
 
 Primary goal: run **Coaade Inc.'s models** fast and locally. The public
 [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c) project (which runs
@@ -141,36 +150,73 @@ Also shipped since the engine core (see [`CHANGELOG.md`](CHANGELOG.md) and
   staging to one layer's footprint, so peak RSS no longer tracks model size: a
   785 MiB model runs in 132 MiB peak RSS, and a 1177 MiB model also runs in
   132 MiB (peak RSS flat as on-disk size grows) (#27).
+- **Legacy per-expert Mixtral packing** - real TheBloke Mixtral GGUFs name
+  routed experts per expert (`blk.N.ffn_{gate,down,up}.E.weight`) rather than
+  stacked `_exps`; `strata-pack` now recognizes the legacy names, groups them
+  per `(layer, expert)` into the stacked `.strata` layout (verbatim bytes, no
+  requant) and synthesizes stacked metadata, so a real Mixtral packs and runs.
+  The engine, reader, format and `mul_mat_id` addressing are unchanged (they
+  still see only stacked names), and the legacy-sourced `.strata` decodes
+  byte-identically to the oracle on generated legacy fixtures (incl. a Q3_K
+  variant mirroring real Mixtral Q3_K_M) (#34).
+- **Async prefetch overlap** - a background I/O worker loads the next layer's
+  predicted experts while the current layer computes, hiding disk-read latency
+  on the bounded streaming path. The synchronous load stays the authoritative
+  backstop (a mispredicted or in-flight prefetch is a plain miss corrected
+  inline), so decode is byte-identical to the oracle even under eviction; ggml
+  compute stays single-threaded (only an I/O thread is added), the worker never
+  touches the non-thread-safe slot pool (thread-safe / TSan-clean), the overlap
+  is default-ON (`--async-prefetch on|off`), and a `completed-before-use`
+  overlap metric is surfaced via the stats line. In-sandbox the mechanism is
+  proven (`completed-before-use` goes from 0 with async off to > 0 with async
+  on, byte-identical output); absolute wall-clock speedup is hardware-dependent
+  and re-verified on Colab / real Mixtral (#36).
 - **Benchmark harness with real numbers** - reports measured tok/s, TTFT, peak
   RSS, resident weights, on-disk size and bytes-per-token across a config
   matrix, with JSON/CSV artifacts (#31).
-- **A real DOWNLOADED quantized model runs end to end** via the Colab flow:
-  download a GGUF, pack to `.strata`, decode bounded. A dense TinyLlama is proven
-  on the free tier; a real llama-arch MoE (Mixtral) runs the same path but is
-  disk-bound on the free tier, so it is Colab-demonstrated.
+- **Real downloaded models run end to end** via the Colab flow: download a GGUF,
+  pack to `.strata`, decode bounded. A real quantized **dense** model
+  (TinyLlama-1.1B-Chat Q4_K_M) and a real large quantized **MoE**
+  (Mixtral-8x7B-Instruct Q3_K_M, ~19 GB on disk) have both run end to end
+  through StrataFlow on a free Colab CPU box (12 GB RAM, no GPU) with coherent
+  output - the "big model, small RAM, no GPU" proof on a real large MoE. This is
+  demonstrated on Colab / real hardware (the offline sandbox and CI cannot
+  download multi-GB models); free-tier throughput was initially disk-bound,
+  which is exactly what the auto-residency and async-prefetch work targets, so
+  the large-MoE result is framed as "runs end to end, bounded RAM, coherent
+  output; throughput improvements from auto residency + async prefetch are being
+  measured on real hardware" rather than a settled tok/s number.
 
 In progress / next (see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full,
 honest list of what is done and what is open):
 
-- **Capture real large-MoE numbers end to end** - the mechanism is proven and a
-  real dense model runs through it, but running a real *large MoE* (vs dense) end
-  to end with captured tok/s + peak RSS is still Colab/hardware-demonstrated, not
-  sandbox/CI-proven.
-- **Broaden quant coverage** - the IQ quant families are not yet validated.
+- **Capture settled real large-MoE throughput** - the real Mixtral MoE runs end
+  to end with bounded RAM and coherent output, but the throughput gains from
+  auto residency + async prefetch are still being measured on real hardware
+  (Colab / real-Mixtral), not pinned to a product tok/s number in the offline
+  sandbox/CI.
+- **Broaden quant coverage** - the IQ quant families are not yet validated
+  (Q8_0 and the K-quants Q4_K/Q6_K are).
 - **More architectures** - Qwen2-MoE and DeepSeek-MoE are different, unimplemented
   architectures; only llama-arch MoE and dense llama are supported today.
-- GPU / multi-backend execution (optional accelerator; needs GPU hardware to
-  validate) and async prefetch overlap.
+- **GPU / multi-backend execution** - optional accelerator, structurally
+  reachable but needs real GPU hardware to validate (not required for the no-GPU
+  mission).
 - **Release engineering** - no release tag and no OpenAI-compatible HTTP server
-  front-end yet; only the CLI is wired to the engine.
+  front-end yet; only the CLI is wired to the engine. Speculative decoding and
+  the low-bit CPU kernels (Phases 5-6) are not started.
 
 > **Honest status:** the engine works on CPU with the bounded-RAM mechanism
-> proven, quantized weights (incl. K-quant) validated, a memory-budget CLI and a
-> benchmark harness shipping real numbers, and a real downloaded quantized model
-> running end to end via Colab. Still open: capturing real *large-MoE* numbers
-> (Colab/HW-demonstrated, not sandbox-proven), IQ-quant validation, non-llama MoE
-> architectures, GPU backends (need hardware), and a release tag / HTTP server.
-> See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`CHANGELOG.md`](CHANGELOG.md).
+> proven, quantized weights (Q8_0 + K-quant Q4_K/Q6_K) validated, legacy and
+> stacked Mixtral expert layouts both packing and streaming, async prefetch
+> overlap shipped (default-ON), a memory-budget CLI with per-model auto
+> residency, a benchmark harness shipping real numbers, and both a real dense
+> model and a real ~19 GB Mixtral MoE running end to end on a free Colab CPU box
+> (no GPU, coherent output). Still open: pinning settled real large-MoE
+> throughput (Colab/HW-demonstrated, not sandbox-proven), IQ-quant validation,
+> non-llama MoE architectures, GPU backends (need hardware), and a release tag /
+> HTTP server. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and
+> [`CHANGELOG.md`](CHANGELOG.md).
 
 See [`docs/ENGINE_CORE_DESIGN.md`](docs/ENGINE_CORE_DESIGN.md) for the engine
 design and the EC-1..EC-7 breakdown, and [`docs/PLAN.md`](docs/PLAN.md) for the
