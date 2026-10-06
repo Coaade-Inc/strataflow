@@ -74,13 +74,26 @@ per second). RAM size does not cap what you can run.
   resident expert memory is bounded to what a token actually uses, not the whole
   layer.
 - **Automatic hardware tuning.** It profiles your machine on first run and
-  decides what goes where. No hand-tuning placement flags.
+  decides what goes where, with no hand-tuning placement flags. Expert residency
+  is auto-sized per model from your measured free RAM plus the model's own expert
+  layout (no model-specific constants, so it adapts to any MoE shape): when RAM
+  holds the whole working set it caches it, and when it cannot, residency is
+  bounded (never below one layer's top-k). A `--cache-gb` budget caps it and
+  `--expert-slots` overrides it, with precedence `--expert-slots` > `--cache-gb`
+  > auto-from-free-RAM.
 - **A streaming-friendly model format (`.strata`).** Built from standard GGUF,
   one file holds the always-resident trunk plus aligned per-expert blobs for
-  fast per-expert reads.
-- **Predictor-driven prefetch.** The router read-back feeds a predictor that
-  warms the next layer's likely experts into the cache ahead of use, raising the
-  cache hit rate without changing results.
+  fast per-expert reads. The packer handles both the stacked `_exps` expert
+  layout and the legacy per-expert layout that real Mixtral GGUFs use
+  (`blk.N.ffn_{gate,down,up}.E.weight`), grouping the legacy tensors into the
+  stacked `.strata` region with no requant, so a real downloaded Mixtral packs
+  and runs.
+- **Predictor-driven prefetch with async overlap.** The router read-back feeds a
+  predictor, and a background I/O worker loads the next layer's predicted experts
+  while the current layer computes, so disk reads hide behind compute. The
+  synchronous load stays the authoritative backstop, so results do not change and
+  stay byte-identical to the reference engine even under eviction; compute stays
+  single-threaded (only an I/O thread is added) and the overlap is on by default.
 
 ## Proof points (measured)
 
@@ -94,14 +107,27 @@ StrataFlow's correctness and bounded-RAM behavior are measured, not asserted:
   as the on-disk model grows.
 - **Quantized weights validated.** Q8_0 and the K-quant families Q4_K/Q6_K are
   validated against the oracle (identical greedy token sequence) and stream
-  through the `.strata` path.
+  through the `.strata` path. The IQ families are the remaining quant-coverage
+  gap.
+- **Both Mixtral expert layouts stream.** Real Mixtral GGUFs use a legacy
+  per-expert tensor layout as well as the stacked form; the packer handles both,
+  so a real downloaded Mixtral packs into `.strata` and streams, decoding
+  byte-identically to the reference on the matched model.
 - **A benchmark harness reports real numbers** - tokens per second, time to
   first token, peak RSS, resident weights and bytes per token - across a matrix
   of model sizes and memory budgets.
+- **Real models run end to end on free hardware.** A real quantized dense model
+  (TinyLlama-1.1B-Chat Q4_K_M) and a real large quantized MoE
+  (Mixtral-8x7B-Instruct Q3_K_M, about 19 GB on disk) have both run end to end
+  through StrataFlow on a free Colab CPU box (12 GB RAM, no GPU) with coherent
+  output - the "big model, small RAM, no GPU" proof on a real large MoE.
 
-The bounded-RAM mechanism is proven, and a real downloaded quantized model runs
-end to end through it. Numbers for a real *large* MoE are being gathered on real
-hardware; see Current status.
+The bounded-RAM mechanism is proven, and both a real dense model and a real
+large MoE run end to end through it on real hardware. Free-tier throughput on
+the large MoE was initially disk-bound (exactly what the auto-residency and
+async-prefetch work targets), so the large-MoE result is "runs end to end,
+bounded RAM, coherent output; throughput improvements are being measured on real
+hardware", not a settled tokens-per-second number. See Current status.
 
 ## Who it is for
 
@@ -122,24 +148,35 @@ Windows:
 - Bounded per-expert streaming from the `.strata` format, with peak RAM proven
   flat as on-disk model size grows.
 - Quantized-weight support validated for Q8_0 and K-quant Q4_K/Q6_K.
+- Both the stacked and the legacy per-expert Mixtral expert layouts packing and
+  streaming, so a real downloaded Mixtral runs.
+- Per-model automatic expert residency sized from free RAM plus the model's own
+  expert layout, with a `--cache-gb` cap and an `--expert-slots` override.
+- Async prefetch overlap (default-ON): a background I/O worker hides disk reads
+  behind compute while output stays byte-identical to the reference.
 - A memory-budget knob plus resident/peak-RSS reporting.
 - A benchmark harness that emits real tok/s, TTFT, peak RSS and bytes-per-token.
-- A real downloaded quantized model running end to end via the Colab guide
-  (a dense TinyLlama proven on free Colab).
+- Real downloaded models running end to end via the Colab guide: a real
+  quantized dense model (TinyLlama Q4_K_M) and a real large quantized MoE
+  (Mixtral-8x7B-Instruct Q3_K_M, about 19 GB on disk) have both run on a free
+  12 GB Colab CPU box, no GPU, with coherent output.
 
 Honest open items:
 
-- Running a real *large* MoE (as opposed to dense) end to end with captured
-  numbers is demonstrated on Colab/real hardware, not yet proven in the offline
-  test sandbox.
-- The IQ quantization families are not yet validated.
+- Settled throughput for the real large MoE is still being measured on real
+  hardware. It runs end to end with bounded RAM and coherent output, and
+  free-tier throughput was initially disk-bound (what auto residency and async
+  prefetch target), so there is no settled tokens-per-second product number yet.
+- The IQ quantization families are not yet validated (Q8_0 and K-quant
+  Q4_K/Q6_K are).
 - Other MoE architectures (Qwen2-MoE, DeepSeek-MoE) are not yet implemented;
   only llama-arch MoE and dense llama are supported today.
 - GPU backends are structurally reachable but need real GPU hardware to
   validate.
 - No tagged release and no OpenAI-compatible HTTP server front-end yet.
 
-The mechanism is proven; real large-model numbers are being gathered.
+The mechanism is proven on real hardware; settled real large-model throughput is
+being measured.
 
 ## Platforms
 
