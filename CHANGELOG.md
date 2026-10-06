@@ -11,6 +11,48 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- Layer-stratified residency + prefetch gating (fewer SSD bytes streamed per
+  token; async prefetch no longer hurts). Two composing levers on the
+  bounded-RAM streaming path, both oracle byte-identical and adaptive to model
+  shape with NO machine-specific constants. LEVER B: the single GLOBAL plain-LRU
+  `SlotPool` is replaced by LAYER-STRATIFIED, frequency-aware per-layer
+  residency. Each layer gets its own LRU scope and a shape-derived capacity
+  (`base = n_slots / n_layer`, floored at a single layer's top-k, spare slots
+  distributed by observed per-layer routing frequency from the predictor), so a
+  layer's hot experts survive across tokens instead of being evicted by the
+  intervening layers' per-token sweep. The TOTAL slot budget the planner chose
+  is UNCHANGED (peak RSS stays bounded by `n_slots * slot_bytes`); only how the
+  slots are partitioned and evicted changes. The fully-resident fast path
+  (`n_slots >= n_layer * n_expert`) is preserved exactly (no eviction). LEVER A:
+  async prefetch is GATED so it can never increase bytes streamed - a completed
+  speculative read is installed ONLY into a genuinely FREE per-layer slot
+  (`SlotPool::has_free_slot_in_layer`), so a prefetch never evicts a
+  still-needed authoritative resident; and the worker SELF-BACKS-OFF (quiesces,
+  stops issuing speculative reads) once the observed `completed-before-use` rate
+  stays ~0 over a shape-derived window. The authoritative
+  `ensure_layer_experts_resident` is UNCHANGED (it still acquires exactly the
+  router-selected experts before the matmul, so byte provenance / graph order /
+  decoded output are identical); the ggml compute path stays single-threaded
+  (one background I/O thread that never mutates the pool); the default-ON async
+  toggle and the `streamed_bytes` + `prefetch_warmed/used/completed_before_use`
+  stats are intact. Sandbox-proven on generated multi-layer fixtures: at the
+  shape-derived tight budget (`bench_moe-L8-E16`, slots=32 = `n_layer *
+  n_expert_used`, async off) layer-stratified residency streams 327,155,712 vs
+  the old global LRU's 522,190,848 bytes (37.3% fewer, 35.8% fewer misses) at
+  identical 132.4 MiB peak RSS, byte-identical decode; and at a bounded slots=24,
+  async-on streams 46,792,704 bytes/tok vs async-off 61,341,696 (0.76x, async-on
+  <= async-off, byte-identical decoded text), reversing the earlier bounded-slot
+  regression where async-on streamed ~1.48x MORE than async-off. The
+  streamed-bytes/token reduction, byte-identity, and prefetch-no-longer-hurts
+  invariant are SANDBOX-PROVEN; the absolute wall-clock tok/s on the real ~19 GB
+  Mixtral stays COLAB-ONLY (`completed-before-use` stays ~0 on fast sandbox CPUs,
+  mirroring 2-core Colab, so the overlap wall-clock win is hardware-dependent -
+  per the project steer, no tok/s target is promised). `colab/strataflow_bench.py`
+  surfaces the async on-vs-off `<=` relationship directly, and
+  `colab/README.md` carries the exact real-Mixtral before/after re-verify
+  commands (RUN A/RUN B auto vs small fixed residency; RUN C/RUN D async on vs
+  off; run on current `main` before and this branch after and compare streamed
+  MiB / bytes-per-token). `docs/ROADMAP.md` records the lever as done.
 - Async/overlapped expert prefetch (hide disk reads behind compute). A dedicated
   background I/O worker thread now loads the next layer's predicted experts off
   disk CONCURRENTLY with the current layer's ggml compute, so read latency hides

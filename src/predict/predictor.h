@@ -26,6 +26,13 @@ public:
     // Fraction of past predictions that were later confirmed by observe().
     double accuracy() const;
 
+    // Per-layer total observed routing activity (sum of expert activations in
+    // the layer). Drives the layer-stratified SlotPool's spare-slot
+    // distribution (FEAT-002): busier layers get the spare slots. The returned
+    // vector has one entry per layer; all zero until decoding has observed
+    // routes.
+    std::vector<uint64_t> layer_activity() const;
+
 private:
     uint32_t n_layers_;
     uint32_t n_experts_;

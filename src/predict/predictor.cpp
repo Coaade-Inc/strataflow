@@ -43,4 +43,14 @@ double ExpertPredictor::accuracy() const {
     return predicted_ ? double(confirmed_) / double(predicted_) : 0.0;
 }
 
+std::vector<uint64_t> ExpertPredictor::layer_activity() const {
+    std::vector<uint64_t> out(n_layers_, 0);
+    for (uint32_t l = 0; l < n_layers_; ++l) {
+        uint64_t sum = 0;
+        for (uint64_t c : freq_[l]) sum += c;
+        out[l] = sum;
+    }
+    return out;
+}
+
 } // namespace sf

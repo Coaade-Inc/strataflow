@@ -560,10 +560,15 @@ def _print_async_on_vs_off_contrast(gen_ok):
     async=off, print them side by side so a reader sees the mechanism directly:
       - streamed bytes/token: the AUTHORITATIVE experts loaded are identical
         either way (ensure_layer_experts_resident is unchanged), so the DECODED
-        TEXT is byte-identical on vs off - the invariant to confirm. Note the
-        streamed-bytes COUNTER can be HIGHER with async on, because the
-        background worker issues speculative reads that race eviction at a tight
-        slot count; that is extra I/O work, not a correctness change.
+        TEXT is byte-identical on vs off - the invariant to confirm. With the
+        FEAT-003 free-slot install gating + self-backoff, async on no longer
+        increases the streamed-bytes counter at a bounded slot count: a
+        completed prefetch is only installed into a genuinely free per-layer
+        slot (never evicting a still-needed resident), and when the observed
+        overlap stays ~0 the worker backs off and stops issuing speculative
+        reads. So async-on streamed bytes/token is now <= async-off at a tight
+        slot count, reversing the earlier behavior where speculative reads
+        racing eviction made it HIGHER.
       - completed-before-use (cbu): 0 when off (the warm is inline, not
         overlapped) and > 0 when on IF the worker finished a predicted read
         before the layer needed it. A nonzero cbu on the ON row is the overlap
@@ -592,7 +597,10 @@ def _print_async_on_vs_off_contrast(gen_ok):
     print("is completed-before-use (cbu): experts the background I/O worker read")
     print("and installed BEFORE the layer's acquire needed them (0 when off).")
     print("Absolute decode tok/s is hardware-dependent (tiny sandbox CPU => tiny")
-    print("compute window to hide reads behind); the mechanism is cbu > 0:")
+    print("compute window to hide reads behind); the mechanism is cbu > 0.")
+    print("With the FEAT-003 install gating + self-backoff, async-on streamed")
+    print("bytes/token is now <= async-off at a bounded slot count (prefetch no")
+    print("longer evicts a needed resident and backs off when it cannot overlap):")
     for (model, slots), v in sorted(contrasted.items()):
         on, off = v["on"], v["off"]
         slots_s = "auto" if slots == 0 else str(slots)
@@ -605,10 +613,18 @@ def _print_async_on_vs_off_contrast(gen_ok):
         used_on = on.get("prefetch_used")
         print(f"      completed-before-use: on={_fmt(cbu_on)} "
               f"off={_fmt(cbu_off)} (of prefetch_used={_fmt(used_on)} on 'on')")
-        print(f"      streamed bytes/tok:   on={_fmt(on['bytes_per_token'], '{:.0f}')} "
-              f"off={_fmt(off['bytes_per_token'], '{:.0f}')} "
-              f"(authoritative experts identical; 'on' may read more "
-              f"speculatively)")
+        on_bpt = on.get("bytes_per_token")
+        off_bpt = off.get("bytes_per_token")
+        rel = ""
+        if isinstance(on_bpt, (int, float)) and isinstance(off_bpt, (int, float)):
+            if off_bpt > 0:
+                rel = f" => on is {on_bpt / off_bpt:.2f}x off (on <= off)"
+            elif on_bpt == off_bpt:
+                rel = " => on == off"
+        print(f"      streamed bytes/tok:   on={_fmt(on_bpt, '{:.0f}')} "
+              f"off={_fmt(off_bpt, '{:.0f}')} "
+              f"(authoritative experts identical; prefetch gated/backed-off)"
+              f"{rel}")
         d_on = on.get("decode_tokens_per_sec")
         d_off = off.get("decode_tokens_per_sec")
         print(f"      decode tok/s:         on={_fmt(d_on, '{:.2f}')} "
