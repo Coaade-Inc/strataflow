@@ -569,6 +569,94 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
         if (shape.n_experts == 0) shape.n_experts = sb.n_experts;
     }
 
+    // CRITICAL (OOM regression fix): make_shape() ran on a VOCAB-ONLY
+    // llama_model, which did not read the arch block or any tensor sizes, so it
+    // reports total_bytes=0 and therefore expert_bytes=0. The superblock patch
+    // above fixes is_moe/n_experts/n_layers but NOT the byte fields. If we plan
+    // now, the planner's MoE branch (gated on model.is_moe && expert_bytes > 0)
+    // is skipped, the model is treated as dense, 0 expert slots are reserved,
+    // streaming never engages, and a ~19 GB Mixtral is loaded fully resident and
+    // OOM-kills a smaller box. So BEFORE planning we fill the byte fields and
+    // the top-k from the .strata's own authoritative records: the superblock,
+    // the expert index, and the embedded GGUF metadata.
+    if (shape.is_moe && reader.index_count() > 0) {
+        // Defensive invariant (same silently-zero-field class this fix exists
+        // to prevent): if a future code path ever marks is_moe=true while
+        // n_experts stayed 0, plan_placement would compute full_slots==0 and
+        // report fully-resident for a model it cannot hold. The superblock
+        // patch above already sets n_experts from sb.n_experts, so this should
+        // not happen; recover it from the superblock if it somehow did, and
+        // skip the MoE pre-pass cleanly (rather than crash this library load
+        // path) if there is still nothing to derive it from.
+        if (shape.n_experts == 0) {
+            log_warn("GgmlModel .strata '" + shape.name +
+                     "': is_moe set but n_experts==0; recovering from "
+                     "superblock n_experts=" + std::to_string(sb.n_experts));
+            shape.n_experts = sb.n_experts;
+        }
+        if (shape.n_experts == 0) {
+            // Still zero: there is nothing to size the expert shape from.
+            // Skip the pre-pass cleanly rather than crash this library load
+            // path; the planner will treat the model as dense.
+            log_warn("GgmlModel .strata '" + shape.name +
+                     "': MoE flagged with zero experts; skipping expert "
+                     "shape pre-pass (planner will treat as dense)");
+        } else {
+        const std::vector<ExpertIndexEntry> &idx = reader.index();
+        // One index entry IS one (layer,expert) bundle of gate+up+down, so its
+        // blob_length is exactly one expert's resident weight bytes (the unit
+        // the planner and the engine's SlotPool reason about). Entries are
+        // uniform for a given model; take the first.
+        shape.expert_bytes = idx[0].blob_length;
+        // Trunk bytes come straight from the superblock's trunk block size.
+        shape.trunk_bytes = sb.trunk_size;
+        // Total = trunk + the sum of every bundle. Summing (rather than
+        // n_layers*n_experts*expert_bytes) stays correct even if a future pack
+        // emits non-uniform bundle sizes or a sparse index.
+        uint64_t experts_total = 0;
+        for (const ExpertIndexEntry &e : idx) experts_total += e.blob_length;
+        shape.total_bytes = shape.trunk_bytes + experts_total;
+
+        // Top-k (experts activated per token). make_shape could not read it
+        // from the vocab-only model, so pull it from the embedded GGUF metadata
+        // that strata_pack.cpp copied verbatim (it carries all source KVs,
+        // including "<arch>.expert_used_count"). Fallback to 2 (Mixtral top-2)
+        // if the key is somehow absent.
+        if (shape.n_experts_used == 0) {
+            uint32_t n_used = 0;
+            gguf_init_params gp{};
+            gp.no_alloc = true;
+            gp.ctx = nullptr;
+            gguf_context *gc = gguf_init_from_buffer(
+                reader.metadata(),
+                static_cast<size_t>(reader.metadata_size()), gp);
+            if (gc != nullptr) {
+                std::string arch;
+                int64_t aid = gguf_find_key(gc, "general.architecture");
+                if (aid >= 0) {
+                    const char *a = gguf_get_val_str(gc, aid);
+                    if (a != nullptr) arch = a;
+                }
+                if (!arch.empty()) {
+                    int64_t uid =
+                        gguf_find_key(gc, (arch + ".expert_used_count").c_str());
+                    if (uid >= 0) n_used = gguf_get_val_u32(gc, uid);
+                }
+                gguf_free(gc);
+            }
+            shape.n_experts_used = n_used > 0 ? n_used : 2;
+            if (n_used == 0) {
+                log_warn("GgmlModel .strata '" + shape.name +
+                         "': embedded metadata missing expert_used_count; "
+                         "defaulting n_experts_used to 2 (Mixtral top-2). "
+                         "Non-top-2 MoE families (e.g. Qwen2-MoE top-4, "
+                         "DeepSeek top-6) will get a wrong planner floor.");
+            }
+        }
+        }  // else (n_experts > 0)
+    }
+    // Plan ONLY after every shape field the planner reads is populated, so the
+    // MoE/streaming branch is reached for a real MoE .strata.
     PlacementPlan plan =
         plan_placement(hw, shape, vram_budget, ram_budget, cache_budget);
     if (out_plan != nullptr) *out_plan = plan;

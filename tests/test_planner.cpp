@@ -2,6 +2,8 @@
 #include "plan/planner.h"
 #include "test_util.h"
 
+#include <cstdio>
+
 using namespace sf;
 
 static constexpr uint64_t GiB = 1024ull * 1024 * 1024;
@@ -151,6 +153,48 @@ static void test_cache_budget_caps_choice() {
               uint64_t(m.n_experts_used) * m.expert_bytes);
 }
 
+// Mixtral-scale auto-residency on a 12 GB budget. A ~19 GB Mixtral Q3_K_M
+// (trunk ~5.5 GiB, each expert bundle ~52 MiB, 32 layers x 8 experts) cannot
+// fit in 10 GiB free RAM, so the planner must choose bounded streaming with a
+// slot count > 0 but < full_slots (256), and the peak estimate must stay within
+// the budget. This guards the auto policy for the real shape+budget that
+// triggered the OOM regression (where the pre-fix code misclassified the model
+// as dense and planned 0 expert slots).
+static void test_mixtral_scale_12gb_auto() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 12 * GiB;
+    hw.ram_free_bytes = 10 * GiB;
+
+    ModelShape m;
+    m.name = "mixtral-q3km-scale";
+    m.n_layers = 32;
+    m.is_moe = true;
+    m.n_experts = 8;
+    m.n_experts_used = 2;
+    m.trunk_bytes = static_cast<uint64_t>(5.5 * static_cast<double>(GiB));  // ~5.5 GiB
+    m.expert_bytes = 52 * MiB;   // each (layer,expert) bundle ~52 MiB
+    m.total_bytes = m.trunk_bytes +
+        uint64_t(m.n_experts) * m.n_layers * m.expert_bytes;  // ~18.8 GiB
+
+    const uint32_t full_slots =
+        static_cast<uint32_t>(uint64_t(m.n_layers) * m.n_experts);  // 256
+
+    PlacementPlan plan = plan_placement(hw, m, /*vram=*/0, /*ram=*/0);
+
+    // Must stream: the ~13.3 GiB expert working set cannot fit the ~4.5 GiB
+    // remaining after the 5.5 GiB trunk.
+    CHECK(plan.stream_experts);
+    CHECK(plan.expert_slots_resident > 0u);
+    CHECK(plan.expert_slots_resident >= m.n_experts_used);
+    CHECK(plan.expert_slots_resident < full_slots);
+    CHECK(plan.planned_peak_bytes <= hw.ram_free_bytes);
+
+    std::printf("[mixtral scale: slots=%u stream=%s peak=%lluMiB] ",
+                plan.expert_slots_resident,
+                plan.stream_experts ? "yes" : "no",
+                static_cast<unsigned long long>(plan.planned_peak_bytes / MiB));
+}
+
 // With a GPU, some trunk layers should be pinned in VRAM first.
 static void test_gpu_pins_trunk() {
     HardwareProfile hw;
@@ -169,6 +213,7 @@ static void run_all() {
     RUN(test_small_moe_bounded_under_tiny_budget);
     RUN(test_different_layout_adapts);
     RUN(test_cache_budget_caps_choice);
+    RUN(test_mixtral_scale_12gb_auto);
     RUN(test_gpu_pins_trunk);
 }
 

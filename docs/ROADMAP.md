@@ -85,6 +85,18 @@ families are the remaining quant-coverage gap.
   64.39 MB/tok) and faster steady-state decode (47.3 vs 15.3 tok/s, mechanism
   proxy on random weights). The real large-MoE (Mixtral) speedup from relying on
   auto residency stays Colab-only (offline sandbox cannot download it).
+  Regression fix (OOM on a legacy-Mixtral `.strata`): `load_strata_model` built
+  the `ModelShape` from a vocab-only `llama_model`, so `expert_bytes`/
+  `trunk_bytes`/`total_bytes` were 0 and the superblock patch did not set the
+  byte fields or the top-k. `plan_placement`'s MoE branch is gated on
+  `expert_bytes > 0`, so the model was misclassified as dense: 0 expert slots,
+  no streaming, whole model planned resident, OOM-killing a 12 GB box. Fixed by
+  populating `expert_bytes` (expert index `blob_length`), `trunk_bytes`/
+  `total_bytes` (superblock + index), and `n_experts_used` (embedded GGUF
+  metadata) BEFORE planning, so a real MoE `.strata` is planned as MoE +
+  bounded streaming. Guarded by `test_strata_shape_prepass` (packs the legacy
+  fixture and asserts the plan is NOT dense) and `test_mixtral_scale_12gb_auto`
+  (auto policy on the real Mixtral shape + 12 GB budget).
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.

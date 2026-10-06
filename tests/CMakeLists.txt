@@ -38,3 +38,9 @@ target_include_directories(test_mixtral_faithful_pack SYSTEM PRIVATE
 # library (pack + engine + oracle) and reads pre-generated fixtures from disk,
 # so it needs no ggml writer headers - a plain sf_add_test suffices.
 sf_add_test(test_legacy_per_expert_pack)
+
+# test_strata_shape_prepass is the regression gate for the .strata MoE shape
+# pre-pass fix: it packs a legacy GGUF to .strata and asserts the loaded plan is
+# MoE+streaming (NOT the dense branch). Only drives the library (pack + load +
+# plan), so a plain sf_add_test suffices (no extra ggml linkage).
+sf_add_test(test_strata_shape_prepass)
