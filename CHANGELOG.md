@@ -104,6 +104,23 @@ grouped by the pull request that merged them.
 
 ### Correctness and honesty fixes
 
+- `.strata` MoE shape pre-pass regression fixed (OOM on legacy Mixtral .strata).
+  `load_strata_model` built `ModelShape` from a vocab-only `llama_model`, which
+  reported `expert_bytes=0`/`trunk_bytes=0`/`total_bytes=0`. The superblock
+  patch filled `is_moe`/`n_experts`/`n_layers` but NOT the byte fields or the
+  top-k (`n_experts_used`), so `plan_placement` (gated on `expert_bytes > 0`)
+  fell to the dense branch, computed 0 expert slots, streaming never engaged,
+  and a real legacy-Mixtral `.strata` loaded fully resident and OOM-killed a
+  12 GB box (`rc=-9`) at the default `--expert-slots 0`. The fix populates
+  `expert_bytes` (from the first expert index entry's `blob_length`),
+  `trunk_bytes`/`total_bytes` (from the superblock + index), and
+  `n_experts_used` (from the embedded GGUF metadata's
+  `<arch>.expert_used_count`, fallback 2) BEFORE planning. The plan now
+  correctly sees MoE + bounded streaming for any `.strata` with experts. A
+  regression test (`test_strata_shape_prepass`) packs the legacy fixture to
+  `.strata`, loads it with a modest budget, and asserts the plan is the MoE path
+  (NOT dense). A Mixtral-scale planner test (`test_mixtral_scale_12gb_auto`)
+  guards the auto policy for the real shape + 12 GB budget.
 - Packer FAILS LOUDLY on a misclassified MoE instead of writing an OOM-bomb
   `.strata`. If the GGUF metadata says MoE (`llama.expert_count` > 0) but zero
   expert tensors classify, `strata-pack` now aborts with a diagnostic listing
