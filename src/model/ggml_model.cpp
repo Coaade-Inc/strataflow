@@ -580,6 +580,28 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
     // the top-k from the .strata's own authoritative records: the superblock,
     // the expert index, and the embedded GGUF metadata.
     if (shape.is_moe && reader.index_count() > 0) {
+        // Defensive invariant (same silently-zero-field class this fix exists
+        // to prevent): if a future code path ever marks is_moe=true while
+        // n_experts stayed 0, plan_placement would compute full_slots==0 and
+        // report fully-resident for a model it cannot hold. The superblock
+        // patch above already sets n_experts from sb.n_experts, so this should
+        // not happen; recover it from the superblock if it somehow did, and
+        // skip the MoE pre-pass cleanly (rather than crash this library load
+        // path) if there is still nothing to derive it from.
+        if (shape.n_experts == 0) {
+            log_warn("GgmlModel .strata '" + shape.name +
+                     "': is_moe set but n_experts==0; recovering from "
+                     "superblock n_experts=" + std::to_string(sb.n_experts));
+            shape.n_experts = sb.n_experts;
+        }
+        if (shape.n_experts == 0) {
+            // Still zero: there is nothing to size the expert shape from.
+            // Skip the pre-pass cleanly rather than crash this library load
+            // path; the planner will treat the model as dense.
+            log_warn("GgmlModel .strata '" + shape.name +
+                     "': MoE flagged with zero experts; skipping expert "
+                     "shape pre-pass (planner will treat as dense)");
+        } else {
         const std::vector<ExpertIndexEntry> &idx = reader.index();
         // One index entry IS one (layer,expert) bundle of gate+up+down, so its
         // blob_length is exactly one expert's resident weight bytes (the unit
@@ -623,9 +645,16 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
                 gguf_free(gc);
             }
             shape.n_experts_used = n_used > 0 ? n_used : 2;
+            if (n_used == 0) {
+                log_warn("GgmlModel .strata '" + shape.name +
+                         "': embedded metadata missing expert_used_count; "
+                         "defaulting n_experts_used to 2 (Mixtral top-2). "
+                         "Non-top-2 MoE families (e.g. Qwen2-MoE top-4, "
+                         "DeepSeek top-6) will get a wrong planner floor.");
+            }
         }
+        }  // else (n_experts > 0)
     }
-
     // Plan ONLY after every shape field the planner reads is populated, so the
     // MoE/streaming branch is reached for a real MoE .strata.
     PlacementPlan plan =
