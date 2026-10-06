@@ -278,6 +278,51 @@ python3 colab/strataflow_colab.py --real-model --is-moe \
   --prompt "The city of"
 ```
 
+#### Residency + prefetch gating BEFORE/AFTER (sandbox-measured)
+
+Two levers shipped together: (B) layer-stratified, frequency-aware per-layer
+expert residency replacing the single global plain-LRU, and (A) prefetch
+free-slot install gating + adaptive self-backoff so async prefetch never
+increases bytes streamed. Both are measured IN-SANDBOX on the bounded
+multi-layer generated fixtures (byte-identical decoded text throughout), with
+the absolute wall-clock tok/s left as a Colab/hardware-dependent companion. The
+table below is the generated `bench_moe-L8-E16` fixture (8 layers, 16x4 experts,
+full working set = 128 bundles), max-tokens 8, release build.
+
+Lever B (residency), async off, at the shape-derived tight budget slots=32
+(= n_layer * n_expert_used), measured via the CLI apples-to-apples (same slot
+count, same peak RSS, decoded text byte-identical both ways):
+
+| residency policy        | streamed bytes      | streamed MiB | peak RSS  |
+| ----------------------- | ------------------- | ------------ | --------- |
+| global plain-LRU (before) | 522,190,848       | 498.0        | 132.4 MiB |
+| layer-stratified (after)  | 327,155,712       | 312.0        | 132.4 MiB |
+
+That is 37.3% fewer SSD bytes streamed at the same slot budget and peak RSS,
+byte-identical output. (Misses as the engine-level proxy: 975 before vs 626
+after, 35.8% fewer.)
+
+Lever A (prefetch gating), async-on vs async-off at the bounded slot count
+slots=24, from `colab/strataflow_bench.py --layers-list 8 --experts-list 16
+--slots-list 24,0 --async-list on,off --max-tokens 8`:
+
+| config                 | bytes/tok    | streamed MiB | peak RSS  | cbu | decoded text |
+| ---------------------- | ------------ | ------------ | --------- | --- | ------------ |
+| slots=24 async=off (before regression)* | 63,700,992 | 486.0 | 132.5 MiB | 0 | identical |
+| slots=24 async=on (before regression)*  | 94,371,840 | 720.0 | 132.4 MiB | 0 | identical |
+| slots=24 async=off (after) | 61,341,696 | 468.0  | 132.4 MiB | 0 | identical |
+| slots=24 async=on (after)  | 46,792,704 | 357.0  | 132.4 MiB | 0 | identical |
+
+`*` the "before regression" rows are the FEAT-001 baseline on current `main`,
+where async-on streamed ~1.48x MORE than async-off (prefetch HURT). After the
+gating, async-on streams 46,792,704 bytes/tok, which is 0.76x async-off
+(61,341,696) and LESS than before - async prefetch no longer hurts. Decoded
+text is byte-identical across every row and matches the before run exactly (the
+policy change did not alter output). `cbu` (completed-before-use) stays 0 on
+this fast sandbox CPU, mirroring the 2-core Colab 0-overlap case, which is why
+self-backoff engages. The decode tok/s per row is a MECHANISM proxy only (tiny
+random-weight fixture, fast sandbox CPU) and is NOT a throughput claim.
+
 #### Async prefetch overlap on vs off (FEAT-003), real Mixtral
 
 Async prefetch overlaps the next layer's predicted-expert disk reads with the
@@ -326,30 +371,52 @@ python3 colab/strataflow_colab.py --real-model --is-moe \
   --prompt "The city of"
 ```
 
+To measure the effect of the residency + prefetch-gating change itself, run the
+SAME commands (RUN A/RUN B and RUN C/RUN D) on **current `main` (before)** and
+on **this branch (after)** and compare the `streamed = ... MiB` / bytes-per-token
+and tok/s each prints. The sandbox-proven expectation is that the after branch
+streams `<=` bytes/token with async on at a bounded cache (prefetch no longer
+hurts) and the per-layer-stratified residency re-reads fewer SSD bytes/token
+than the before. Absolute tok/s stays hardware-dependent on the 2-core Colab
+runtime, so do not expect a fixed tok/s number - compare the streamed MiB and
+bytes/token first, and read tok/s as the hardware-dependent companion.
+
 This async on-vs-off contrast on the real ~19 GB Mixtral is **Colab/hardware-
 dependent and the offline sandbox cannot run it** (no network to download
 Mixtral, and absolute tok/s depends on the runtime's disk and CPU). The sandbox
 proves the MECHANISM in-sandbox instead: `colab/strataflow_bench.py
---layers-list 8 --experts-list 16 --slots-list 4 --async-list on,off` decodes a
-byte-identical sequence on vs off while `completed-before-use` goes from 0 (off)
-to > 0 (on), i.e. the background worker finishes predicted reads before the
-layer needs them. The CLI's own stats line also reports it directly:
-`build/release/bin/strataflow --model bench_moe-L8-E16.strata --expert-slots 4
---max-tokens 16 --async-prefetch on` vs `off`.
+--layers-list 8 --experts-list 16 --slots-list 24,0 --async-list on,off` decodes
+a byte-identical sequence on vs off while streamed bytes/token with async on
+stays `<=` async off at the bounded slot count (the prefetch-no-longer-hurts
+invariant), and `completed-before-use` is reported (it stays ~0 on the fast
+sandbox CPU, which is why self-backoff engages). The CLI's own stats line also
+reports it directly: `build/release/bin/strataflow --model
+bench_moe-L8-E16.strata --expert-slots 24 --max-tokens 16 --async-prefetch on`
+vs `off`.
 
-Note on `streamed_bytes` in this tiny-fixture contrast: on the generated MoE
-the resident pool is sized at about one layer's working set, so the speculative
-worker reads predicted experts into its staging buffer that the synchronous
-warm path (which reads straight into the pool slot, only on a miss) would often
-skip. async-on therefore streams MORE bytes than async-off here (about 1.5 GiB
-vs 1.0 GiB over 16 tokens), a roughly constant overhead independent of the slot
-count. That is the cost the overlap pays to hide read latency behind compute:
-on a disk-bound target (the real Mixtral) hiding the authoritative read latency
-is the win, and the extra speculative bytes are read on the idle I/O thread
-while compute runs. Output stays byte-identical regardless. Do not read the
-tiny-fixture `streamed_bytes` as a disk-traffic win; it is not, and the sandbox
-CPU is too fast relative to its disk for the wall-clock win to show - that is
-exactly why the absolute speed claim is reserved for the Colab Mixtral run.
+Note on `streamed_bytes` in this tiny-fixture contrast: with the FEAT-003
+free-slot install gating + self-backoff, async-on no longer increases streamed
+bytes vs async-off at a bounded slot count - it is now `<=` off. A completed
+speculative read is only installed into a genuinely FREE per-layer slot
+(wired through the FEAT-002 layer-stratified pool's `has_free_slot_in_layer`),
+so a prefetch can never evict a still-needed authoritative resident and can
+never amplify the authoritative working set's miss/stream count; and when the
+observed `completed-before-use` rate stays ~0 over a shape-derived window the
+worker backs off and stops issuing speculative reads entirely. Measured
+in-sandbox on this fixture at `--expert-slots 24` over 8 tokens: async-on
+streams 46,792,704 bytes/tok vs async-off 61,341,696 bytes/tok (on is 0.76x
+off), at the same 132.4 MiB peak RSS, byte-identical decoded text. This
+reverses the earlier behavior, where speculative reads racing eviction made
+async-on stream MORE than off (~1.5 GiB vs ~1.0 GiB over 16 tokens).
+
+The honest caveat remains: `completed-before-use` stays ~0 on this fast sandbox
+CPU (the per-layer compute window is too small to hide the background read),
+which mirrors the 2-core Colab 0-overlap case and is exactly why self-backoff
+engages. So the sandbox-proven result is that async prefetch no longer HURTS
+(streamed bytes `<=` off, output byte-identical); the absolute wall-clock
+speedup from overlap is still hardware-dependent and reserved for the Colab
+Mixtral run, where a slower disk relative to compute gives the overlap real
+read latency to hide.
 
 Sandbox-proven vs Colab-only, to be exact about what each part demonstrates:
 
@@ -360,10 +427,22 @@ Sandbox-proven vs Colab-only, to be exact about what each part demonstrates:
   measured by `colab/strataflow_bench.py --layers-list 8 --experts-list 16
   --slots-list 2,16,0` on a GENERATED MoE, where the auto row streams ~8x fewer
   SSD bytes/token than `slots=2` on the same model (8.06 MB/tok vs 64.39 MB/tok)
-  and decodes faster (mechanism proxy on random weights).
+  and decodes faster (mechanism proxy on random weights). ALSO sandbox-proven:
+  (lever B) the layer-stratified, frequency-aware per-layer residency re-reads
+  fewer SSD bytes/token than the old global plain-LRU at the SAME bounded slot
+  count (L8-E16 at slots=32: 327,155,712 vs 522,190,848 streamed bytes, 37.3%
+  fewer, byte-identical decode at equal peak RSS), and (lever A) async-on no
+  longer increases streamed bytes vs async-off at a bounded slot count (L8-E16
+  at slots=24: 46,792,704 vs 61,341,696 bytes/tok, on is 0.76x off, decoded text
+  byte-identical, same 132.4 MiB peak RSS), reversing the earlier behavior where
+  async-on streamed MORE than off.
 - **Colab-only (this cell):** the real ~19 GB Mixtral download + end-to-end
-  decode and its absolute tok/s. The offline sandbox cannot download Mixtral, so
-  RUN A vs RUN B above is the real-model before/after you reproduce on Colab.
+  decode and its absolute wall-clock tok/s. The offline sandbox cannot download
+  Mixtral, so RUN A vs RUN B (auto vs small fixed residency) and RUN C vs RUN D
+  (async on vs off) above are the real-model before/after you reproduce on
+  Colab. Absolute tok/s is hardware-dependent on the 2-core free runtime and is
+  deliberately NOT promised as a fixed number; compare streamed MiB /
+  bytes-per-token first, with tok/s as the hardware-dependent companion.
 
 This TheBloke Q3_K_M GGUF uses the LEGACY per-expert tensor naming
 (`blk.N.ffn_{gate,down,up}.E.weight`). As of the legacy per-expert packer fix,
@@ -445,11 +524,13 @@ The table has one row per `(model size x expert-slots)` config, with columns:
 - `resident MiB` / `peak RSS MiB` - RAM held by the run.
 - `streamed MiB` / `bytes/tok` - SSD bytes streamed through `StrataReader`.
   `bytes/tok` is exact: it comes from the raw `streamed_bytes` uint64 the CLI
-  reports, not the 1-decimal `streamed MiB` display value. Note: with
-  `--async-prefetch on` at a tight slot count this can be HIGHER than `off`,
-  because the background worker issues speculative reads that race eviction;
-  that is extra I/O work, not a correctness change (the authoritative experts
-  loaded, and thus the decoded text, are identical).
+  reports, not the 1-decimal `streamed MiB` display value. Note: with the
+  FEAT-003 free-slot install gating + self-backoff, `--async-prefetch on` at a
+  tight slot count now streams `<=` as many bytes/tok as `off` (a completed
+  prefetch is only installed into a genuinely free per-layer slot so it never
+  evicts a still-needed resident, and the worker backs off issuing speculative
+  reads once the observed overlap stays ~0). The authoritative experts loaded,
+  and thus the decoded text, are identical either way.
 - `cbu` - `completed-before-use` (FEAT-003 overlap signal): of the prefetched
   experts the routing then used, how many the background I/O worker had fully
   read AND installed BEFORE the layer's authoritative acquire needed them, i.e.

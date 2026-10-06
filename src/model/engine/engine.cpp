@@ -122,6 +122,10 @@ struct Engine::Impl {
     // completed read (pf_drain_completed) before the layer's authoritative
     // acquire needed them - the overlap actually hid the disk read.
     uint64_t prefetch_completed_before_use = 0;
+    // FEAT-002: how many tokens have been decoded, used to throttle the
+    // layer-stratified pool's frequency-driven cap refresh (the spare-slot
+    // distribution only needs to re-settle occasionally as frequency sharpens).
+    uint64_t decoded_tokens = 0;
     // Experts warmed (by this token's prefetches) whose use we have not yet
     // scored. Cleared at the start of each forward().
     std::unordered_set<ExpertId, ExpertIdHash> warmed_this_token;
@@ -176,6 +180,57 @@ struct Engine::Impl {
     // Cap on outstanding prefetch work so it cannot run unbounded ahead across
     // tokens; sized to a couple of layers' top-k worth of experts.
     size_t pf_queue_cap = 0;
+
+    // ---- FEAT-003: adaptive self-backoff --------------------------------
+    // On a slow box (the real 2-core Colab target) the per-layer compute
+    // window is too small to hide the background expert read, so the worker's
+    // read never COMPLETES before the layer's authoritative acquire needs the
+    // expert (completed_before_use stays ~0). In that regime a speculative
+    // prefetch pays its I/O cost (adds to streamed bytes) for zero overlap
+    // benefit. The engine OBSERVES this: it watches, per decoded token, whether
+    // ANY warmed prefetch completed before use. After a shape-derived window of
+    // consecutive tokens with zero overlap across all warmed experts, it STOPS
+    // enqueuing further speculative prefetches (pf_backoff) so prefetch stops
+    // adding bytes. The threshold/window derive ONLY from model shape, never a
+    // machine constant.
+    //
+    // pf_backoff: once true, pf_enqueue is suppressed (no new speculative reads
+    //   are issued) and the queue is quiesced so no stale bytes stream. It is
+    //   latched monotonically for the sequence; reset_kv() clears it so a fresh
+    //   sequence re-probes overlap.
+    // pf_zero_overlap_tokens: consecutive decoded tokens observed with
+    //   prefetch warmed > 0 but completed_before_use delta == 0.
+    // pf_backoff_window: the number of warmed-prefetch tokens of evidence that
+    //   trips the backoff decision. One such token already samples a full
+    //   per-layer sweep (n_layer speculations) and is judged against a shape-
+    //   derived rate, so a one-token probe is deliberate - see pf_maybe_start().
+    // pf_prev_warmed / pf_prev_cbu: the cumulative counters at the end of the
+    //   previous token, so forward() can compute this token's deltas.
+    bool     pf_backoff = false;
+    uint32_t pf_zero_overlap_tokens = 0;
+    uint32_t pf_backoff_window = 0;
+    uint64_t pf_prev_warmed = 0;
+    uint64_t pf_prev_cbu = 0;
+    // Overlap evidence accumulated over the current observation window: total
+    // experts warmed and total completed-before-use. Reset when the window
+    // decides overlap is effective (keep speculating) or when a new sequence
+    // starts.
+    uint64_t pf_window_warmed = 0;
+    uint64_t pf_window_cbu = 0;
+    // Test-only override of the adaptive backoff decision, following the
+    // STRATAFLOW_ENGINE_ASYNC_PREFETCH env/param pattern. Unset (default): fully
+    // automatic adaptation. "1"/"on": force backoff engaged from the first
+    // token (prove prefetch stops issuing reads). "0"/"off": never back off
+    // (prove the install-gating alone keeps async-on <= async-off). Read once in
+    // pf_maybe_start().
+    enum class PfBackoffForce { Auto, ForceOn, ForceOff };
+    PfBackoffForce pf_backoff_force = PfBackoffForce::Auto;
+    // Test-only: disable the free-slot install gate at pf_drain_completed so a
+    // test can reproduce the PRE-GATING unconditional-install behavior (a
+    // prefetch evicts an LRU victim) and prove the gated policy streams
+    // strictly fewer bytes/misses when overlap is ~0. Unset (default): gate ON.
+    // Read once in pf_maybe_start(). Not a user-facing knob.
+    bool pf_no_install_gate = false;
 
     // One CPU backend + gallocr reused across every segment and token (section
     // 3.5: reuse the allocator across tokens; also avoids re-initializing the
@@ -615,7 +670,33 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         if (n_slots < static_cast<uint32_t>(hp.n_expert_used)) {
             n_slots = static_cast<uint32_t>(hp.n_expert_used);
         }
-        im.pool.reset(new SlotPool(n_slots, slot_bytes));
+        // LEVER B (FEAT-002): layer-stratified residency. The TOTAL budget
+        // (n_slots) is unchanged - peak RSS stays bounded by n_slots*slot_bytes
+        // exactly as before - but the pool partitions those slots across the
+        // layers and scopes eviction per layer, so a layer's hot experts
+        // survive the intervening layers' sweeps instead of being evicted by a
+        // single global LRU. The per-layer shares derive purely from shape
+        // (n_layer/n_expert/n_expert_used), and are refined by observed
+        // per-layer routing frequency during decode (see forward()). When
+        // n_slots >= n_layer*n_expert the pool is fully resident and never
+        // evicts, byte-identical to the auto-residency path.
+        // Test-only escape hatch (STRATAFLOW_ENGINE_GLOBAL_LRU=1): construct
+        // the LEGACY single global-LRU pool instead of the layer-stratified
+        // one, so the residency-policy test can decode the SAME multi-layer
+        // fixture under BOTH policies and prove the stratified policy records
+        // strictly fewer misses (and the output stays byte-identical either
+        // way). Default (unset) is the layer-stratified pool.
+        const char *global_lru_env = std::getenv("STRATAFLOW_ENGINE_GLOBAL_LRU");
+        const bool force_global_lru =
+            global_lru_env != nullptr && global_lru_env[0] == '1';
+        if (force_global_lru) {
+            im.pool.reset(new SlotPool(n_slots, slot_bytes));
+        } else {
+            im.pool.reset(new SlotPool(n_slots, slot_bytes,
+                                       static_cast<uint32_t>(hp.n_layer),
+                                       static_cast<uint32_t>(hp.n_expert),
+                                       static_cast<uint32_t>(hp.n_expert_used)));
+        }
         im.cstats.n_slots    = n_slots;
         im.cstats.slot_bytes = slot_bytes;
         im.cstats.full_bytes = static_cast<uint64_t>(full_slots) * slot_bytes;
@@ -664,6 +745,16 @@ void Engine::reset_kv() {
     // stale staged bytes from the prior sequence's predictions). The worker
     // thread itself stays alive to serve the next sequence.
     pf_quiesce();
+    // FEAT-003: a fresh sequence re-probes prefetch overlap from scratch. Clear
+    // the latched self-backoff and its observation window so the new sequence
+    // is not permanently penalized by the prior sequence's zero-overlap verdict
+    // (unless the test force knob pins it, which pf_maybe_start re-applies).
+    impl_->pf_backoff = (impl_->pf_backoff_force == Impl::PfBackoffForce::ForceOn);
+    impl_->pf_zero_overlap_tokens = 0;
+    impl_->pf_window_warmed = 0;
+    impl_->pf_window_cbu = 0;
+    impl_->pf_prev_warmed = impl_->prefetch_warmed;
+    impl_->pf_prev_cbu = impl_->prefetch_completed_before_use;
     if (impl_->kv != nullptr) impl_->kv->reset();
 }
 
@@ -1237,6 +1328,51 @@ void Engine::pf_maybe_start() {
         static_cast<size_t>(hp_().n_expert_used) * 4 + 4;
     im.pf_stop = false;
 
+    // FEAT-003: self-backoff probe window, measured in tokens that actually
+    // warmed experts (not wall-clock, not a machine-tuned constant). The probe
+    // is deliberately ONE such token: a single decoded token already issues up
+    // to n_layer speculative prefetches (one per layer boundary), so the
+    // accumulated evidence within that one token - pf_window_warmed, which
+    // scales with the layers swept and the per-layer top-k - is a shape-sized
+    // sample, and the effectiveness bar it is judged against is shape-derived
+    // (require >= ceil(window_warmed / n_expert_used) completed-before-use; see
+    // the decision in forward()). We decide on that accumulated RATE rather than
+    // on a single prefetch, so the occasional sporadic completed-before-use the
+    // sandbox CPU produces does not keep an ineffective speculation alive and
+    // let async-on out-stream async-off. A one-token probe keeps the probe cost
+    // minimal while the shape-derived threshold carries the adaptivity; it is
+    // not a tunable window length. Enforced as a named field (rather than a bare
+    // literal at the use site) so the "one warmed token" intent is explicit.
+    im.pf_backoff_window = 1;
+
+    // Test-only force knob (default Auto). Mirrors the async_prefetch pattern.
+    im.pf_backoff_force = Impl::PfBackoffForce::Auto;
+    const char *bo = std::getenv("STRATAFLOW_ENGINE_PREFETCH_BACKOFF");
+    if (bo != nullptr && bo[0] != '\0') {
+        if (std::strcmp(bo, "1") == 0 || std::strcmp(bo, "on") == 0 ||
+            std::strcmp(bo, "ON") == 0 || std::strcmp(bo, "true") == 0) {
+            im.pf_backoff_force = Impl::PfBackoffForce::ForceOn;
+        } else if (std::strcmp(bo, "0") == 0 || std::strcmp(bo, "off") == 0 ||
+                   std::strcmp(bo, "OFF") == 0 || std::strcmp(bo, "false") == 0) {
+            im.pf_backoff_force = Impl::PfBackoffForce::ForceOff;
+        }
+    }
+    // ForceOn: back off immediately (prove prefetch stops issuing reads).
+    im.pf_backoff = (im.pf_backoff_force == Impl::PfBackoffForce::ForceOn);
+    im.pf_zero_overlap_tokens = 0;
+    im.pf_window_warmed = 0;
+    im.pf_window_cbu = 0;
+    im.pf_prev_warmed = 0;
+    im.pf_prev_cbu = 0;
+
+    // Test-only: disable the install gate to reproduce pre-gating behavior.
+    im.pf_no_install_gate = false;
+    const char *nig = std::getenv("STRATAFLOW_ENGINE_PREFETCH_NO_INSTALL_GATE");
+    if (nig != nullptr && (nig[0] == '1' || nig[0] == 'o' || nig[0] == 'O' ||
+                           nig[0] == 't' || nig[0] == 'T')) {
+        im.pf_no_install_gate = true;
+    }
+
     // The worker loop: pop one request, read its bytes into a staging buffer,
     // push the completed buffer back for the compute thread to install. It
     // NEVER touches the SlotPool.
@@ -1282,6 +1418,12 @@ void Engine::pf_maybe_start() {
 void Engine::pf_enqueue(int il, int expert) {
     Impl &im = *impl_;
     if (!im.pf_enabled || !im.pf_thread.joinable()) return;
+    // FEAT-003 self-backoff: once the engine has observed that the worker's
+    // reads never complete before use (zero overlap over a shape-derived
+    // window), stop issuing speculative reads entirely so prefetch stops adding
+    // streamed bytes. The authoritative ensure_layer_experts_resident still
+    // loads exactly what each layer routes, so decode is unchanged.
+    if (im.pf_backoff) return;
     if (il < 0 || il >= hp_().n_layer) return;
     if (expert < 0 || expert >= hp_().n_expert) return;
     ExpertId id{static_cast<uint32_t>(il), static_cast<uint32_t>(expert)};
@@ -1315,36 +1457,49 @@ void Engine::pf_drain_completed() {
     for (auto &c : ready) {
         if (!c.ok) continue;
         if (im.pool->resident(c.id)) continue;  // authoritative load beat us
-        // FEAT-003 (Issue 2 measurement): a speculative prefetch install goes
-        // through SlotPool::acquire, which can evict an LRU victim. We measured
-        // a "free-slot-only" guard (SlotPool::has_free_slot(); drop the install
-        // when the pool would need to evict). On the bounded fixtures the
-        // resident pool is sized at or near one layer's working set, so after
-        // warmup the pool is ALWAYS full (free_slots never refills: eviction
-        // reuses the victim's slot in place). The guard therefore dropped every
-        // post-warmup install, which (a) zeroed the overlap metric - no
-        // prefetch is ever installed-before-use - and (b) did NOT reduce
-        // streamed_bytes (async-on stayed ~1.5 GiB), because the worker still
-        // issued the speculative read into staging and the authoritative pass
-        // then re-read the dropped expert. Installing unconditionally (letting
-        // acquire evict) keeps the overlap mechanism live and does not increase
-        // streamed_bytes versus the guard. So we KEEP the authoritative-correct
-        // install here; the ~0.5 GiB async-on amplification is inherent to
-        // decoupled speculative reads at slots ~= working set and is documented
-        // in FEAT-003 findings. Correctness is unaffected either way (output
-        // byte-identical; the authoritative ensure_layer_experts_resident is
-        // the backstop). has_free_slot() remains available for a slots >>
-        // working-set config where free slots genuinely exist.
-        // Single-thread SlotPool mutation: copy the staged bytes into the slot
-        // the pool assigns (possibly evicting an LRU victim). Because the worker
-        // never touches the pool, this cannot race a worker write.
+        // FEAT-003 FREE-SLOT INSTALL GATING: a speculative prefetch install goes
+        // through SlotPool::acquire, which on a full layer would EVICT that
+        // layer's LRU victim. We only install when the id's layer has a
+        // genuinely FREE slot (has_free_slot_in_layer under FEAT-002's per-layer
+        // scheme); otherwise we DROP the install rather than evict. This
+        // guarantees a prefetch NEVER evicts a still-needed authoritative
+        // resident and so can never amplify the authoritative working set's
+        // miss/stream count: async-on can only ever install into otherwise-idle
+        // slots.
+        //
+        // An EARLIER iteration (prior task) measured a naive free-slot guard
+        // counterproductive and dropped it. That was ONLY because the pool was a
+        // single GLOBAL LRU that, at slots ~= one layer's working set, is ALWAYS
+        // full after warmup (eviction recycles the victim's slot in place, so
+        // free_slots never refills) - the guard then dropped every post-warmup
+        // install and zeroed overlap for no byte saving. Under FEAT-002's
+        // LAYER-STRATIFIED partitioning that reasoning no longer holds: each
+        // layer has its own capacity, so under-filled layers genuinely have free
+        // slots and the guard installs into them while refusing to evict a hot
+        // resident of a full layer. The guard now does its intended job.
+        if (!im.pf_no_install_gate &&
+            !im.pool->has_free_slot_in_layer(c.id.layer)) {
+            // Dropping the install leaves the id for the authoritative
+            // ensure_layer_experts_resident to load if this layer actually
+            // routes it - correctness is unchanged (that path is the backstop),
+            // and we have NOT evicted a resident the current working set needs.
+            // (The test-only pf_no_install_gate path reproduces the pre-gating
+            // behavior where this install would evict an LRU victim.)
+            continue;
+        }
+        // Single-thread SlotPool mutation: copy the staged bytes into the free
+        // slot the pool assigns. Because the worker never touches the pool, this
+        // cannot race a worker write. We asserted a free slot above, so this
+        // acquire does not evict.
         im.pool->acquire(c.id, [&](void *dst) {
             std::memcpy(dst, c.bytes.data(),
                         static_cast<size_t>(im.pf_slot_bytes));
         });
-        // FEAT-003: the worker's read COMPLETED and we installed it here, i.e.
-        // before any authoritative acquire for this id. If the layer then
-        // routes this expert, that is a completed-before-use overlap hit.
+        // FEAT-003: the worker's read COMPLETED and we installed it here (into a
+        // free slot), i.e. before any authoritative acquire for this id. If the
+        // layer then routes this expert, that is a completed-before-use overlap
+        // hit. Only installed ids are counted, so the overlap metric stays
+        // correct under the install gating.
         im.async_installed_this_token.insert(c.id);
     }
 }
@@ -1377,6 +1532,79 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     // from a prior token's predictions stay valid across tokens (same
     // {layer,expert} space), so they are kept, not discarded, at this boundary.
     pf_maybe_start();
+
+    // LEVER B (FEAT-002): refine the layer-stratified pool's spare-slot
+    // distribution from observed per-layer routing frequency so busier layers
+    // get the spare slots. Frequency is only known after decoding starts, so
+    // the pool begins from an even shape-derived split (ctor) and is refined
+    // here. Throttled to once every few tokens: the floor (n_expert_used) is
+    // never crossed, and a resident expert is never moved, so this only changes
+    // future eviction scope, never the decode. No-op on the fully-resident or
+    // non-stratified pool.
+    if (im.pool != nullptr && im.pool->stratified() && im.predictor != nullptr) {
+        if (im.decoded_tokens % 4 == 0) {
+            im.pool->set_layer_weights(im.predictor->layer_activity());
+        }
+    }
+
+    // FEAT-003 adaptive self-backoff decision. Evaluated at the TOP of a token
+    // so the counters reflect the PREVIOUS token's full layer sweep. If async
+    // prefetch is live and not already backed off, OBSERVE overlap over a
+    // shape-derived WINDOW of tokens and decide once per window: how many
+    // experts the window warmed, and of those how many the async worker
+    // completed-before-use. A single sporadic completed-before-use must NOT
+    // keep speculation alive forever on a box where the compute window cannot
+    // hide the read; so instead of resetting on any nonzero overlap, we require
+    // the window's overlap RATE to clear a shape-derived bar. When the rate is
+    // at/near zero across the window, latch backoff and quiesce so prefetch
+    // stops adding streamed bytes. The bar is derived from shape (n_expert_used)
+    // - NOT a machine constant: we require at least one in n_expert_used warmed
+    // prefetches to have genuinely overlapped (i.e. roughly one hidden read per
+    // layer sweep); below that, speculation is paying I/O for no benefit and we
+    // must stop so async-on never streams more than async-off. Fully automatic;
+    // the force knob (test-only) short-circuits the decision.
+    if (im.pf_enabled && !im.pf_backoff &&
+        im.pf_backoff_force == Impl::PfBackoffForce::Auto) {
+        const uint64_t warmed_delta = im.prefetch_warmed - im.pf_prev_warmed;
+        const uint64_t cbu_delta =
+            im.prefetch_completed_before_use - im.pf_prev_cbu;
+        im.pf_window_warmed += warmed_delta;
+        im.pf_window_cbu    += cbu_delta;
+        // Count ELAPSED tokens once speculation has actually begun warming
+        // experts (so the pre-warmup prefix, where nothing is yet warmed, does
+        // not consume the window). Evaluating on elapsed tokens - rather than
+        // only tokens that happened to warm - makes the decision prompt even
+        // when warming is sparse at loose slot counts, so the probe cost stays
+        // bounded to the window.
+        if (im.pf_window_warmed > 0) ++im.pf_zero_overlap_tokens;
+        if (im.pf_zero_overlap_tokens >= im.pf_backoff_window) {
+            // One window of evidence gathered. Overlap is "effective" only if at
+            // least one in n_expert_used warmed prefetches actually overlapped
+            // (ceil division so a tiny window still needs >= 1 hit when the bar
+            // rounds down to zero). Otherwise the reads are not being hidden and
+            // we stop speculating for the rest of the sequence.
+            const uint64_t k = static_cast<uint64_t>(hp.n_expert_used > 0
+                                                          ? hp.n_expert_used
+                                                          : 1);
+            const uint64_t required = (im.pf_window_warmed + k - 1) / k;
+            const bool effective =
+                im.pf_window_cbu > 0 && im.pf_window_cbu >= required;
+            if (!effective) {
+                im.pf_backoff = true;
+                pf_quiesce();
+            } else {
+                // Overlap is genuinely helping: reset the window and keep
+                // speculating (re-probe over the next window).
+                im.pf_zero_overlap_tokens = 0;
+                im.pf_window_warmed = 0;
+                im.pf_window_cbu = 0;
+            }
+        }
+    }
+    im.pf_prev_warmed = im.prefetch_warmed;
+    im.pf_prev_cbu = im.prefetch_completed_before_use;
+
+    ++im.decoded_tokens;
 
     ggml_tensor *tok_embd = ggml_get_tensor(im.wctx, "token_embd.weight");
     ggml_tensor *out_norm = ggml_get_tensor(im.wctx, "output_norm.weight");
@@ -1568,7 +1796,15 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
         // SYNCHRONOUS fallback (async disabled): warm inline via warm_expert as
         // before. Both paths keep prefetch_warmed/warmed_this_token semantics
         // so test_engine_prefetch_hit_rate still measures used-after-warm.
-        if (im.predictor != nullptr && il + 1 < hp.n_layer) {
+        // FEAT-003: when the async self-backoff has latched (overlap stayed at
+        // zero, so prefetch only costs I/O), stop warming entirely on the async
+        // path - no read is issued and nothing is counted as warmed, so
+        // prefetch_warmed stops growing and streamed bytes stop climbing for
+        // prefetch. The synchronous fallback path (async disabled) is never
+        // backed off: it is the EC-6 warm-ahead that the existing hit-rate test
+        // exercises, and it adds no decoupled speculative reads.
+        const bool async_backed_off = im.pf_enabled && im.pf_backoff;
+        if (im.predictor != nullptr && il + 1 < hp.n_layer && !async_backed_off) {
             const uint32_t k = static_cast<uint32_t>(hp.n_expert_used);
             std::vector<uint32_t> pred = im.predictor->predict(
                 static_cast<uint32_t>(il + 1), k);

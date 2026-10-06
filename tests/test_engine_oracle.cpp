@@ -55,6 +55,39 @@ static int32_t argmax(const std::vector<float> &v) {
     return best;
 }
 
+// Set an arbitrary env var for the scope of a run, restoring the prior value on
+// destruction. RAII so a mid-test assertion cannot leak the override into
+// sibling tests. Used for the FEAT-003 backoff/install-gate knobs; the engine
+// reads these env vars at Engine::load()/pf_maybe_start() time.
+class ScopedEnv {
+public:
+    ScopedEnv(const char *name, const char *value) : name_(name) {
+        const char *prev = std::getenv(name);
+        had_prev_ = prev != nullptr;
+        if (had_prev_) prev_ = prev;
+#if defined(_WIN32)
+        _putenv_s(name, value);
+#else
+        setenv(name, value, /*overwrite=*/1);
+#endif
+    }
+    ~ScopedEnv() {
+#if defined(_WIN32)
+        _putenv_s(name_.c_str(), had_prev_ ? prev_.c_str() : "");
+#else
+        if (had_prev_) setenv(name_.c_str(), prev_.c_str(), 1);
+        else unsetenv(name_.c_str());
+#endif
+    }
+    ScopedEnv(const ScopedEnv &) = delete;
+    ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+private:
+    std::string name_;
+    bool had_prev_ = false;
+    std::string prev_;
+};
+
 // Engine single-token forward must match the libllama oracle on the tiny MoE.
 static void test_engine_matches_oracle() {
     const char *path = std::getenv("STRATAFLOW_TEST_MOE_GGUF");
@@ -360,7 +393,14 @@ static void test_engine_prefetch_hit_rate() {
                                       nullptr));
 
     // Bounded pool so prefetch has something to warm (an auto pool goes fully
-    // resident after token 1 and never needs warming).
+    // resident after token 1 and never needs warming). This test measures the
+    // EC-6 warm-ahead HIT RATE (how often a warmed expert is then routed), which
+    // is orthogonal to FEAT-003's zero-overlap self-backoff; pin the backoff OFF
+    // so the warm-ahead mechanism is exercised over the whole sequence (with
+    // backoff on, this tiny 2-layer fixture latches after one probe token - a
+    // separate FEAT-003 assertion - leaving too little warming to measure a
+    // stable hit rate here).
+    ScopedEnv no_backoff("STRATAFLOW_ENGINE_PREFETCH_BACKOFF", "off");
     engine::EngineCacheStats st{};
     std::vector<std::vector<float>> logits;
     std::vector<int32_t> toks =
@@ -891,6 +931,364 @@ static void test_engine_async_prefetch_byte_identical() {
     CHECK(async_stats.evictions > 0);
 }
 
+// FEAT-002: set STRATAFLOW_ENGINE_GLOBAL_LRU for the scope of an engine run,
+// restoring the prior value on destruction. "1" forces the LEGACY single
+// global-LRU SlotPool; unset (default) uses the LAYER-STRATIFIED pool. RAII so
+// a mid-test assertion cannot leak the override into sibling tests. Mirrors
+// ScopedAsyncPrefetch above.
+class ScopedGlobalLru {
+public:
+    explicit ScopedGlobalLru(const char *value) {
+        const char *prev = std::getenv("STRATAFLOW_ENGINE_GLOBAL_LRU");
+        had_prev_ = prev != nullptr;
+        if (had_prev_) prev_ = prev;
+#if defined(_WIN32)
+        _putenv_s("STRATAFLOW_ENGINE_GLOBAL_LRU", value);
+#else
+        setenv("STRATAFLOW_ENGINE_GLOBAL_LRU", value, /*overwrite=*/1);
+#endif
+    }
+    ~ScopedGlobalLru() {
+#if defined(_WIN32)
+        _putenv_s("STRATAFLOW_ENGINE_GLOBAL_LRU", had_prev_ ? prev_.c_str() : "");
+#else
+        if (had_prev_) {
+            setenv("STRATAFLOW_ENGINE_GLOBAL_LRU", prev_.c_str(), 1);
+        } else {
+            unsetenv("STRATAFLOW_ENGINE_GLOBAL_LRU");
+        }
+#endif
+    }
+    ScopedGlobalLru(const ScopedGlobalLru &) = delete;
+    ScopedGlobalLru &operator=(const ScopedGlobalLru &) = delete;
+
+private:
+    bool had_prev_ = false;
+    std::string prev_;
+};
+
+// LEVER B gate (FEAT-002): on a MULTI-LAYER MoE fixture at the SAME bounded slot
+// count, the LAYER-STRATIFIED residency policy must (a) decode BYTE-IDENTICALLY
+// to the legacy single global-LRU pool (streaming only changes WHICH experts
+// are resident / WHEN, never which bytes compute), and (b) record STRICTLY
+// FEWER misses than the global LRU - i.e. the per-token working set now hits
+// cache across tokens instead of being evicted via the intervening layers.
+//
+// Guarded on STRATAFLOW_TEST_BENCH_STRATA (a multi-layer bench MoE GGUF, e.g.
+// /projects/sandbox/bench_moe-L8-E16.gguf). Despite the historical env-var name
+// this MUST point at the .gguf, NOT the sibling .strata: the test tokenizes the
+// prompt through engine_decode_sequence -> vocab_tokenize, which loads the file
+// with the libllama vocab loader, and libllama rejects the StrataFlow 'STRA'
+// magic. The .strata byte source is NOT needed to prove lever B - the engine
+// still exercises the GGUF MoE SlotPool path, which is exactly what the
+// stratified-vs-global comparison changes. The CLI drives the real .strata +
+// streamed_bytes path for the byte-count proof (see FEAT-002 findings).
+//
+// Skips cleanly (never hard-fails) when the var is unset OR when it points at a
+// file the libllama vocab cannot tokenize (e.g. a .strata): a set-but-wrong-
+// kind var yields a 0-token decode, which we detect and skip rather than
+// turning every assertion red. The 2-layer oracle fixture
+// (STRATAFLOW_TEST_MOE_GGUF) already gates byte-identity + eviction above; this
+// case adds the multi-layer fewer-misses proof the global LRU cannot pass.
+// Async prefetch is forced OFF so the comparison isolates the residency policy
+// from prefetch timing.
+static void test_engine_residency_policy_fewer_misses() {
+    const char *path = std::getenv("STRATAFLOW_TEST_BENCH_STRATA");
+    if (path == nullptr || path[0] == '\0') {
+        std::printf("[skipped: set STRATAFLOW_TEST_BENCH_STRATA to a bench "
+                    ".gguf] ");
+        return;
+    }
+
+    // Robustness: if the fixture cannot be tokenized through the libllama vocab
+    // (e.g. the var points at a .strata, whose 'STRA' magic libllama rejects),
+    // every decode below would return an empty token vector and the hits/misses
+    // assertions would spuriously fail. Detect that up front and SKIP cleanly so
+    // a set-but-wrong-kind var never produces a red suite.
+    {
+        std::vector<int32_t> probe_ids;
+        if (!engine::vocab_tokenize(path, "hello world", probe_ids) ||
+            probe_ids.empty()) {
+            std::printf("[skipped: STRATAFLOW_TEST_BENCH_STRATA=%s not "
+                        "libllama-tokenizable (point it at a bench .gguf)] ",
+                        path);
+            return;
+        }
+    }
+
+    const std::string prompt = "hello world";
+    const int n_generate = 8;
+    // Bounded at n_layer * n_expert_used (the L8-E16 fixture: 8*4 = 32), the
+    // tight-budget regime lever B targets: the budget barely holds ONE per-
+    // layer sweep, so a single global LRU thrashes (a layer's top-k is evicted
+    // by the intervening layers before the next token sweeps back), while the
+    // layer-stratified pool guarantees each layer keeps its top-k resident in
+    // its own scope. Well below the full working set (n_layer*n_expert = 128)
+    // yet >= n_expert_used so a single layer's top-k always fits. This is a
+    // shape-derived count, not a machine constant.
+    const uint32_t bounded_slots = 32;
+
+    ScopedAsyncPrefetch async_off("0");  // isolate residency from prefetch
+
+    // Decode under the legacy GLOBAL-LRU pool.
+    engine::EngineCacheStats global_stats{};
+    std::vector<std::vector<float>> global_logits;
+    std::vector<int32_t> global_tokens;
+    {
+        ScopedGlobalLru force("1");
+        global_tokens = engine_decode_sequence(path, prompt, n_generate,
+                                               bounded_slots, global_stats,
+                                               global_logits);
+    }
+
+    // Decode under the LAYER-STRATIFIED pool (default).
+    engine::EngineCacheStats strat_stats{};
+    std::vector<std::vector<float>> strat_logits;
+    std::vector<int32_t> strat_tokens;
+    {
+        ScopedGlobalLru use_strat("0");
+        strat_tokens = engine_decode_sequence(path, prompt, n_generate,
+                                              bounded_slots, strat_stats,
+                                              strat_logits);
+    }
+
+    CHECK_EQ(global_tokens.size(), static_cast<size_t>(n_generate));
+    CHECK_EQ(strat_tokens.size(), static_cast<size_t>(n_generate));
+
+    // (a) BYTE-IDENTITY: same tokens and bit-identical per-step logits.
+    bool seq_match = global_tokens.size() == strat_tokens.size();
+    for (size_t i = 0; i < strat_tokens.size() && i < global_tokens.size(); ++i) {
+        CHECK_EQ(strat_tokens[i], global_tokens[i]);
+        if (strat_tokens[i] != global_tokens[i]) seq_match = false;
+    }
+    double max_delta = 0.0;
+    const size_t steps = global_logits.size() < strat_logits.size()
+                             ? global_logits.size()
+                             : strat_logits.size();
+    for (size_t s = 0; s < steps; ++s) {
+        const size_t n = global_logits[s].size() < strat_logits[s].size()
+                             ? global_logits[s].size()
+                             : strat_logits[s].size();
+        for (size_t i = 0; i < n; ++i) {
+            const double d = std::fabs(static_cast<double>(global_logits[s][i]) -
+                                       static_cast<double>(strat_logits[s][i]));
+            if (d > max_delta) max_delta = d;
+        }
+    }
+
+    std::printf("[residency: slots=%u strat(hits=%llu miss=%llu evict=%llu) "
+                "global(hits=%llu miss=%llu evict=%llu) seq match=%s "
+                "max|delta|=%.3e] ",
+                bounded_slots,
+                static_cast<unsigned long long>(strat_stats.hits),
+                static_cast<unsigned long long>(strat_stats.misses),
+                static_cast<unsigned long long>(strat_stats.evictions),
+                static_cast<unsigned long long>(global_stats.hits),
+                static_cast<unsigned long long>(global_stats.misses),
+                static_cast<unsigned long long>(global_stats.evictions),
+                seq_match ? "yes" : "no", max_delta);
+
+    CHECK(seq_match);
+    CHECK(max_delta == 0.0);  // policy changes residency, never the math
+
+    // The bounded pool actually evicted under BOTH policies (hits/misses/
+    // evictions all > 0), so the comparison is meaningful.
+    CHECK(strat_stats.hits > 0);
+    CHECK(strat_stats.misses > 0);
+    CHECK(strat_stats.evictions > 0);
+    CHECK(global_stats.misses > 0);
+
+    // (b) LEVER B WIN: the stratified policy re-streams strictly less - fewer
+    // misses than the global LRU at the SAME bounded slot count.
+    CHECK(strat_stats.misses < global_stats.misses);
+}
+
+// FEAT-003 (LEVER A) gate: async prefetch must STOP HURTING. Two gates compose:
+//   (1) FREE-SLOT INSTALL GATING at pf_drain_completed - a completed prefetch
+//       installs ONLY into a genuinely free per-layer slot, never evicting a
+//       still-needed authoritative resident, so async-on can never amplify the
+//       authoritative working set's miss/stream count.
+//   (2) ADAPTIVE SELF-BACKOFF - when the observed completed-before-use rate
+//       stays at zero over a shape-derived window of tokens (the slow-box
+//       regime where compute cannot hide the read), stop enqueuing speculative
+//       prefetches so prefetch adds no more bytes.
+//
+// This test asserts, on the 2-layer oracle fixture at a BOUNDED pool that forces
+// eviction:
+//   (a) async-on decode is byte-identical to async-off AND to the fully-
+//       resident run AND to the oracle under the gated policy (tokens exact;
+//       logits max|delta| 0.0 vs sync/full, < 1e-3 vs oracle);
+//   (b) async-on misses (the streamed-bytes proxy on the .gguf path, where
+//       streamed_bytes() is 0) are <= async-off at the same bounded slots (the
+//       no-longer-hurts invariant), and STRICTLY LESS than the pre-gating
+//       unconditional-install behavior when overlap is ~0 (reproduced via the
+//       test-only no-install-gate + no-backoff knobs);
+//   (c) under this zero-overlap scenario the self-backoff engages: with the
+//       gates ON, prefetch_warmed is STRICTLY LESS than with backoff forced OFF
+//       (the worker stopped issuing speculative reads once overlap stayed at 0).
+// Guarded on STRATAFLOW_TEST_MOE_GGUF; skips cleanly if unset.
+static void test_engine_async_prefetch_gated_no_regression() {
+    const char *path = std::getenv("STRATAFLOW_TEST_MOE_GGUF");
+    if (path == nullptr || path[0] == '\0') {
+        std::printf("[skipped: set STRATAFLOW_TEST_MOE_GGUF] ");
+        return;
+    }
+
+    const std::string prompt = "hello world";
+    const int n_generate = 12;             // enough tokens for backoff to latch
+    const uint32_t bounded_slots = 3;      // below 8 experts/layer: forces evict
+
+    // Oracle sequence (the hard gate).
+    std::vector<int32_t> oracle_tokens;
+    std::vector<std::vector<float>> oracle_step_logits;
+    CHECK(engine::run_oracle_sequence(path, prompt, n_generate, oracle_tokens,
+                                      &oracle_step_logits));
+
+    // Fully-resident (auto pool, no eviction, no prefetch worker).
+    engine::EngineCacheStats full_stats{};
+    std::vector<std::vector<float>> full_logits;
+    std::vector<int32_t> full_tokens = engine_decode_sequence(
+        path, prompt, n_generate, /*slots=*/0, full_stats, full_logits);
+
+    // Async OFF (synchronous warm_expert) at the bounded slots.
+    engine::EngineCacheStats off_stats{};
+    std::vector<std::vector<float>> off_logits;
+    std::vector<int32_t> off_tokens;
+    {
+        ScopedAsyncPrefetch off("0");
+        off_tokens = engine_decode_sequence(path, prompt, n_generate,
+                                            bounded_slots, off_stats, off_logits);
+    }
+
+    // Async ON, GATED (default policy: install-gating + adaptive backoff).
+    // Explicitly pin the knobs to their DEFAULTS so an ambient env override
+    // (e.g. a developer exporting the test-only knob) cannot leak in and defeat
+    // the gated policy this config is meant to exercise: "auto" is not a
+    // recognized backoff force value, so the engine falls through to adaptive
+    // Auto; "0" is not a recognized no-install-gate truthy value, so the install
+    // gate stays ON.
+    engine::EngineCacheStats on_stats{};
+    std::vector<std::vector<float>> on_logits;
+    std::vector<int32_t> on_tokens;
+    {
+        ScopedAsyncPrefetch on("1");
+        ScopedEnv auto_backoff("STRATAFLOW_ENGINE_PREFETCH_BACKOFF", "auto");
+        ScopedEnv gate_on("STRATAFLOW_ENGINE_PREFETCH_NO_INSTALL_GATE", "0");
+        on_tokens = engine_decode_sequence(path, prompt, n_generate,
+                                           bounded_slots, on_stats, on_logits);
+    }
+
+    // Async ON, PRE-GATING (both gates disabled): unconditional install (evicts)
+    // + no backoff (keeps speculating). This reproduces the old behavior that
+    // AMPLIFIED misses/streamed bytes when overlap is ~0.
+    engine::EngineCacheStats pre_stats{};
+    std::vector<std::vector<float>> pre_logits;
+    std::vector<int32_t> pre_tokens;
+    {
+        ScopedAsyncPrefetch on("1");
+        ScopedEnv no_backoff("STRATAFLOW_ENGINE_PREFETCH_BACKOFF", "off");
+        ScopedEnv no_gate("STRATAFLOW_ENGINE_PREFETCH_NO_INSTALL_GATE", "1");
+        pre_tokens = engine_decode_sequence(path, prompt, n_generate,
+                                            bounded_slots, pre_stats, pre_logits);
+    }
+
+    // Async ON, backoff FORCED OFF but install-gate ON: isolates the backoff's
+    // contribution to the reduced prefetch_warmed (gated < this).
+    engine::EngineCacheStats nobo_stats{};
+    std::vector<std::vector<float>> nobo_logits;
+    std::vector<int32_t> nobo_tokens;
+    {
+        ScopedAsyncPrefetch on("1");
+        ScopedEnv no_backoff("STRATAFLOW_ENGINE_PREFETCH_BACKOFF", "off");
+        ScopedEnv gate_on("STRATAFLOW_ENGINE_PREFETCH_NO_INSTALL_GATE", "0");
+        nobo_tokens = engine_decode_sequence(path, prompt, n_generate,
+                                             bounded_slots, nobo_stats,
+                                             nobo_logits);
+    }
+
+    CHECK_EQ(off_tokens.size(), static_cast<size_t>(n_generate));
+    CHECK_EQ(on_tokens.size(), static_cast<size_t>(n_generate));
+    CHECK_EQ(pre_tokens.size(), static_cast<size_t>(n_generate));
+    CHECK_EQ(nobo_tokens.size(), static_cast<size_t>(n_generate));
+
+    // (a) BYTE-IDENTITY across every config and vs the oracle. Prefetch policy
+    // only changes WHEN/WHETHER bytes are pre-warmed, never the math.
+    bool seq_match = true;
+    for (size_t i = 0; i < on_tokens.size() && i < oracle_tokens.size(); ++i) {
+        CHECK_EQ(on_tokens[i], oracle_tokens[i]);
+        CHECK_EQ(on_tokens[i], off_tokens[i]);
+        CHECK_EQ(on_tokens[i], full_tokens[i]);
+        CHECK_EQ(on_tokens[i], pre_tokens[i]);
+        CHECK_EQ(on_tokens[i], nobo_tokens[i]);
+        if (on_tokens[i] != oracle_tokens[i] || on_tokens[i] != off_tokens[i] ||
+            on_tokens[i] != full_tokens[i] || on_tokens[i] != pre_tokens[i] ||
+            on_tokens[i] != nobo_tokens[i]) {
+            seq_match = false;
+        }
+    }
+    double max_on_vs_off = 0.0, max_on_vs_full = 0.0, max_on_vs_oracle = 0.0;
+    const size_t steps = on_logits.size();
+    for (size_t s = 0; s < steps; ++s) {
+        const auto &a = on_logits[s];
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double av = static_cast<double>(a[i]);
+            if (s < off_logits.size() && i < off_logits[s].size()) {
+                const double d = std::fabs(av - static_cast<double>(off_logits[s][i]));
+                if (d > max_on_vs_off) max_on_vs_off = d;
+            }
+            if (s < full_logits.size() && i < full_logits[s].size()) {
+                const double d = std::fabs(av - static_cast<double>(full_logits[s][i]));
+                if (d > max_on_vs_full) max_on_vs_full = d;
+            }
+            if (s < oracle_step_logits.size() && i < oracle_step_logits[s].size()) {
+                const double d = std::fabs(av - static_cast<double>(oracle_step_logits[s][i]));
+                if (d > max_on_vs_oracle) max_on_vs_oracle = d;
+            }
+        }
+    }
+
+    std::printf("[gated: slots=%u off(miss=%llu) on(miss=%llu warmed=%llu cbu=%llu) "
+                "nobo(miss=%llu warmed=%llu) pre(miss=%llu warmed=%llu) "
+                "seq=%s on-vs-off|d|=%.3e on-vs-oracle|d|=%.3e] ",
+                bounded_slots,
+                static_cast<unsigned long long>(off_stats.misses),
+                static_cast<unsigned long long>(on_stats.misses),
+                static_cast<unsigned long long>(on_stats.prefetch_warmed),
+                static_cast<unsigned long long>(on_stats.prefetch_completed_before_use),
+                static_cast<unsigned long long>(nobo_stats.misses),
+                static_cast<unsigned long long>(nobo_stats.prefetch_warmed),
+                static_cast<unsigned long long>(pre_stats.misses),
+                static_cast<unsigned long long>(pre_stats.prefetch_warmed),
+                seq_match ? "yes" : "no", max_on_vs_off, max_on_vs_oracle);
+
+    CHECK(seq_match);
+    CHECK(max_on_vs_off == 0.0);     // async-on bit-identical to async-off
+    CHECK(max_on_vs_full == 0.0);    // and to fully-resident
+    CHECK(max_on_vs_oracle < 1e-3);  // and within F32 tol of the oracle
+
+    // The bounded pool actually evicted (the comparison is meaningful).
+    CHECK(on_stats.misses > 0);
+    CHECK(off_stats.misses > 0);
+
+    // Zero-overlap scenario confirmation: the fast test CPU + the small per-
+    // layer compute window hides nothing, so completed_before_use is 0 - the
+    // regime self-backoff targets.
+    CHECK_EQ(on_stats.prefetch_completed_before_use, 0u);
+
+    // (b) NO-LONGER-HURTS: async-on streams no MORE than async-off (misses are
+    // the streamed-bytes proxy here, since the .gguf path has streamed_bytes==0)
+    // and STRICTLY LESS than the pre-gating unconditional-install behavior that
+    // amplified misses by evicting still-needed residents for zero overlap.
+    CHECK(on_stats.misses <= off_stats.misses);
+    CHECK(on_stats.misses < pre_stats.misses);
+
+    // (c) SELF-BACKOFF ENGAGED: with the gates ON the worker stopped issuing
+    // speculative reads once overlap stayed at zero, so strictly fewer experts
+    // were warmed than with backoff forced OFF (which keeps speculating every
+    // token for the whole sequence).
+    CHECK(on_stats.prefetch_warmed < nobo_stats.prefetch_warmed);
+}
+
 static void run_all() {
     RUN(test_engine_matches_oracle);
     RUN(test_engine_sequence_matches_oracle);
@@ -898,6 +1296,8 @@ static void run_all() {
     RUN(test_engine_auto_slots_matches_oracle);
     RUN(test_engine_prefetch_hit_rate);
     RUN(test_engine_async_prefetch_byte_identical);
+    RUN(test_engine_async_prefetch_gated_no_regression);
+    RUN(test_engine_residency_policy_fewer_misses);
     RUN(test_engine_dense_matches_oracle);
     RUN(test_engine_quant_matches_oracle);
     RUN(test_engine_kquant_matches_oracle);

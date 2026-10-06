@@ -97,6 +97,36 @@ families are the remaining quant-coverage gap.
   bounded streaming. Guarded by `test_strata_shape_prepass` (packs the legacy
   fixture and asserts the plan is NOT dense) and `test_mixtral_scale_12gb_auto`
   (auto policy on the real Mixtral shape + 12 GB budget).
+- [x] **Layer-stratified residency + prefetch gating (bytes-streamed/token
+  reduction, async no longer hurts).** Two composing levers on the bounded-RAM
+  streaming path, both oracle byte-identical and adaptive to model shape with no
+  machine constants. LEVER B: the single GLOBAL plain-LRU SlotPool is replaced
+  by LAYER-STRATIFIED, frequency-aware per-layer residency - each layer gets its
+  own LRU scope and a shape-derived capacity (`base = n_slots / n_layer`, floored
+  at a single layer's top-k, spare slots distributed by observed per-layer
+  routing frequency), so a layer's hot experts survive across tokens instead of
+  being evicted by the intervening layers' sweeps. The TOTAL slot budget (and
+  thus peak RSS) is unchanged; only how slots are partitioned/evicted changes.
+  Sandbox-proven on `bench_moe-L8-E16` at the shape-derived tight budget
+  (slots=32 = `n_layer * n_expert_used`): streamed bytes drop from 522,190,848
+  to 327,155,712 (37.3% fewer, 35.8% fewer misses) at identical peak RSS, decode
+  byte-identical. LEVER A: async prefetch no longer increases bytes streamed - a
+  completed speculative read is only installed into a genuinely FREE per-layer
+  slot (so it can never evict a still-needed authoritative resident), and the
+  worker SELF-BACKS-OFF (stops issuing speculative reads) once the observed
+  `completed-before-use` rate stays ~0 over a shape-derived window. This
+  reverses the earlier async-on regression: on `bench_moe-L8-E16` at the bounded
+  slots=24, async-on now streams 46,792,704 bytes/tok vs async-off 61,341,696
+  (0.76x, async-on <= async-off), decoded text byte-identical at the same
+  132.4 MiB peak RSS. The authoritative `ensure_layer_experts_resident` is
+  unchanged (byte provenance / graph order identical), the compute path stays
+  single-threaded (one extra I/O thread that never mutates the pool), and the
+  default-ON async toggle + `completed-before-use`/`streamed_bytes` stats are
+  intact. Sandbox-proven: the streamed-bytes/token reduction, byte-identity, and
+  prefetch-no-longer-hurts invariant. Colab-only: the absolute wall-clock tok/s
+  on the real ~19 GB Mixtral (`completed-before-use` stays ~0 on fast sandbox
+  CPUs, mirroring 2-core Colab, so the overlap wall-clock win is hardware-
+  dependent; exact before/after re-verify commands in `colab/README.md`).
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.
@@ -200,7 +230,16 @@ most are pure CPU/disk work.
   a larger runtime), not proven in the offline sandbox/CI. The harness also
   contrasts the auto row (slots=0) against a deliberately-too-small fixed slot
   count for the SAME model and reports that auto streams far fewer bytes/token
-  (and decodes faster), demonstrating the per-model auto-residency policy.
+  (and decodes faster), demonstrating the per-model auto-residency policy. With
+  `--async-list on,off` it now also reports, per `(model, slots)`, that async-on
+  streams `<=` as many bytes/token as async-off at a bounded slot count (the
+  prefetch-no-longer-hurts invariant from the gating lever above), alongside the
+  `completed-before-use` overlap metric; the streamed-bytes/token reduction from
+  layer-stratified residency vs the old global LRU is likewise sandbox-measured
+  (see "Layer-stratified residency + prefetch gating"). What stays Colab-only is
+  the absolute wall-clock tok/s on real large models - the mechanism (fewer
+  bytes streamed/token, async no longer increasing streamed bytes, byte-
+  identity) is proven in-sandbox; the throughput ladder is hardware-dependent.
 
 ### Breadth and performance
 
@@ -236,7 +275,11 @@ most are pure CPU/disk work.
   on, byte-identical output); absolute wall-clock speedup is hardware-dependent
   and re-verifiable on Colab/real-Mixtral (see `colab/README.md`). Per-layer
   graph-build reuse across tokens (`ENGINE_CORE_DESIGN.md` section 3.5) remains
-  a separate deferred item.
+  a separate deferred item. FOLLOW-UP (see "Layer-stratified residency +
+  prefetch gating" above): async prefetch is now GATED so it never increases
+  bytes streamed - a completed prefetch installs only into a free per-layer slot
+  and the worker self-backs-off when overlap stays ~0 - which reverses the
+  earlier bounded-slot regression where async-on streamed MORE than async-off.
 
 ### From the original PLAN.md (Phases 4-7), as written
 
