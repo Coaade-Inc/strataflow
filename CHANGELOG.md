@@ -211,6 +211,72 @@ grouped by the pull request that merged them.
 
 ### Correctness and honesty fixes
 
+- Conservative RAM budget: the auto expert-cache is now sized AFTER subtracting
+  ALL other mandatory resident costs, and the planner can no longer plan a
+  configuration that OOM-kills the box. This fixes the real symptom where a
+  real Mixtral-8x7B Q3_K_M `.strata` (`n_ctx` 32768) on the 12 GiB free Colab
+  box loaded the trunk, printed the plan line
+  `experts[resident=122 bundles], experts STREAMED (bounded), est. peak ~9 GiB`,
+  and was then KILLED (OOM, exit status 137 / SIGKILL) before producing any
+  output or stats line - even though the "est. peak ~9 GiB" claimed to fit.
+  Adding `STRATAFLOW_ENGINE_KV_WINDOW=512` made the OOM certain; the default run
+  only barely survived at ~10.6 GB. Root cause: the planner sized the resident
+  expert pool from ALL remaining RAM after only the trunk
+  (`ram_for_experts = vram_left + ram`, ~122 bundles on Mixtral) and its
+  `planned_peak_bytes` was a dishonest trunk+experts-only figure that omitted
+  the KV cache (8 GiB at full `n_ctx`), the one-layer expert staging buffer, the
+  ggml compute buffer, the process floor, and any safety margin - and it was
+  never used as a hard bound. The fix reworks `plan_placement`
+  (`src/plan/planner.cpp`):
+  - A CONSERVATIVE usable-RAM ceiling replaces the optimistic MemAvailable
+    reading: `usable_RAM = min(ram_free - max(1 GiB, 12.5%), 85% of ram_total)`,
+    because MemAvailable on a shared Colab box over-reports what is really free.
+  - The resident expert cache is sized from what is LEFT after every other
+    mandatory resident cost is subtracted:
+    `available_for_experts = usable_RAM - (trunk_in_RAM + resident_KV(chosen
+    window) + one-layer staging at FULL n_expert (matching the engine's
+    stage_gate/up/down, not n_experts_used) + a conservative ggml compute-buffer
+    estimate + a ~160 MiB process floor + a safety margin of max(512 MiB, 8% of
+    usable))`; only `available_for_experts / expert_bytes` gives the resident
+    bundle count, clamped to `[n_experts_used, full_slots]`. The old
+    `ram_for_experts = vram_left + ram` is gone.
+  - `planned_peak_bytes` is now an HONEST, conservative upper bound: it is the
+    sum of all those components, not the old trunk+experts-only number.
+  - HARD FIT INVARIANT: the planner never returns a configuration whose own
+    projected peak exceeds `usable_RAM`. It reduces the resident bundle count
+    down to the `n_experts_used` floor rather than over-committing, so by
+    construction `planned_peak_bytes <= usable_RAM` for any non-refused plan.
+  - LOSSLESS auto KV-window default: when full-`n_ctx` KV (8 GiB on Mixtral
+    `n_ctx` 32768) would blow the budget, the planner steps the resident KV
+    window down to the largest power-of-two (`>= 256`) that fits, recorded in
+    `plan.kv_window` and plumbed to the engine via the same
+    `STRATAFLOW_ENGINE_KV_WINDOW` path (an explicit user window still wins), so a
+    real large-context Mixtral fits by DEFAULT. The freed RAM LOWERS the peak and
+    is NOT re-consumed by more experts (the safety margin is held fixed).
+  - LOUD refusal: if even the minimal config (`n_experts_used` bundles + the
+    smallest safe KV window + trunk) cannot fit, `plan.fits` is set false with a
+    clear ASCII reason naming the shortfall, `sf_context_create` returns
+    `SF_ERR_RUNTIME`, and the CLI prints the reason and exits non-zero - instead
+    of the silent SIGKILL this change replaces.
+  Before/after on the synthetic Mixtral-on-12GB box (`n_layer` 32, 8x2,
+  `expert_bytes` ~52 MiB, trunk ~5.5 GiB, `n_ctx` 32768, `head_dim` 128,
+  `n_head_kv` 8; `ram_total` 12 GiB, `ram_free` 10.6 GiB, no GPU): BEFORE the
+  planner picked ~122 resident bundles and printed "est. peak ~9 GiB" while the
+  true peak (adding ~8 GiB full KV + staging + compute + floor) OOM-killed the
+  box (exit 137). AFTER `slots=19`, auto `kv_window=4096` (lossless; full
+  `n_ctx` KV would not fit), honest projected peak 9495 MiB `<=` usable
+  9497 MiB, well under 12 GiB with margin. Sandbox-proven by the pure-function
+  planner unit test `test_mixtral_12gb_conservative_budget` in
+  `tests/test_planner.cpp` (asserts the honest peak `<=` usable `<` ram_total
+  AND is strictly larger than the old dishonest trunk+slots*expert_bytes value,
+  the slot count is reduced below ~122 and `>= n_experts_used` and `< 256`, a KV
+  window lowers the peak, and a pathologically small 2 GiB box triggers the loud
+  `fits=false` refusal); the forward math and the libllama oracle byte-identity
+  are untouched (residency/window sizing only). The REAL confirmation is the
+  user's Colab re-run: with this fix the SAME default run and the
+  `STRATAFLOW_ENGINE_KV_WINDOW=512` run from the OOM report should both DECODE
+  (not SIGKILL) with identical text and a stats line showing peak RSS safely
+  under 12 GB; the exact re-verify commands are in `colab/README.md`.
 - Real-hardware empty-output regression in lossless KV paging (technique 6.5)
   fixed, and the cold store is now BOUNDED to used positions. On the real
   Mixtral-8x7B Q3_K_M (`n_ctx` 32768) a Colab run with

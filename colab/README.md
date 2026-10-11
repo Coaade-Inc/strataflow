@@ -202,6 +202,81 @@ the DEFAULT is byte-identical and zero-overhead) and is set via the
   `resident_kv`, `resident_kv_bytes`, `peak RSS` and the decoded text on the SAME
   model and prompt.
 
+### Conservative RAM budget (no more silent OOM / exit 137)
+
+The planner now sizes the resident expert cache from a CONSERVATIVE memory
+budget that subtracts ALL other mandatory resident costs BEFORE deciding how
+many experts fit, treats its own projected peak as a HARD bound, auto-picks a
+lossless KV window when full-`n_ctx` KV would not fit, and REFUSES loudly rather
+than hand back an OOM-bound configuration. This fixes the exact failure from the
+field report: on the free Colab box (12 GiB RAM, 2 cores, SSD ~4 GiB/s, no GPU),
+the real Mixtral-8x7B Q3_K_M `.strata` (`n_ctx` 32768) loaded the trunk, printed
+the plan line `experts[resident=122 bundles], experts STREAMED (bounded),
+est. peak ~9 GiB`, and was then KILLED (OOM, exit status 137 / SIGKILL) before
+producing any output or the stats line - with `STRATAFLOW_ENGINE_KV_WINDOW=512`
+the OOM was certain, and even the default run only barely survived at ~10.6 GB.
+The "est. peak ~9 GiB" was dishonest: it counted only trunk + experts and omitted
+the ~8 GiB full-`n_ctx` KV cache, the one-layer expert staging buffer, the ggml
+compute buffer, the process floor, and any margin.
+
+After the fix the planner's `planned_peak_bytes` is an HONEST, conservative upper
+bound (trunk + resident experts + resident KV at the chosen window + one-layer
+staging at full `n_expert` + a conservative compute estimate + a ~160 MiB process
+floor + a safety margin of `max(512 MiB, 8% of usable)`), the usable-RAM ceiling
+is conservative (`min(ram_free - max(1 GiB, 12.5%), 85% of ram_total)` because
+MemAvailable over-reports on a shared box), and the resident bundle count is
+reduced (down to one layer's top-k if needed) until the projected peak fits -
+never over-committed. On the synthetic Mixtral-on-12GB shape this goes from
+~122 bundles / "~9 GiB" (OOM) to `slots=19`, auto `kv_window=4096`, with an
+honest projected safe peak of 9495 MiB (`<=` usable 9497 MiB), well under 12 GiB.
+
+- **Sandbox-proven (offline, in CI):** the pure-function planner unit test
+  `test_mixtral_12gb_conservative_budget` in `tests/test_planner.cpp` reproduces
+  the over-commit deterministically with synthetic shapes (no model download):
+  it asserts the honest peak is `<=` usable `<` `ram_total` AND strictly larger
+  than the old dishonest trunk+slots*expert_bytes value, the slot count is
+  reduced below ~122 and stays `>= n_experts_used` and `< 256`, a KV window
+  lowers the peak, and a pathologically small 2 GiB budget triggers the loud
+  `fits=false` refusal. Run it with:
+
+  ```bash
+  %%bash
+  cd /content/strataflow/build/release
+  ctest -R test_planner --output-on-failure
+  ```
+
+  The `test_planner` log prints a `[mixtral budget: slots=19 kv_window=4096
+  peak=9495MiB usable=9497MiB]` line showing the reduced slots and the honest
+  peak under budget.
+- **Colab-only (real Mixtral):** the SAME default run and the
+  `STRATAFLOW_ENGINE_KV_WINDOW=512` run from the OOM report should now BOTH
+  DECODE (not SIGKILL) with identical text and a `stats:` line showing peak RSS
+  safely under 12 GB (projected safe peak ~9.5 GiB with the auto KV window; lower
+  still with the explicit 512-column window). The offline sandbox cannot download
+  the multi-GB model, so re-verify on Colab by running both commands on the SAME
+  model and prompt:
+
+  ```bash
+  %%bash
+  cd /content/strataflow/build/release
+  # DEFAULT run: auto residency + auto lossless KV window chosen by the planner.
+  ./bin/strataflow --model /content/real_model.strata \
+    --expert-slots 0 --max-tokens 16 --async-prefetch on --prompt "The city of"
+  # KV_WINDOW run: the exact command that previously OOM-killed (exit 137).
+  STRATAFLOW_ENGINE_KV_WINDOW=512 ./bin/strataflow --model /content/real_model.strata \
+    --expert-slots 0 --max-tokens 16 --async-prefetch on --prompt "The city of"
+  ```
+
+  Expected after the fix: BOTH runs decode "The city of ..." text (identical
+  between them, since the KV window is lossless), each printing a plan line and a
+  final `stats: resident model weights = ... MiB, peak RSS = ... MiB, ...` line
+  with peak RSS under 12 GB - instead of the empty cell + `Killed` (exit status
+  137) the default planner produced before. If a runtime genuinely cannot fit
+  even the minimal configuration, the CLI now prints a clear ASCII refusal naming
+  the shortfall and exits non-zero, rather than being SIGKILLed with no message.
+  The real confirmation of the peak-RSS numbers is this Colab re-run; the
+  in-sandbox proof is the synthetic-Mixtral planner unit test above.
+
 ### Which real model, and why
 
 The engine runs **llama-architecture** models only. That drives the choice:

@@ -291,6 +291,61 @@ resident costs into *bounded, streamable* costs, which (a) makes the model fit
 and (b) frees several GB to enlarge the resident expert cache, which directly
 attacks Ceiling B by holding more of the hot working set.
 
+### The budget is enforced by construction (conservative, fit-by-construction)
+
+The table above is the target shape of the floor; the planner now MAKES it hold
+rather than hoping it does. Shipped in FEAT-002 (`src/plan/planner.cpp`), the
+auto placement planner sizes the resident expert cache from what is LEFT after
+EVERY other mandatory resident cost is subtracted from a conservative usable-RAM
+ceiling, and treats its own projected peak as a hard bound. The components are:
+
+- **usable_RAM** = `min(ram_free - max(1 GiB, 12.5%), 85% of ram_total)`. This is
+  deliberately conservative because MemAvailable (`ram_free`) on a shared Colab
+  box over-reports what is really free, so the budget also caps at 85% of
+  physical `ram_total`.
+- **trunk resident** - the hot trunk bytes placed in RAM (edge tensors already
+  streamed per 6.4).
+- **resident KV at the chosen window** - `n_layer * 2 * (head_dim * n_head_kv) *
+  4 * W` for the resident window `W` (full `n_ctx` if no window), matching the
+  engine's `resident_kv_bytes()`. If the shape fields are unknown the planner
+  uses a conservative fallback and never under-counts.
+- **one-layer expert staging at FULL n_expert** - `n_expert * expert_bytes`, NOT
+  `n_experts_used * expert_bytes`, because the engine's `stage_gate/up/down`
+  tensors are sized to a full layer's expert count.
+- **compute buffer** - a conservative ggml estimate (a floor plus a
+  window/shape term, erring high, since `ggml_gallocr_alloc_graph` grows it on
+  demand with no fixed reserve).
+- **process floor** - at least ~160 MiB (the fixed llama/ggml + vocab floor
+  Section 1 and the ROADMAP measure at ~132 MiB).
+- **safety margin** - `max(512 MiB, 8% of usable_RAM)`, held fixed.
+
+Only `available_for_experts = usable_RAM - (sum of the above)` divided by
+`expert_bytes` gives the resident bundle count, clamped to
+`[n_experts_used, full_slots]`. This REPLACES the old
+`ram_for_experts = vram_left + ram` (all remaining RAM after only the trunk,
+which picked ~122 bundles on Mixtral). Two invariants follow:
+
+- **Honest peak.** `planned_peak_bytes` is now the SUM of all those components,
+  a conservative upper bound - not the old dishonest trunk+experts-only figure
+  that printed "est. peak ~9 GiB" on a 12 GiB box and still got OOM-killed
+  (exit status 137 / SIGKILL) before any output.
+- **Fit by construction.** For any non-refused plan, `planned_peak_bytes <=
+  usable_RAM`; the planner reduces the resident bundle count down to the
+  `n_experts_used` floor rather than ever over-committing.
+
+The KV window interacts with the budget cleanly: when full-`n_ctx` KV would make
+the floor infeasible, the planner picks a LOSSLESS auto window `W` (the largest
+power-of-two `>= 256` that fits) and the KV saving LOWERS the projected peak - it
+is NOT re-consumed by a greedy re-expansion of the expert cache to the brink (the
+safety margin stays held). An explicit `STRATAFLOW_ENGINE_KV_WINDOW` still wins.
+If even the minimal config (`n_experts_used` bundles + the smallest safe window +
+trunk) cannot fit, the planner sets `fits=false` with a clear ASCII reason, the C
+ABI returns an error, and the CLI exits non-zero - a loud refusal instead of a
+silent SIGKILL. On the synthetic Mixtral-on-12GB shape this takes the plan from
+~122 bundles / dishonest "~9 GiB" (OOM) to `slots=19`, auto `kv_window=4096`,
+honest projected peak 9495 MiB `<=` usable 9497 MiB; proven by
+`test_mixtral_12gb_conservative_budget` in `tests/test_planner.cpp`.
+
 ### SPEED levers' effect on bytes/token
 
 With more RAM freed for experts, a larger fraction of the ~22-25 GB expert set
@@ -451,7 +506,17 @@ instead of byte-identity.
     box and produced NO output at all (empty cell, before any plan line) when a
     sub-`n_ctx` window was requested; grow-on-demand is the fix, and a genuine
     allocation failure now logs an ASCII error and fails the decode cleanly
-    rather than silently yielding nothing.
+    rather than silently yielding nothing. A later increment made the window
+    choice AUTOMATIC and lossless (FEAT-002, conservative RAM budget): when
+    full-`n_ctx` KV would overflow the conservative memory budget (Section 5),
+    the planner steps `W` down to the largest power-of-two (`>= 256`) that fits
+    and plumbs it to the engine via the same `STRATAFLOW_ENGINE_KV_WINDOW` path
+    (an explicit user window still wins), so a real large-context Mixtral fits by
+    DEFAULT. The KV saving LOWERS the projected peak and is NOT re-consumed by
+    more resident experts - the budget model holds the safety margin fixed (see
+    Section 5, "The budget is enforced by construction"). This is what lets the
+    SAME default and `STRATAFLOW_ENGINE_KV_WINDOW=512` runs that previously
+    OOM-killed the 12 GiB box (exit status 137) now decode within budget.
   - **KV quantization [DEFERRED, approximate]**: store K/V at q8 or 4-bit
     (optionally Hadamard-rotated) instead of F32. NOT shipped: it is approximate
     (changes attention numerics) and belongs behind the quality-metric gate
