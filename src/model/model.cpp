@@ -40,6 +40,11 @@ public:
         shape_.expert_bytes  = 24ull * 1024 * 1024;
         shape_.total_bytes   = shape_.trunk_bytes +
             uint64_t(shape_.n_experts) * shape_.n_layers * shape_.expert_bytes;
+        // FEAT-002: representative KV geometry so the planner's KV estimate is
+        // non-degenerate for the dry-run shape too (a large-ctx MoE).
+        shape_.n_ctx         = 32768;
+        shape_.head_dim      = 128;
+        shape_.n_head_kv     = 8;
         (void)path;
     }
 

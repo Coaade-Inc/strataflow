@@ -328,6 +328,22 @@ ModelShape make_shape(llama_model *model) {
     s.n_experts      = n_experts;
     s.n_experts_used = n_experts_used;
 
+    // FEAT-002: KV-sizing geometry so the planner can estimate the engine's
+    // REAL resident KV footprint. head_dim = embedding_length / head_count;
+    // n_head_kv falls back to head_count (standard MHA) when the GQA key is
+    // absent. 0 anywhere means "unknown" and the planner uses a conservative
+    // fallback.
+    if (!arch_str.empty()) {
+        s.n_ctx = meta_u32(model, (arch_str + ".context_length").c_str(), 0);
+        const uint32_t n_embd =
+            meta_u32(model, (arch_str + ".embedding_length").c_str(), 0);
+        const uint32_t n_head =
+            meta_u32(model, (arch_str + ".attention.head_count").c_str(), 0);
+        s.n_head_kv = meta_u32(
+            model, (arch_str + ".attention.head_count_kv").c_str(), n_head);
+        s.head_dim = (n_head > 0) ? n_embd / n_head : 0;
+    }
+
     s.total_bytes = llama_model_size(model);
     if (s.is_moe && s.n_experts > 0 && s.n_layers > 0) {
         // Rough split: assume expert weights dominate and are evenly spread
@@ -405,6 +421,12 @@ bool read_shape_from_gguf(const std::string &path, ModelShape &s) {
         s.n_layers = get_u32(arch + ".block_count", 0);
         s.n_experts = get_u32(arch + ".expert_count", 0);
         s.n_experts_used = get_u32(arch + ".expert_used_count", 0);
+        // FEAT-002: KV-sizing geometry (see make_shape()).
+        s.n_ctx = get_u32(arch + ".context_length", 0);
+        const uint32_t n_embd = get_u32(arch + ".embedding_length", 0);
+        const uint32_t n_head = get_u32(arch + ".attention.head_count", 0);
+        s.n_head_kv = get_u32(arch + ".attention.head_count_kv", n_head);
+        s.head_dim = (n_head > 0) ? n_embd / n_head : 0;
     }
     s.is_moe = s.n_experts > 0;
 
@@ -659,6 +681,48 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
         }
         }  // else (n_experts > 0)
     }
+    // FEAT-002: populate the KV-sizing geometry (n_ctx / head_dim / n_head_kv)
+    // from the embedded GGUF metadata so the planner's KV estimate is grounded
+    // in reality on the .strata path too. make_shape() ran on a vocab-only
+    // model and left these 0; read them from the same verbatim metadata blob
+    // strata_pack.cpp copied (same gguf_init_from_buffer pattern used above for
+    // expert_used_count). Without this the planner would use the conservative
+    // UNKNOWN-geometry fallback and could not pick a right-sized auto KV window
+    // for a real large-ctx Mixtral.
+    if (shape.n_ctx == 0 || shape.head_dim == 0 || shape.n_head_kv == 0) {
+        gguf_init_params gp{};
+        gp.no_alloc = true;
+        gp.ctx = nullptr;
+        gguf_context *gc = gguf_init_from_buffer(
+            reader.metadata(), static_cast<size_t>(reader.metadata_size()), gp);
+        if (gc != nullptr) {
+            std::string arch;
+            int64_t aid = gguf_find_key(gc, "general.architecture");
+            if (aid >= 0) {
+                const char *a = gguf_get_val_str(gc, aid);
+                if (a != nullptr) arch = a;
+            }
+            auto key_u32 = [&](const std::string &k) -> uint32_t {
+                int64_t id = gguf_find_key(gc, k.c_str());
+                return id >= 0 ? gguf_get_val_u32(gc, id) : 0;
+            };
+            if (!arch.empty()) {
+                if (shape.n_ctx == 0)
+                    shape.n_ctx = key_u32(arch + ".context_length");
+                const uint32_t n_embd = key_u32(arch + ".embedding_length");
+                const uint32_t n_head = key_u32(arch + ".attention.head_count");
+                if (shape.n_head_kv == 0) {
+                    shape.n_head_kv =
+                        key_u32(arch + ".attention.head_count_kv");
+                    if (shape.n_head_kv == 0) shape.n_head_kv = n_head;
+                }
+                if (shape.head_dim == 0 && n_head > 0)
+                    shape.head_dim = n_embd / n_head;
+            }
+            gguf_free(gc);
+        }
+    }
+
     // Plan ONLY after every shape field the planner reads is populated, so the
     // MoE/streaming branch is reached for a real MoE .strata.
     PlacementPlan plan =

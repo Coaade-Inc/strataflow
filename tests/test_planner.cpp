@@ -87,10 +87,14 @@ static void test_small_moe_bounded_under_tiny_budget() {
     CHECK(plan.expert_slots_resident < full_slots);        // bounded below full
     CHECK(plan.expert_slots_resident >= m.n_experts_used); // top-k must fit
     CHECK(plan.stream_experts);                            // eviction happens
-    // The bounded peak must fit the budget: trunk + resident experts + staging.
-    CHECK(plan.planned_peak_bytes <=
-          m.trunk_bytes + cache_budget +
-              uint64_t(m.n_experts_used) * m.expert_bytes);
+    // The RESIDENT expert footprint must respect the --cache-gb cap. (The
+    // honest planned_peak_bytes also includes KV + staging + compute + floor +
+    // margin, so it is intentionally larger than the resident-expert bytes;
+    // the cap bounds the EXPERT pool, which is what this test guards.)
+    CHECK(uint64_t(plan.expert_slots_resident) * m.expert_bytes <= cache_budget);
+    // The honest peak still fits the conservative usable-RAM budget.
+    CHECK(plan.fits);
+    CHECK(plan.planned_peak_bytes <= plan.usable_ram_bytes);
 }
 
 // A DIFFERENT expert layout (kimi_like 256x8) under a realistic budget adapts
@@ -148,9 +152,13 @@ static void test_cache_budget_caps_choice() {
         plan_placement(hw, m, /*vram=*/0, /*ram=*/0, cache_budget);
     CHECK(capped.expert_slots_resident < auto_plan.expert_slots_resident);
     CHECK(capped.expert_slots_resident >= m.n_experts_used);
-    CHECK(capped.planned_peak_bytes <=
-          m.trunk_bytes + cache_budget +
-              uint64_t(m.n_experts_used) * m.expert_bytes);
+    // The cap bounds the resident expert pool (the honest peak additionally
+    // charges KV + staging + compute + floor + margin, so compare against the
+    // expert footprint, not the dishonest trunk+cap+topk sum).
+    CHECK(uint64_t(capped.expert_slots_resident) * m.expert_bytes <=
+          cache_budget);
+    CHECK(capped.fits);
+    CHECK(capped.planned_peak_bytes <= capped.usable_ram_bytes);
 }
 
 // Mixtral-scale auto-residency on a 12 GB budget. A ~19 GB Mixtral Q3_K_M
@@ -195,6 +203,102 @@ static void test_mixtral_scale_12gb_auto() {
                 static_cast<unsigned long long>(plan.planned_peak_bytes / MiB));
 }
 
+// FEAT-002 conservative-budget REGRESSION: the real Mixtral-8x7B Q3_K_M on the
+// 12 GiB Colab box. Pre-fix the planner reserved only a 2 GiB/12.5% headroom,
+// sized ~122 resident bundles, and printed "est. peak ~9 GiB" - yet the TRUE
+// peak (adding ~8 GiB full-n_ctx KV + staging + compute + floor) blows the box
+// and the engine was OOM-killed (SIGKILL 137) before any output. This builds
+// the SAME synthetic shape and asserts the honest, conservative planner now (a)
+// reports a peak that includes KV+staging+compute+floor+margin and fits usable
+// RAM with margin, (b) reduces the slot count far below the old ~122, (c)
+// lowers the peak via a lossless auto KV window, and (d) refuses loudly when
+// the budget is pathologically small.
+static ModelShape mixtral_real() {
+    ModelShape m;
+    m.name = "mixtral-8x7b-q3km";
+    m.n_layers = 32;
+    m.is_moe = true;
+    m.n_experts = 8;
+    m.n_experts_used = 2;
+    m.trunk_bytes = static_cast<uint64_t>(5.5 * static_cast<double>(GiB));  // ~5.5 GiB
+    m.expert_bytes = 52 * MiB;   // each (layer,expert) bundle ~52 MiB
+    m.total_bytes = m.trunk_bytes +
+        uint64_t(m.n_experts) * m.n_layers * m.expert_bytes;  // ~18.8 GiB
+    // REAL KV geometry (this is what the pre-fix estimate omitted):
+    // n_ctx=32768, head_dim=128, n_head_kv=8 => floats_per_col=1024 =>
+    // full KV = 32*2*1024*4*32768 = 8 GiB.
+    m.n_ctx = 32768;
+    m.head_dim = 128;
+    m.n_head_kv = 8;
+    return m;
+}
+
+static void test_mixtral_12gb_conservative_budget() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 12 * GiB;
+    hw.ram_free_bytes = static_cast<uint64_t>(10.6 * static_cast<double>(GiB));  // optimistic MemAvailable
+    // no GPU
+
+    ModelShape m = mixtral_real();
+    const uint32_t full_slots =
+        static_cast<uint32_t>(uint64_t(m.n_layers) * m.n_experts);  // 256
+
+    PlacementPlan plan = plan_placement(hw, m, /*vram=*/0, /*ram=*/0);
+
+    // (a) The plan must FIT and its honest peak must stay under the usable RAM
+    // with margin to spare (strictly under physical RAM too).
+    CHECK(plan.fits);
+    CHECK(plan.planned_peak_bytes <= plan.usable_ram_bytes);
+    CHECK(plan.usable_ram_bytes < hw.ram_total_bytes);
+    CHECK(plan.planned_peak_bytes < hw.ram_total_bytes);
+    // The honest estimate INCLUDES KV + staging + compute + floor + margin, so
+    // it must be CLEARLY larger than the old dishonest value (trunk + resident
+    // experts alone). This is the assertion that would FAIL against the pre-fix
+    // estimate.
+    const uint64_t dishonest_old =
+        m.trunk_bytes +
+        uint64_t(plan.expert_slots_resident) * m.expert_bytes;
+    CHECK(plan.planned_peak_bytes > dishonest_old);
+    CHECK(plan.kv_resident_bytes > 0u);
+    CHECK(plan.staging_bytes == uint64_t(m.n_experts) * m.expert_bytes);  // full layer
+    CHECK(plan.compute_bytes > 0u);
+    CHECK(plan.safety_margin_bytes > 0u);
+
+    // (b) The slot count is REDUCED far below the pre-fix ~122 (and stays in
+    // the valid band: >= top-k, < full working set).
+    CHECK(plan.expert_slots_resident < 122u);
+    CHECK(plan.expert_slots_resident >= m.n_experts_used);
+    CHECK(plan.expert_slots_resident < full_slots);
+    CHECK(plan.stream_experts);
+
+    // (c) A lossless auto KV window was chosen (full n_ctx KV = 8 GiB cannot fit
+    // the 12 GiB box alongside the 5.5 GiB trunk), and it LOWERS the peak versus
+    // sizing the same plan with full-n_ctx KV.
+    CHECK(plan.kv_window > 0u);
+    CHECK(plan.kv_window < m.n_ctx);
+    // Full-n_ctx KV would be ~8 GiB; the chosen window's KV is strictly less.
+    const uint64_t full_kv =
+        uint64_t(m.n_layers) * 2 * uint64_t(m.head_dim) * m.n_head_kv *
+        sizeof(float) * m.n_ctx;
+    CHECK(plan.kv_resident_bytes < full_kv);
+
+    std::printf("[mixtral budget: slots=%u kv_window=%u peak=%lluMiB "
+                "usable=%lluMiB] ",
+                plan.expert_slots_resident, plan.kv_window,
+                static_cast<unsigned long long>(plan.planned_peak_bytes / MiB),
+                static_cast<unsigned long long>(plan.usable_ram_bytes / MiB));
+
+    // (d) A pathologically small budget cannot fit even the minimal config:
+    // the planner must refuse LOUDLY (fits=false + a non-empty reason), never
+    // return an over-committing plan.
+    HardwareProfile tiny;
+    tiny.ram_total_bytes = 2 * GiB;
+    tiny.ram_free_bytes = 2 * GiB;
+    PlacementPlan refused = plan_placement(tiny, m, /*vram=*/0, /*ram=*/0);
+    CHECK(!refused.fits);
+    CHECK(!refused.refusal_reason.empty());
+}
+
 // With a GPU, some trunk layers should be pinned in VRAM first.
 static void test_gpu_pins_trunk() {
     HardwareProfile hw;
@@ -214,6 +318,7 @@ static void run_all() {
     RUN(test_different_layout_adapts);
     RUN(test_cache_budget_caps_choice);
     RUN(test_mixtral_scale_12gb_auto);
+    RUN(test_mixtral_12gb_conservative_budget);
     RUN(test_gpu_pins_trunk);
 }
 

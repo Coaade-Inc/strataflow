@@ -171,6 +171,50 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
                                   params->cache_budget);
     if (st != SF_OK) return st;
 
+    // FEAT-002: REFUSE LOUDLY rather than hand back an over-committing context.
+    // When the conservative planner could not fit even the minimal config
+    // (one layer's top-k + the smallest safe KV window + the trunk) inside the
+    // usable-RAM budget, plan.fits is false. Returning the context here would
+    // let the engine load and the OS SIGKILL it (the exact silent-OOM this
+    // feature eliminates). Log the shortfall and return an error so the CLI
+    // prints the reason and exits non-zero. Only enforced for the auto path
+    // (no explicit --expert-slots): an explicit override is the user forcing a
+    // count, which we honor (and reconcile below).
+    if (!ctx->plan.fits && params->expert_slots == 0) {
+        sf::log_error("placement plan refused: " + ctx->plan.refusal_reason);
+        return SF_ERR_RUNTIME;
+    }
+
+    // FEAT-002: plumb the planner's chosen LOSSLESS auto KV window to the
+    // engine via STRATAFLOW_ENGINE_KV_WINDOW, using the SAME clear-when-default
+    // _WIN32-guarded discipline as expert_slots / async above. Precedence: an
+    // EXPLICIT user STRATAFLOW_ENGINE_KV_WINDOW (set by a test or a parent
+    // process) WINS over the auto choice, so we only write the env when the
+    // user has NOT already set it. When the plan chose full n_ctx (kv_window
+    // == 0) we CLEAR the env so a stale window from a prior context in this
+    // process (the C ABI allows many contexts) cannot silently shrink the KV
+    // of an auto-full context.
+    {
+        const char *user_kv = std::getenv("STRATAFLOW_ENGINE_KV_WINDOW");
+        const bool user_set = (user_kv != nullptr && user_kv[0] != '\0');
+        if (!user_set) {
+            if (ctx->plan.kv_window > 0) {
+                const std::string v = std::to_string(ctx->plan.kv_window);
+#if defined(_WIN32)
+                _putenv_s("STRATAFLOW_ENGINE_KV_WINDOW", v.c_str());
+#else
+                setenv("STRATAFLOW_ENGINE_KV_WINDOW", v.c_str(), /*overwrite=*/1);
+#endif
+            } else {
+#if defined(_WIN32)
+                _putenv_s("STRATAFLOW_ENGINE_KV_WINDOW", "");
+#else
+                unsetenv("STRATAFLOW_ENGINE_KV_WINDOW");
+#endif
+            }
+        }
+    }
+
     // Keep the reported plan HONEST under an explicit --expert-slots override:
     // the engine will run with params.expert_slots (routed via the env above),
     // so reconcile the plan's resident count + stream flag to that same number
@@ -187,13 +231,21 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
             if (slots > full_slots) slots = full_slots;
             ctx->plan.expert_slots_resident = slots;
             ctx->plan.stream_experts = slots < full_slots;
-            // Recompute the peak to match the forced resident count: trunk +
-            // resident bundles + a one-layer staging footprint (same shape as
-            // the planner's own estimate), so the reported peak stays honest.
+            // Recompute the peak to match the forced resident count using the
+            // SAME honest components the planner now charges (FEAT-002): trunk +
+            // resident bundles + KV(chosen window) + one-layer staging at FULL
+            // n_expert + compute + process floor + safety margin. The non-slot
+            // components were already computed by the auto plan on this exact
+            // shape/budget and stored on ctx->plan, so reuse them so the
+            // reported peak never diverges from what the engine allocates.
+            ctx->plan.staging_bytes =
+                static_cast<uint64_t>(shape.n_experts) * shape.expert_bytes;
             ctx->plan.planned_peak_bytes =
                 shape.trunk_bytes +
                 static_cast<uint64_t>(slots) * shape.expert_bytes +
-                static_cast<uint64_t>(shape.n_experts_used) * shape.expert_bytes;
+                ctx->plan.kv_resident_bytes + ctx->plan.staging_bytes +
+                ctx->plan.compute_bytes + ctx->plan.process_floor_bytes +
+                ctx->plan.safety_margin_bytes;
         }
     }
 
