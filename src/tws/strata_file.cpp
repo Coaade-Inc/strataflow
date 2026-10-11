@@ -30,6 +30,8 @@ bool StrataReader::open(const std::string &path) {
     index_.clear();
     map_.clear();
     meta_.clear();
+    trunk_index_.clear();
+    trunk_map_.clear();
 
     if (!file_.open(path)) {
         log_warn("StrataReader: cannot open '" + path + "'");
@@ -50,7 +52,10 @@ bool StrataReader::open(const std::string &path) {
         log_warn("StrataReader: bad magic in '" + path + "'");
         return false;
     }
-    if (sb_.version != kStrataVersion) {
+    // Accept v1 and v2. v2 is strictly additive over v1 (an optional trunk
+    // index); every v1 field keeps its meaning, so an older v1 .strata still
+    // opens and simply reports trunk_index_count()==0 (full-resident trunk).
+    if (sb_.version != 1 && sb_.version != kStrataVersion) {
         log_warn("StrataReader: unsupported version in '" + path + "'");
         return false;
     }
@@ -101,6 +106,39 @@ bool StrataReader::open(const std::string &path) {
     map_.reserve(index_.size());
     for (size_t i = 0; i < index_.size(); ++i) {
         map_[pack_key(index_[i].layer, index_[i].expert)] = i;
+    }
+
+    // --- v2 trunk index (optional, FEAT-002) -------------------------------
+    // Present only when the file is v2+, the kStrataFlagTrunkIndexed flag is
+    // set, and trunk_index_count>0. A v1 file leaves trunk_index_ empty, so the
+    // engine falls back to a fully-resident trunk (byte-identical to before).
+    if (sb_.version >= 2 && (sb_.flags & kStrataFlagTrunkIndexed) != 0 &&
+        sb_.trunk_index_count > 0) {
+        const uint64_t trunk_index_bytes =
+            sb_.trunk_index_count * sizeof(TrunkIndexEntry);
+        if (sb_.trunk_index_offset + trunk_index_bytes > file_.size()) {
+            log_warn("StrataReader: invalid trunk index region in '" + path +
+                     "'");
+            return false;
+        }
+        trunk_index_.resize(static_cast<size_t>(sb_.trunk_index_count));
+        if (file_.read_at(trunk_index_.data(),
+                          static_cast<size_t>(trunk_index_bytes),
+                          sb_.trunk_index_offset) !=
+            static_cast<int64_t>(trunk_index_bytes)) {
+            log_warn("StrataReader: failed to read trunk index from '" + path +
+                     "'");
+            trunk_index_.clear();
+            return false;
+        }
+        trunk_map_.reserve(trunk_index_.size());
+        for (size_t i = 0; i < trunk_index_.size(); ++i) {
+            // The name is a fixed NUL-padded char array; strnlen bounds the
+            // read so a non-terminated record cannot overrun the field.
+            const TrunkIndexEntry &e = trunk_index_[i];
+            const size_t nlen = ::strnlen(e.name, sizeof(e.name));
+            trunk_map_[std::string(e.name, nlen)] = i;
+        }
     }
 
     open_ = true;
@@ -171,6 +209,33 @@ int64_t StrataReader::read_blob(uint32_t layer, uint32_t expert,
 
 int64_t StrataReader::read_at(void *dst, uint64_t len, uint64_t offset) const {
     return file_.read_at(dst, static_cast<size_t>(len), offset);
+}
+
+bool StrataReader::trunk_slice_range(const std::string &name, uint64_t &offset,
+                                     uint64_t &length) const {
+    auto it = trunk_map_.find(name);
+    if (it == trunk_map_.end()) return false;
+    const TrunkIndexEntry &e = trunk_index_[it->second];
+    // The index stores the trunk-RELATIVE offset; the absolute file offset is
+    // the trunk block start plus that relative offset.
+    offset = sb_.trunk_offset + e.rel_offset;
+    length = e.length;
+    return true;
+}
+
+int64_t StrataReader::read_trunk_tensor(const std::string &name,
+                                        void *dst) const {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    if (!trunk_slice_range(name, offset, length)) return -1;
+    const int64_t n = file_.read_at(dst, static_cast<size_t>(length), offset);
+    // Count successful trunk reads toward the SEPARATE trunk-streaming total
+    // (not streamed_bytes(), which stays expert-only for the bench harness).
+    if (n > 0) {
+        streamed_trunk_bytes_.fetch_add(static_cast<uint64_t>(n),
+                                        std::memory_order_relaxed);
+    }
+    return n;
 }
 
 }  // namespace sf
