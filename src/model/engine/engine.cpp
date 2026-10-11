@@ -287,7 +287,27 @@ struct Engine::Impl {
     // not drop on a fixture where the two tensors are equal size). The buffer
     // is refilled from disk immediately before each segment, so sharing it
     // across the two segments never races a read against a stale op.
+    //
+    // SHARED-BUFFER INVARIANT (load-bearing; do not break in a forward()
+    // refactor): token_embd.weight is read ONLY in the first (embedding)
+    // segment and output.weight ONLY in the last (lm_head) segment. The two
+    // reads are DISJOINT and NEVER concurrent, and the embedding result is
+    // copied out to the host hidden[] vector BEFORE the lm_head fetch
+    // overwrites this buffer. That is the ONLY reason both tensors can alias
+    // one buffer. If forward() is ever changed to defer segment computation,
+    // batch multiple tokens into one graph, or read either edge tensor outside
+    // its own segment, this aliasing becomes a silent corruption with no
+    // compile-time signal - give each tensor its own buffer in that case. The
+    // trunk_stream_owner guard below asserts (at ASCII log_error granularity)
+    // which streamed tensor the buffer currently holds, so a future violation
+    // is caught at runtime rather than producing wrong logits.
     std::vector<uint8_t> trunk_stream_buf;     // bounded resident floor for the edge tensors
+    // Which streamed trunk tensor the shared buffer currently holds. Set at
+    // each per-forward fetch and checked just before the segment that reads it,
+    // so an accidental concurrent/out-of-order read of the two edge tensors is
+    // caught (see the SHARED-BUFFER INVARIANT above). None between forwards.
+    enum class TrunkBufOwner { None, TokEmbd, LmHead };
+    TrunkBufOwner trunk_stream_owner = TrunkBufOwner::None;
     // .strata path only: expert tensors live here as METADATA ONLY (no_alloc,
     // never backed by a buffer), so the full expert footprint is NOT resident
     // in RAM - the whole point of streaming. The SlotPool streams each routed
@@ -472,9 +492,13 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         im.trunk_stream_buf.resize(sz_tok > sz_lm ? sz_tok : sz_lm);
         // Both metadata tensors (no_alloc tctx) point their stable ->data at the
         // shared buffer. The buffer is refilled before each segment, and the
-        // two segments never run concurrently, so this aliasing is safe.
+        // two segments never run concurrently, so this aliasing is safe - see
+        // the SHARED-BUFFER INVARIANT on Impl::trunk_stream_buf and the two
+        // fetch sites in forward() for the full statement and the runtime
+        // guard that enforces it.
         im.stream_tok_embd->data = im.trunk_stream_buf.data();
         im.stream_lm_head->data  = im.trunk_stream_buf.data();
+        im.trunk_stream_owner    = Impl::TrunkBufOwner::None;
     }
 
     // Fill the TRUNK tensors from the trunk block. The trunk block packs the
@@ -1776,7 +1800,15 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
         // exactly the expert path's 'resident before the op' discipline. The
         // fetch is synchronous on this (compute) thread; the async prefetch
         // worker and the SlotPool are never involved.
+        //
+        // SHARED-BUFFER INVARIANT (see Impl::trunk_stream_buf): this is the
+        // FIRST of the two disjoint fetch sites. It claims the shared buffer
+        // for the embedding read; the embedding op runs and its result is
+        // copied into hidden[] below, BEFORE the lm_head fetch (final segment)
+        // reuses the buffer. Record the ownership so the lm_head site can catch
+        // a future refactor that reads the two tensors concurrently.
         if (im.trunk_streaming) {
+            im.trunk_stream_owner = Impl::TrunkBufOwner::TokEmbd;
             const int64_t n = im.reader->read_trunk_tensor("token_embd.weight",
                                                            tok_embd->data);
             if (n != static_cast<int64_t>(ggml_nbytes(tok_embd))) {
@@ -2012,7 +2044,25 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
         // FEAT-002: stream output.weight into its stable buffer IMMEDIATELY
         // before the lm_head segment that reads it (ggml_mul_mat below), same
         // discipline as the embedding fetch above.
+        //
+        // SHARED-BUFFER INVARIANT (see Impl::trunk_stream_buf): this is the
+        // SECOND, disjoint fetch site. Overwriting the shared buffer here is
+        // safe ONLY because the embedding segment already ran and copied its
+        // result into hidden[] (far above, before the per-layer loop), so no
+        // live read of token_embd.weight remains. The buffer's current owner
+        // must therefore be TokEmbd (claimed at the embedding fetch and never
+        // reused in between); if it is anything else, forward() has been
+        // refactored to read the two edge tensors concurrently or out of order
+        // and this reuse would corrupt the embedding read - fail loud instead.
         if (im.trunk_streaming) {
+            if (im.trunk_stream_owner != Impl::TrunkBufOwner::TokEmbd) {
+                log_error("engine: shared trunk buffer invariant violated "
+                          "(token_embd must own the buffer before the lm_head "
+                          "fetch reuses it; forward() segments are no longer "
+                          "disjoint - give each edge tensor its own buffer)");
+                return false;
+            }
+            im.trunk_stream_owner = Impl::TrunkBufOwner::LmHead;
             const int64_t n = im.reader->read_trunk_tensor("output.weight",
                                                            lm_head->data);
             if (n != static_cast<int64_t>(ggml_nbytes(lm_head))) {
