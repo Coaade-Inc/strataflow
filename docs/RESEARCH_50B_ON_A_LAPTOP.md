@@ -98,11 +98,15 @@ resident floor that does NOT shrink with `--expert-slots`:
   `ggml_backend_alloc_ctx_tensors_from_buft` and filled from the trunk block;
   only the expert tensors live in the unbacked `ectx` and stream. The trunk is
   NOT streamed today.
-- **Fully-resident KV cache.** `src/model/engine/engine.cpp` allocates, in a
-  persistent `kvctx`, one K and one V tensor per layer shaped
-  `[head_dim, n_head_kv, n_ctx]` as F32, backed once for the engine lifetime.
-  `KvStore` (`src/kv/kv_store.h`) only does bookkeeping; the bytes are a fixed
-  resident cost that grows with `n_ctx`. Not paged, not quantized today.
+- **Resident KV cache (now windowed; was fully resident).** Before FEAT-002,
+  `src/model/engine/engine.cpp` allocated, in a persistent `kvctx`, one K and one
+  V tensor per layer shaped `[head_dim, n_head_kv, n_ctx]` as F32, a fixed
+  resident cost that grew with `n_ctx`. FEAT-002 (technique 6.5, lossless KV
+  paging) sizes those tensors to a recent WINDOW `W` (ring buffer,
+  `[head_dim, n_head_kv, W]`, default `W == n_ctx`) and tiers cold columns to a
+  RAM store, re-assembling them losslessly for attention. `KvStore`
+  (`src/kv/kv_store.h`) now owns the paging bookkeeping (window, ring mapping,
+  cold/resident split). KV quantization is still deferred (approximate).
 - **The process floor.** `libllama` is still linked (for the tokenizer / vocab;
   see the `llama_*` includes in `src/model/engine/engine.cpp` and
   `src/model/ggml_model.cpp`) and, with the ggml backend and vocab, contributes
@@ -259,7 +263,7 @@ GB. The FIT levers are mandatory, not optional.**
 | Component | Resident after | Lever |
 |---|---|---|
 | Trunk | ~0.5-1.5 GB resident hot set; rest streamed | 6.4 stream the trunk (lossless) |
-| KV cache | ~0.5-1.5 GB (recent window resident; cold paged and/or quantized) | 6.5 page / quantize KV |
+| KV cache | ~0.5-1.5 GB (recent window `W` resident; cold columns tiered to RAM, re-assembled losslessly) | 6.5 KV paging (SHIPPED, lossless); SSD spill + quant deferred |
 | Process floor | ~0.02-0.05 GB | 6.6 tiny tokenizer, drop libllama |
 | One-layer staging | ~0.3-1 GB | unchanged (bounded already) |
 | Compute buffer | ~0.2-0.5 GB | unchanged |
@@ -409,31 +413,53 @@ instead of byte-identity.
 
 ### 6.5 Page / quantize the KV cache
 
-- **Mechanism.** KV grows with context and is pure resident cost today
-  (`kvctx`, F32, `[head_dim, n_head_kv, n_ctx]` per layer). Two independent
+- **Mechanism.** KV grows with context and was pure resident cost before this
+  lever (`kvctx`, F32, `[head_dim, n_head_kv, n_ctx]` per layer). Two independent
   sub-levers (Phase 6, `PLAN.md` section 3.9):
-  - **KV paging**: keep a recent-window of KV resident, page cold KV pages to
-    SSD (or just RAM for shorter contexts), fetch on demand for attention.
-  - **KV quantization**: store K/V at q8 or 4-bit (optionally Hadamard-rotated)
-    instead of F32.
+  - **KV paging [SHIPPED, lossless]**: keep a recent-window `W` of KV resident
+    (the per-layer `kvctx` tensors are now sized `[head_dim, n_head_kv, W]`, a
+    ring buffer, instead of the full `n_ctx`), tier cold KV columns to a
+    RAM-backed per-layer cold page store (SSD spill is the deferred follow-on,
+    option b), and RE-ASSEMBLE the full history losslessly for attention so
+    every past position `0..pos` is still attended over with the SAME F32 bytes.
+    The window `W` defaults to the full `n_ctx` (so the DEFAULT path is
+    byte-identical and zero-overhead) and is overridable via
+    `STRATAFLOW_ENGINE_KV_WINDOW` to engage paging. Shipped in FEAT-002.
+  - **KV quantization [DEFERRED, approximate]**: store K/V at q8 or 4-bit
+    (optionally Hadamard-rotated) instead of F32. NOT shipped: it is approximate
+    (changes attention numerics) and belongs behind the quality-metric gate
+    (Stage 4). Out of scope for the lossless increment.
 - **50B math.** F32 KV at useful context is multi-GB. q8 KV is ~4x smaller;
   4-bit ~8x. Paging bounds resident KV to the recent window regardless of total
   context. Together these turn a growing multi-GB fixed cost into a bounded
   sub-GB resident cost, freeing RAM for experts (Ceiling A) and enabling long
   context on the box.
 - **Oracle-safety.**
-  - KV *paging* is LOSSLESS (same F32 bytes, just moved tiers) if paged
-    faithfully. Byte-identical to the oracle.
+  - KV *paging* is LOSSLESS (same F32 bytes, just moved RAM tiers): the cold
+    columns and the resident ring columns are re-assembled in absolute position
+    order and the IDENTICAL attention op sequence runs over them, so decode is
+    byte-identical to the full-resident path and to the oracle. PROVEN in-sandbox
+    (FEAT-002, `tests/test_kv_paging.cpp`): with `STRATAFLOW_ENGINE_KV_WINDOW=4`
+    over an 8-token generation (sequence longer than the window, so cold KV is
+    paged out and fetched back), the paged greedy token sequence and per-step
+    logits are BIT-IDENTICAL to the full-resident engine (`max|delta| == 0.0`)
+    and match the libllama oracle (F32 within 1e-3; Q4_K seq-identical). Resident
+    KV dropped from 32768 B to 2048 B (F32 MoE, `n_ctx` 64 -> `W` 4) and from
+    1048576 B to 16384 B (Q4_K MoE, `n_ctx` 256 -> `W` 4) with byte-identical
+    output.
   - KV *quantization* is APPROXIMATE (q8/4-bit K/V changes attention numerics)
-    and needs the quality-metric gate; ship as opt-in with measured perplexity
-    cost. StreamingLLM/SnapKV-style windowed eviction is also lossy and opt-in.
-- **Complexity / deps.** Medium for paging (new KV residency + attention fetch),
-  medium-high for quantized KV (quantized attention path / dequant). Paging has
-  no new-kernel dependency; quantization needs quantized-KV attention kernels.
-- **Verdict: KV paging feasible-with-effort and LOSSLESS (FIT lever); KV
-  quantization feasible-with-effort but APPROXIMATE.** Prioritize paging (or at
-  minimum making KV depth-bounded) as a lossless FIT lever; treat quantization
-  as an opt-in follow-on with a quality metric.
+    and needs the quality-metric gate; DEFERRED as an opt-in follow-on with
+    measured perplexity cost. StreamingLLM/SnapKV-style windowed EVICTION is also
+    lossy (it DROPS past positions) and is explicitly out of scope here: the
+    shipped paging keeps every past position.
+- **Complexity / deps.** Paging shipped with no new-kernel dependency (the cold
+  store is plain RAM vectors and the assembly reuses `ggml_cpy` + the existing
+  attention ops, all on the single compute thread). SSD spill of cold pages
+  (option b) and quantized-KV attention kernels remain the deferred follow-ons.
+- **Verdict: KV paging SHIPPED, LOSSLESS (FIT lever, FEAT-002); KV quantization
+  DEFERRED and APPROXIMATE.** The lossless RAM-tiering half is done and proven
+  byte-identical in-sandbox; SSD spill and quantization are sequenced behind it
+  (quantization behind a quality metric).
 
 ### 6.6 Shrink the process floor (drop libllama from the runtime)
 
@@ -583,8 +609,11 @@ first and ship opt-in.
 1. **Stream the trunk (6.4)** - LOSSLESS, mandatory for 50B to fit. Converts the
    ~3-5 GB fixed trunk into a bounded hot set. Reuses `StrataReader`/`SlotPool`/
    staging. **Recommended FIRST implementation target.**
-2. **Page / depth-bound the KV cache (6.5 paging)** - LOSSLESS. Bounds the
-   growing multi-GB KV to a resident recent window; frees RAM for experts.
+2. **Page / depth-bound the KV cache (6.5 paging)** - LOSSLESS, SHIPPED
+   (FEAT-002). Bounds the growing multi-GB KV to a resident recent window `W`
+   (`STRATAFLOW_ENGINE_KV_WINDOW`), tiers cold columns to a RAM store, and
+   re-assembles them losslessly for attention; frees RAM for experts. SSD spill
+   of cold pages is the deferred follow-on.
 3. **Shrink the process floor / standalone tokenizer (6.6)** - LOSSLESS, modest,
    independent (parallelizable with 1-2).
 
@@ -654,7 +683,7 @@ Prerequisite for Stage 4: a perplexity / KLD regression harness vs the oracle
 | # | Technique | Oracle-safety | Verdict |
 |---|---|---|---|
 | 6.4 | Stream the trunk | lossless | feasible-now (FIT, top) |
-| 6.5 | KV paging | lossless | feasible-with-effort (FIT) |
+| 6.5 | KV paging (lossless RAM tiering) | lossless | SHIPPED (FIT, FEAT-002); SSD spill deferred |
 | 6.6 | Standalone tokenizer / drop libllama | lossless | feasible-with-effort (modest) |
 | 6.7 | Batched sequential I/O + co-activation packing | lossless | feasible-now (SPEED, top lossless) |
 | 6.9 | Cross-token pinning / prefill-decode split | lossless | feasible-now (refinement) |

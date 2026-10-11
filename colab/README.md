@@ -114,6 +114,73 @@ identical to before.
   size. Absolute numbers are hardware-dependent on the free runtime; compare the
   before/after `peak RSS` and `resident weights` lines on the SAME model.
 
+### Page the KV cache (resident-floor reduction for long context)
+
+Technique 6.5 from [`../docs/RESEARCH_50B_ON_A_LAPTOP.md`](../docs/RESEARCH_50B_ON_A_LAPTOP.md)
+(the LOSSLESS half). Before this lever the engine reserved the full trained
+`n_ctx` of F32 K/V resident per layer up front, regardless of how many positions
+were actually used - a fixed, growing multi-GB cost at a useful context. Now the
+resident per-layer K/V are bounded to a recent WINDOW `W` (a ring buffer), and
+positions that scroll out of the window are tiered to a RAM-backed per-layer COLD
+page store (keyed by absolute position, the EXACT F32 bytes the ring held).
+Attention re-assembles the full history `0..pos` (cold columns + resident ring
+columns in absolute order) and runs the IDENTICAL op sequence over it, so decode
+stays BYTE-IDENTICAL and no past position is dropped (this is NOT lossy
+StreamingLLM/SnapKV eviction). The window `W` defaults to the full `n_ctx` (so
+the DEFAULT is byte-identical and zero-overhead) and is set via the
+`STRATAFLOW_ENGINE_KV_WINDOW` env knob to engage paging. KV quantization
+(approximate) is deferred.
+
+- **Sandbox-proven (offline, in CI):** the reserved resident-KV reduction and
+  byte-identity on generated fixtures, including K-quant. With
+  `STRATAFLOW_ENGINE_KV_WINDOW=4` over an 8-token generation (sequence longer
+  than the window, so cold KV is paged out and fetched back), reserved resident
+  KV drops `32,768 -> 2,048 B` on the F32 tiny MoE (`n_ctx` 64) and
+  `1,048,576 -> 16,384 B` on the K-quant MoE (`n_ctx` 256), with the paged decode
+  BIT-identical to the full-resident engine (`max|delta| = 0.000e+00`) and
+  matching the libllama oracle (F32 within 1e-3; Q4_K seq-identical). Re-run it on
+  Colab's real hardware with:
+
+  ```bash
+  %%bash
+  cd /content/strataflow
+  python3 tools/testdata/make_tiny_moe_gguf.py /content/moe.gguf
+  # A K-quant fixture (Q4_K); the generator writes the quantized MoE.
+  python3 tools/testdata/make_tiny_quant_moe_gguf.py /content/kquant_moe.gguf
+  cd build/release
+  STRATAFLOW_TEST_MOE_GGUF=/content/moe.gguf \
+  STRATAFLOW_TEST_KQUANT_MOE_GGUF=/content/kquant_moe.gguf \
+    ctest -R test_kv_paging --output-on-failure
+  ```
+
+  The `test_kv_paging` log prints, per fixture, `residentKV` vs `fullKV` byte
+  numbers, the `cold_fetches` count (> 0 proves the cold path ran), and the
+  paged-vs-full `max|delta|` (`0.000e+00`).
+- **Colab-only (real Mixtral/50B, long context):** the absolute PEAK-RSS
+  reduction at a useful context, and "useful context now fits where it did not
+  before". The offline sandbox cannot run a real long-context Mixtral, so
+  re-verify on Colab by running the SAME real-model decode (Cell 8 RUN A) with a
+  long prompt/`--max-tokens`, once on **current `main` (before)** and once on
+  **this branch with a bounded window (after)**, setting the window before the
+  CLI:
+
+  ```bash
+  %%bash
+  cd /content/strataflow/build/release
+  # before: full-resident KV (default). after: bounded window.
+  STRATAFLOW_ENGINE_KV_WINDOW=512 ./bin/strataflow \
+    --model /content/mixtral.strata --expert-slots 0 \
+    --max-tokens 256 --prompt "<a long prompt>"
+  ```
+
+  Compare the `peak RSS = ... MiB` and `resident_kv_bytes = N` lines the CLI
+  prints: the bounded-window run holds only `W` columns of K/V resident, so its
+  reserved KV (and thus peak RSS at long context) is lower, and a context that
+  OOM'd on the full-`n_ctx` reservation can now complete the decode. Expected
+  effect: lower peak RSS, lower `resident_kv_bytes`, IDENTICAL decoded text (the
+  change is lossless). Absolute numbers are hardware-dependent on the free
+  runtime; compare the before/after lines on the SAME model and prompt.
+
 ### Which real model, and why
 
 The engine runs **llama-architecture** models only. That drives the choice:

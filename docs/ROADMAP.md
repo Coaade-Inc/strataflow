@@ -156,6 +156,34 @@ families are the remaining quant-coverage gap.
   expected effect are in `colab/README.md`. Deferred follow-ons: streaming the
   per-layer attention weights, a budget-aware trunk residency policy, and async
   (prefetched) trunk streaming.
+- [x] **Lossless KV paging (technique 6.5, lossless half).** Per
+  `RESEARCH_50B_ON_A_LAPTOP.md` section 6.5, the engine-owned per-layer K/V no
+  longer reserve the full trained `n_ctx` up front: they are sized to a resident
+  recent WINDOW `W` (a ring buffer keyed by `pos % W`), and positions that
+  scroll out of the window are tiered to a RAM-backed per-layer COLD page store
+  (keyed by absolute position, the EXACT F32 bytes the ring held). Attention
+  re-assembles the full history `0..pos` (cold columns + resident ring columns
+  in absolute order, handling wrap) and runs the IDENTICAL op sequence over it,
+  so decode stays BYTE-IDENTICAL to the full-resident path and the oracle - no
+  past position is dropped (this is NOT lossy StreamingLLM/SnapKV eviction). `W`
+  defaults to `n_ctx` (so the DEFAULT path is byte-identical and zero-overhead)
+  and is overridable via `STRATAFLOW_ENGINE_KV_WINDOW` to engage paging.
+  `KvStore` (`src/kv/kv_store.h`) owns the paging bookkeeping; the ggml-touching
+  copies live in `engine.cpp`; everything is on the single compute thread (no new
+  background thread; TSan clean). A new `resident_kv_bytes()` / `full_kv_bytes()`
+  accessor pair (and a `resident_kv_bytes` field appended ABI-safely to
+  `sf_runtime_stats` + `sf_session_stats`, surfaced by the CLI) measures the win.
+  Sandbox-proven byte-identical and resident-KV-lower on generated fixtures
+  (`tests/test_kv_paging.cpp`): with `STRATAFLOW_ENGINE_KV_WINDOW=4` over an
+  8-token generation (sequence longer than the window, so cold KV is paged out
+  and fetched back - cold-fetch counter 462), resident KV drops 32,768 -> 2,048 B
+  on the F32 tiny MoE (`n_ctx` 64) and 1,048,576 -> 16,384 B on the K-quant MoE
+  (`n_ctx` 256), with the paged decode BIT-identical to the full-resident engine
+  (`max|delta| = 0.000e+00`) and matching the libllama oracle (F32 within 1e-3;
+  Q4_K seq-identical). Colab-only: the absolute peak-RSS reduction at real long
+  context on Mixtral/50B is hardware-only; the exact re-verify command and
+  expected effect are in `colab/README.md`. Deferred follow-ons: SSD spill of
+  cold pages (option b) and KV quantization (approximate, Stage 4).
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.

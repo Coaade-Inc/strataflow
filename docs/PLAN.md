@@ -163,8 +163,18 @@ Predictor accuracy and prefetch hit rate are always tracked and reported as metr
 - Combined with the TWS: for SSD-resident dense layers, read only the needed neuron bundles. This is "LLM in a Flash" windowing plus row-column bundling.
 
 ### 3.9 KV cache
-- Paged KV store. Default q8 K/V; optional 4-bit Hadamard-rotated KV (TurboQuant/KIVI class).
-- Optional spill of old KV pages to RAM or SSD for very long contexts, plus an attention-sink + recent-window eviction mode (SnapKV/StreamingLLM class) as a lossy option.
+- Paged KV store. SHIPPED (FEAT-002, lossless RAM tiering): the engine-owned
+  per-layer K/V are bounded to a resident recent WINDOW `W`
+  (`STRATAFLOW_ENGINE_KV_WINDOW`, default the full `n_ctx` so the default path is
+  byte-identical), with cold columns tiered to a RAM-backed per-layer cold page
+  store and re-assembled losslessly for attention (every past position is still
+  attended over with the SAME F32 bytes). `KvStore` owns the paging bookkeeping
+  (window, ring mapping, cold/resident split). DEFERRED: q8 K/V and optional
+  4-bit Hadamard-rotated KV (TurboQuant/KIVI class) - approximate, Stage 4.
+- Optional spill of old KV pages to SSD (option b, deferred follow-on to the
+  shipped RAM tiering) for very long contexts. An attention-sink + recent-window
+  EVICTION mode (SnapKV/StreamingLLM class) remains a LOSSY, opt-in option and is
+  explicitly NOT what FEAT-002 shipped (the shipped paging drops no position).
 - Native MLA support (DeepSeek/Kimi) so long context fits in a small VRAM budget.
 
 ### 3.10 Strata pack file format (`.strata`)

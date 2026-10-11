@@ -123,6 +123,11 @@ def parse_cli_stats(captured):
                      overlap signal: the overlap actually hid the disk read), or
                      None if absent. 0 on the synchronous (--async-prefetch off)
                      path.
+      resident_kv_bytes - reserved resident KV-cache bytes as the exact uint64
+                     the engine holds (FEAT-002, technique 6.5 lossless KV
+                     paging), or None if absent. Shrinks when a smaller resident
+                     window (STRATAFLOW_ENGINE_KV_WINDOW) is set, with
+                     byte-identical output.
 
     The resident/peak fields keep the exact wording from before FEAT-002, and
     the TTFT/streamed/prefetch fields are optional, so this parser works against
@@ -138,6 +143,7 @@ def parse_cli_stats(captured):
         "prefetch_warmed": None,
         "prefetch_used": None,
         "prefetch_completed_before_use": None,
+        "resident_kv_bytes": None,
     }
     for line in captured.splitlines():
         if line.startswith("output:"):
@@ -175,6 +181,12 @@ def parse_cli_stats(captured):
         m = re.search(r"prefetch_used = ([0-9]+)", line)
         if m:
             stats["prefetch_used"] = int(m.group(1))
+        # FEAT-002 (technique 6.5): reserved resident KV bytes as the exact
+        # uint64 the engine holds. Printed on new CLI builds when the engine
+        # loaded a KV cache; absent on old builds / the dry-run path.
+        m = re.search(r"resident_kv_bytes = ([0-9]+)", line)
+        if m:
+            stats["resident_kv_bytes"] = int(m.group(1))
     return stats
 
 

@@ -26,6 +26,15 @@
 #   - bytes/token  : exact streamed_bytes / max_tokens. Uses the raw uint64
 #                    streamed_bytes the CLI reports (not the 1-decimal MiB
 #                    display value), so the integer is exact, not quantized.
+#   - resident KV  : reserved resident KV-cache bytes (FEAT-002, technique 6.5).
+#                    The engine bounds the resident per-layer K/V to a recent
+#                    WINDOW W (STRATAFLOW_ENGINE_KV_WINDOW, default the full
+#                    n_ctx) and tiers older columns to a RAM cold store,
+#                    re-assembling them losslessly for attention. Setting a
+#                    smaller W lowers this reserved KV (and thus peak RSS at long
+#                    context) with BYTE-IDENTICAL output. On a real long-context
+#                    Mixtral/50B run this frees multi-GB of resident KV; the CLI
+#                    prints 'resident_kv_bytes = N' when the engine loaded.
 #
 # DEFAULT matrix: a small GENERATED-F32 MoE swept across model sizes and
 # --expert-slots. It is CPU-only, offline, fits the free Colab tier (~12 GB
@@ -199,6 +208,10 @@ def run_one(args, cfg, slots, async_prefetch="on"):
         "prefetch_used": stats["prefetch_used"],
         "prefetch_completed_before_use":
             stats["prefetch_completed_before_use"],
+        # FEAT-002 (technique 6.5): reserved resident KV bytes, when the CLI
+        # reports it (older CLI builds / the dry-run path do not). Best-effort
+        # via .get so a missing field never KeyErrors the whole row.
+        "resident_kv_bytes": stats.get("resident_kv_bytes"),
         "decoded_text": stats["decoded"],
         "bytes_per_token": None,
         "ok": False,
