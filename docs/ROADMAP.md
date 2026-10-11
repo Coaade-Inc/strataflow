@@ -159,9 +159,12 @@ families are the remaining quant-coverage gap.
 - [x] **Lossless KV paging (technique 6.5, lossless half).** Per
   `RESEARCH_50B_ON_A_LAPTOP.md` section 6.5, the engine-owned per-layer K/V no
   longer reserve the full trained `n_ctx` up front: they are sized to a resident
-  recent WINDOW `W` (a ring buffer keyed by `pos % W`), and positions that
-  scroll out of the window are tiered to a RAM-backed per-layer COLD page store
-  (keyed by absolute position, the EXACT F32 bytes the ring held). Attention
+  recent WINDOW `W` (a ring buffer keyed by `pos % W`, so the resident
+  reservation is `W/n_ctx` of the full cost), and positions that scroll out of
+  the window are tiered to a RAM-backed per-layer COLD page store (keyed by
+  absolute position, the EXACT F32 bytes the ring held). The cold store is
+  BOUNDED - it is empty at load and GROWS ON DEMAND, sized only to the positions
+  actually evicted (never the full `n_ctx`). Attention
   re-assembles the full history `0..pos` (cold columns + resident ring columns
   in absolute order, handling wrap) and runs the IDENTICAL op sequence over it,
   so decode stays BYTE-IDENTICAL to the full-resident path and the oracle - no
@@ -180,10 +183,31 @@ families are the remaining quant-coverage gap.
   on the F32 tiny MoE (`n_ctx` 64) and 1,048,576 -> 16,384 B on the K-quant MoE
   (`n_ctx` 256), with the paged decode BIT-identical to the full-resident engine
   (`max|delta| = 0.000e+00`) and matching the libllama oracle (F32 within 1e-3;
-  Q4_K seq-identical). Colab-only: the absolute peak-RSS reduction at real long
-  context on Mixtral/50B is hardware-only; the exact re-verify command and
-  expected effect are in `colab/README.md`. Deferred follow-ons: SSD spill of
-  cold pages (option b) and KV quantization (approximate, Stage 4).
+  Q4_K seq-identical). A real-hardware fix followed: the cold store was first
+  pre-allocated at full `n_ctx` (8 GiB on Mixtral: `n_layer` 32 x 2 x `n_ctx`
+  32768 x `floats_per_col` 1024 x 4 B, matching the Colab-measured
+  `resident_kv_bytes` byte-for-byte), which OOMed at LOAD on a 12 GB box and
+  produced NO output at all (empty cell, before any plan line) when
+  `STRATAFLOW_ENGINE_KV_WINDOW=512` was set; grow-on-demand is the fix, a genuine
+  allocation failure now logs an ASCII error and fails the decode cleanly, a new
+  `kv_cold_bytes()` accessor reports the bounded cold-store size, and the regime
+  the tiny `W=4` fixtures missed (large `n_ctx`, window well below it, BOTH a
+  short no-overflow and a long overflow run) is now a dedicated gate
+  (`test_kv_paging_bigctx_small_window` over the `n_ctx` 4096 fixture
+  `make_tiny_moe_bigctx_gguf.py`, `W=64`): SHORT (gen=8) residentKV 32768 B,
+  fullKV 2097152 B, coldBytes 0 B, cold_fetches 0; LONG (gen=80) residentKV
+  32768 B, fullKV 2097152 B, coldBytes 12800 B, cold_fetches 650 - both
+  byte-identical (`max|delta| = 0.000e+00`) and within 1e-3 of the oracle
+  (`residentKV == fullKV/64` proves the `W/n_ctx` reservation; coldBytes
+  proportional to the 25 evicted positions, far below the full-`n_ctx` cold size
+  2097152 B, proves the cold store is bounded). The DEFAULT stays full-resident
+  (lossless, zero-overhead); an auto KV-window default is a deferred low-risk
+  follow-on. Colab-only: the absolute peak-RSS reduction at real long context on
+  Mixtral/50B is hardware-only - the re-verify (RUN 2,
+  `STRATAFLOW_ENGINE_KV_WINDOW=512`) should now decode byte-identically with
+  `resident_kv` ~128 MiB instead of 8192 MiB (~8 GB lower peak RSS); the exact
+  command and expected numbers are in `colab/README.md`. Deferred follow-ons:
+  SSD spill of cold pages (option b) and KV quantization (approximate, Stage 4).
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.

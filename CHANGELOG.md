@@ -17,7 +17,11 @@ grouped by the pull request that merged them.
   (the per-layer `kvctx` tensors become `[head_dim, n_head_kv, W]`, a ring buffer
   keyed by `pos % W`), and positions that scroll out of the window are tiered to
   a RAM-backed per-layer COLD page store (keyed by absolute position, holding the
-  EXACT F32 bytes the ring held). Attention re-assembles the full history
+  EXACT F32 bytes the ring held). The cold store is NOT pre-allocated at `n_ctx`:
+  it is EMPTY at load and GROWS ON DEMAND, bounded to the positions actually
+  evicted (never the full `n_ctx`), so a large-`n_ctx` model does not pay a
+  multi-GB cold allocation up front (see the real-model empty-output fix below).
+  Attention re-assembles the full history
   `0..pos` - cold columns from the store plus the resident ring columns in
   absolute position order (handling ring wrap) - and runs the IDENTICAL
   permute/`mul_mat`/`soft_max_ext`/`mul_mat` op sequence over it, so decode is
@@ -207,6 +211,54 @@ grouped by the pull request that merged them.
 
 ### Correctness and honesty fixes
 
+- Real-hardware empty-output regression in lossless KV paging (technique 6.5)
+  fixed, and the cold store is now BOUNDED to used positions. On the real
+  Mixtral-8x7B Q3_K_M (`n_ctx` 32768) a Colab run with
+  `STRATAFLOW_ENGINE_KV_WINDOW=512` produced NO output at all - no plan line, no
+  error, just an empty cell - while the default full-resident run decoded fine.
+  Root cause: `Engine::load` PRE-ALLOCATED the per-layer KV cold store at the
+  FULL trained `n_ctx` (a `std::vector<float>(n_ctx * floats_per_col)` per layer
+  for BOTH K and V) whenever paging was engaged. For Mixtral (`n_ctx` 32768,
+  `head_dim` 128, `n_head_kv` 8 => `floats_per_col` 1024, `n_layer` 32) that is
+  `32 * 2 * 32768 * 1024 * 4` = 8,589,934,592 bytes (exactly 8 GiB, matching the
+  Colab-measured `resident_kv_bytes` byte-for-byte). On the 12 GB box that 8 GiB
+  cold allocation - ON TOP OF the ~0.9 GB resident weights + experts - threw
+  during LOAD, before the CLI printed its plan line (the CLI prints the plan only
+  after `sf_context_create` succeeds), which is why the cell was empty. The
+  resident window itself (512 columns, ~128 MiB) was tiny and, with only ~17
+  decoded positions, never even overflowed - so the bug was the cold store, not
+  the window. The fix: the cold store is no longer pre-allocated at `n_ctx`. It
+  is EMPTY at load and GROWS ON DEMAND, sized to the positions actually evicted
+  (`(evict_pos + 1) * floats_per_col`, never `n_ctx`); for `W=512` and ~17
+  positions it never evicts, so it stays 0 bytes. `resident_kv_bytes()` reports
+  only the resident ring (`n_layer * 2 * floats_per_col * 4 * W`, proportional
+  `W/n_ctx` of full), and a new `Engine::kv_cold_bytes()` accessor reports the
+  current bounded cold-store size (0 when the window never overflowed). A growth
+  allocation that fails now logs an ASCII error with the attempted byte count and
+  fails the decode cleanly (returned up through `sf_generate` and surfaced by the
+  CLI) instead of a silent no-output. The DEFAULT path (no
+  `STRATAFLOW_ENGINE_KV_WINDOW`) stays full-resident, byte-identical, zero-
+  overhead, and allocates no cold store; the explicit windowed path is the fit
+  lever this change repairs. An AUTO KV-window default (sizing `W` from the RAM
+  budget + `n_ctx`, like the auto expert-residency policy) is DEFERRED as a
+  low-risk follow-on to keep this change minimal and the default byte-identical.
+  Sandbox-proven on a new large-`n_ctx` fixture
+  (`tools/testdata/make_tiny_moe_bigctx_gguf.py`, `n_ctx` 4096) via the new
+  `tests/test_kv_paging.cpp::test_kv_paging_bigctx_small_window` gate at `W=64`
+  (`W/n_ctx` 1/64), run with `STRATAFLOW_TEST_BIGCTX_MOE_GGUF`: the SHORT regime
+  (no overflow, gen=8) reports `residentKV 32768 B`, `fullKV 2097152 B`,
+  `coldBytes 0 B`, `cold_fetches 0`; the LONG regime (overflow, gen=80) reports
+  `residentKV 32768 B`, `fullKV 2097152 B`, `coldBytes 12800 B`,
+  `cold_fetches 650`. Both regimes are byte-identical to the full-resident engine
+  (`max|delta| = 0.000e+00`) and within 1e-3 of the oracle; `residentKV ==
+  fullKV / 64` proves the `W/n_ctx` reservation and `coldBytes 12800`
+  (proportional to the 25 evicted positions, far below the full-`n_ctx` cold size
+  of 2,097,152 B) proves the cold store is bounded. The existing `W=4` fixtures
+  (`n_ctx` 64/256) still pass bit-identical. Colab re-verify of the real Mixtral
+  (sandbox cannot download it): `STRATAFLOW_ENGINE_KV_WINDOW=512` should now
+  DECODE text byte-identical to the default run and report `resident_kv` ~128 MiB
+  (`resident_kv_bytes` ~134217728, i.e. `512/32768 * 8192 MiB`) instead of
+  8192 MiB, cutting peak RSS by ~8 GB (from ~10.6 GB toward ~2.5 GB).
 - `.strata` MoE shape pre-pass regression fixed (OOM on legacy Mixtral .strata).
   `load_strata_model` built `ModelShape` from a vocab-only `llama_model`, which
   reported `expert_bytes=0`/`trunk_bytes=0`/`total_bytes=0`. The superblock

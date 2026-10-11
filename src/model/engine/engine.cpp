@@ -42,6 +42,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -120,7 +121,7 @@ struct Engine::Impl {
     uint32_t kv_window = 0;
     uint32_t kv_floats_per_col = 0;
     bool     kv_paging = false;
-    std::vector<std::vector<float>> kv_cold_k;  // per layer, [n_ctx * floats_per_col]
+    std::vector<std::vector<float>> kv_cold_k;  // per layer, grows to cold cols
     std::vector<std::vector<float>> kv_cold_v;
     uint64_t kv_cold_fetches = 0;               // cold columns re-assembled (proof)
 
@@ -604,6 +605,17 @@ uint64_t Engine::full_kv_bytes() const {
 
 uint64_t Engine::kv_cold_fetches() const { return impl_->kv_cold_fetches; }
 
+uint64_t Engine::kv_cold_bytes() const {
+    // Sum the per-layer K and V cold vectors' CURRENT element counts. This
+    // reflects the grow-on-demand size (bounded by positions actually decoded),
+    // not any n_ctx-scale reservation. Empty (0) on the default path.
+    const Impl &im = *impl_;
+    uint64_t floats = 0;
+    for (const auto &v : im.kv_cold_k) floats += static_cast<uint64_t>(v.size());
+    for (const auto &v : im.kv_cold_v) floats += static_cast<uint64_t>(v.size());
+    return floats * sizeof(float);
+}
+
 uint64_t Engine::resident_weight_bytes() const {
     // The .strata path backs only the resident trunk tensors in im.wbuf;
     // experts live in the unbacked ectx. The plain-GGUF path lets ggml/llama
@@ -829,19 +841,29 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         }
     }
 
-    // FEAT-002: per-layer RAM-backed cold page store for positions that scroll
-    // out of the resident window. Sized to the full n_ctx of F32 K/V columns so
-    // every evicted position has a stable home keyed by absolute position; it
-    // is populated lazily (only columns actually evicted are written) and stays
-    // empty on the default full-resident path (kv_paging false). This holds the
-    // SAME F32 bytes the resident ring held - pure RAM tiering, lossless.
+    // FEAT-002 (real-scale fit fix): per-layer RAM-backed cold page store for
+    // positions that scroll out of the resident window. GROW-ON-DEMAND: the
+    // per-layer vectors are EMPTY at load and are grown (resized) only in
+    // forward()'s eviction snapshot, sized to the number of cold positions
+    // ACTUALLY produced (through evict_pos), never to the full trained n_ctx.
+    //
+    // Rationale: the previous policy reserved std::vector<float>(n_ctx * fpc)
+    // per layer for BOTH K and V up front - for a real model (Mixtral n_ctx=
+    // 32768, fpc=1024, n_layer=32) that is 32*2*32768*1024*4 = 8 GiB zero-
+    // filled and committed at LOAD, which OOMs on a bounded-RAM box before any
+    // output is produced, even though a short decode (e.g. ~17 positions with
+    // W=512) never evicts a single column. Sizing the cold store to the
+    // positions actually generated makes the windowed path fit: the resident
+    // ring is W columns (reported by resident_kv_bytes) and the cold store is
+    // bounded by the real decode length, not the trained context. The vectors
+    // only grow on the paging path (kv_paging true) and stay empty on the
+    // default full-resident path (kv_paging false). This holds the SAME F32
+    // bytes the resident ring held - pure RAM tiering, lossless.
     if (im.kv_paging) {
         im.kv_cold_k.assign(static_cast<size_t>(hp.n_layer),
-                            std::vector<float>(static_cast<size_t>(n_ctx) *
-                                               im.kv_floats_per_col, 0.0f));
+                            std::vector<float>());
         im.kv_cold_v.assign(static_cast<size_t>(hp.n_layer),
-                            std::vector<float>(static_cast<size_t>(n_ctx) *
-                                               im.kv_floats_per_col, 0.0f));
+                            std::vector<float>());
     }
 
     // bytes_per_token across all layers: K and V, head_dim * n_head_kv F32 each.
@@ -2034,6 +2056,30 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
         const size_t col_bytes = fpc * sizeof(float);
         const size_t ring_off  = static_cast<size_t>(ring_col) * col_bytes;
         const size_t cold_off  = static_cast<size_t>(evict_pos) * fpc;
+        // FEAT-002: grow the per-layer cold store to cover through evict_pos
+        // (cold positions are absolute 0..evict_pos, stored contiguously from
+        // offset 0). The grown size is (evict_pos + 1) * fpc columns, which is
+        // exactly the `cold` count the attention assembly reads back for this
+        // position - never the full n_ctx. resize() both K and V BEFORE the
+        // copy so the destination range [cold_off, cold_off+fpc) is in bounds.
+        // A genuine growth OOM is caught here and surfaced as a clean decode
+        // failure with an ASCII error naming the attempted byte count, rather
+        // than letting an uncaught std::bad_alloc abort before any log line.
+        const size_t need = (static_cast<size_t>(evict_pos) + 1) * fpc;
+        try {
+            for (int il = 0; il < hp.n_layer; ++il) {
+                const size_t L = static_cast<size_t>(il);
+                if (im.kv_cold_k[L].size() < need) im.kv_cold_k[L].resize(need);
+                if (im.kv_cold_v[L].size() < need) im.kv_cold_v[L].resize(need);
+            }
+        } catch (const std::bad_alloc &) {
+            const uint64_t attempted =
+                static_cast<uint64_t>(hp.n_layer) * 2 * need * sizeof(float);
+            log_error("engine: KV cold-store growth failed (attempted " +
+                      std::to_string(attempted) +
+                      " bytes total); failing decode");
+            return false;
+        }
         for (int il = 0; il < hp.n_layer; ++il) {
             const size_t L = static_cast<size_t>(il);
             ggml_backend_tensor_get(im.k_cache[L],
