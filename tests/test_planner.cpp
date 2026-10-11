@@ -299,6 +299,29 @@ static void test_mixtral_12gb_conservative_budget() {
     CHECK(!refused.refusal_reason.empty());
 }
 
+// An UNKNOWN hardware profile (both RAM fields 0, e.g. the dry-run/ABI path or
+// a profiler that could not read the OS RAM) must NOT collapse the usable-RAM
+// budget to 0 and refuse every model. It must fall back to a non-zero budget so
+// a normal small model still fits.
+static void test_unknown_ram_profile_nonzero_budget() {
+    HardwareProfile hw;  // ram_total_bytes == 0 && ram_free_bytes == 0
+
+    ModelShape m;
+    m.name = "dry-run-moe";
+    m.n_layers = 32;
+    m.is_moe = true;
+    m.n_experts = 8;
+    m.n_experts_used = 2;
+    m.trunk_bytes = 256 * MiB;
+    m.expert_bytes = 24 * MiB;
+    m.total_bytes = m.trunk_bytes + m.n_experts * m.n_layers * m.expert_bytes;
+
+    PlacementPlan plan = plan_placement(hw, m, /*vram=*/0, /*ram=*/0);
+    CHECK(plan.usable_ram_bytes > 0u);  // unknown RAM != 0-byte budget
+    CHECK(plan.fits);                   // not spuriously refused
+    CHECK(plan.refusal_reason.empty());
+}
+
 // With a GPU, some trunk layers should be pinned in VRAM first.
 static void test_gpu_pins_trunk() {
     HardwareProfile hw;
@@ -319,6 +342,7 @@ static void run_all() {
     RUN(test_cache_budget_caps_choice);
     RUN(test_mixtral_scale_12gb_auto);
     RUN(test_mixtral_12gb_conservative_budget);
+    RUN(test_unknown_ram_profile_nonzero_budget);
     RUN(test_gpu_pins_trunk);
 }
 

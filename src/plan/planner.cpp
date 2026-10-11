@@ -26,8 +26,28 @@ constexpr uint64_t kGiB = 1024ull * 1024 * 1024;
 // and the free-RAM headroom (max(1 GiB, 12.5%)) are deliberately conservative;
 // the per-component subtraction and the safety margin in plan_placement do the
 // rest of the protection.
+// Fallback usable-RAM budget for an UNKNOWN hardware profile (both RAM fields
+// 0). Some code paths (the dry-run/ABI smoke path and any profiler that could
+// not read the OS RAM figures) hand the planner a zero-filled HardwareProfile.
+// A literal 0-byte budget would make the fit invariant refuse EVERY model, so
+// we treat "RAM unknown" as a generous, realistic default rather than "no RAM".
+// This only affects the unknown case; a REAL profile with nonzero RAM still
+// gets the conservative ceiling below and the fit refusal is unchanged.
+constexpr uint64_t kUnknownRamFallbackBytes = 16ull * 1024 * 1024 * 1024;
+
 uint64_t usable_ram(const HardwareProfile &hw) {
     const uint64_t total = hw.ram_total_bytes;
+
+    // RAM UNKNOWN: neither total nor free reported. Fall back to a sane,
+    // non-zero default so the planner does not refuse a model purely because
+    // the profile lacked RAM numbers (e.g. the dry-run ABI path).
+    if (total == 0 && hw.ram_free_bytes == 0) {
+        return kUnknownRamFallbackBytes;
+    }
+
+    // Each field being 0 means "unknown"; prefer the known one. If free is
+    // unknown fall back to total; if total is unknown the free-based ceiling
+    // below simply has no 85%-of-total guard to apply.
     const uint64_t avail = hw.ram_free_bytes ? hw.ram_free_bytes : total;
 
     uint64_t from_free = avail;
