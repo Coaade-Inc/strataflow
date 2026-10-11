@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "common/gguf_meta.h"  // gguf_read_u32_key (robust int metadata read)
 #include "tws/async_io.h"  // kIoAlignment, align_up
 #include "tws/strata_format.h"
 #include "tws/stream_buft.h"  // parse_expert_tensor_name, ExpertTensorKind
@@ -262,9 +263,8 @@ bool pack_gguf_to_strata(const std::string &in_path, const std::string &out_path
         return v != nullptr ? std::string(v) : std::string();
     };
     auto gguf_get_u32 = [&](const std::string &key, uint32_t fallback) -> uint32_t {
-        const int64_t id = gguf_find_key(gc, key.c_str());
-        if (id < 0) return fallback;
-        return gguf_get_val_u32(gc, id);
+        // Robust to the source's GGUF integer encoding (u32/i32/other widths).
+        return gguf_read_u32_key(gc, key.c_str(), fallback);
     };
     std::string arch = gguf_get_str("general.architecture");
     if (arch.empty()) arch = "llama";

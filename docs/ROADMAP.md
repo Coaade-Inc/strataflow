@@ -153,9 +153,44 @@ families are the remaining quant-coverage gap.
   identically to the oracle too. Colab-only: the absolute peak-RSS reduction on
   the real Mixtral/50B case (where the multi-GB resident embeddings + lm_head
   previously blocked the fit) is hardware-only; the exact re-verify command and
-  expected effect are in `colab/README.md`. Deferred follow-ons: streaming the
-  per-layer attention weights, a budget-aware trunk residency policy, and async
-  (prefetched) trunk streaming.
+  expected effect are in `colab/README.md`.
+- [x] **Adaptive per-layer trunk streaming (technique 6.4, FEAT-003 Part B).**
+  Generalizes the edge-tensor streaming above to the DOMINANT remaining resident
+  cost after the KV window: the four large per-layer attention projections
+  (`blk.N.attn_{q,k,v,output}.weight`), ~5.5 GB across 32 layers on real
+  Mixtral. They now live metadata-only in a per-layer context (`pltctx`) and are
+  fetched into a BOUNDED HOT-TRUNK POOL (a ring of `trunk_pool_layers` layers)
+  immediately before each layer's attention segment, reusing the SAME v2 trunk
+  index (`read_trunk_tensor`) and resident-before-op discipline as the edge
+  tensors; the tiny per-layer norms + router stay HOT (resident). BUDGET-DRIVEN:
+  the planner derives `trunk_pool_layers` from the SAME conservative usable-RAM
+  budget (`ModelShape::attn_trunk_bytes` summed from the trunk index), so a
+  big-RAM box keeps the whole trunk resident (pool 0, zero per-token trunk
+  traffic) and a tight 12 GB-class box streams it hard (pool as low as 1). The
+  decision is plumbed to `Engine::load` as a load parameter via `GgmlModel`
+  (exactly like `plan.kv_window`), so it applies BY DEFAULT with no env
+  side-channel; the plan line gains a `trunk stream[hot=N layers]` segment.
+  HONEST TRADEOFF: these weights are touched every token, so streaming adds
+  per-token SSD traffic and is slower on a slow box - accepted because the FIRST
+  goal is to FIT small, and the policy streams only as much as the budget
+  forces. `resident_weight_bytes()` reflects the bounded hot pool;
+  `StrataReader::streamed_trunk_bytes()` counts the per-layer trunk reads
+  DISTINCTLY from the expert `streamed_bytes()` (the bench per-token expert
+  number is unchanged). LOSSLESS (pure residency / byte provenance; same bytes,
+  ops, graph order), single compute thread (no new TSan surface), with the
+  `STRATAFLOW_ENGINE_NO_TRUNK_STREAM=1` knob forcing the whole trunk resident.
+  Sandbox-proven on an attention-trunk-dominated Mixtral-mirroring fixture
+  through the REAL load path (packer -> `.strata` -> `load_strata_model` ->
+  planner -> engine): the plan chose `trunk_pool_layers=5` of 10 layers by
+  default under a ~1.27 GiB budget, `resident_weight_bytes` dropped (e.g. the
+  default CLI run on an `n_embd=4096 n_layer=16` fixture at `--ram-gb 1.3`:
+  resident model weights 292.9 -> 110.9 MiB, peak RSS 329.5 -> 161.5 MiB), and
+  the streamed decode was bit-for-bit identical (`max|delta| = 0.000e+00`) to the
+  fully-resident decode on the SAME file and within the oracle quant tolerance,
+  over a short AND a longer sequence (`tests/test_trunk_stream_adaptive.cpp`).
+  Colab-only: the absolute real-Mixtral peak-RSS drop (the ~5.5 GB resident
+  attention trunk heading toward a bounded hot set) is hardware-only; the
+  re-verify command and expected effect are in `colab/README.md`.
 - [x] **Lossless KV paging (technique 6.5, lossless half).** Per
   `RESEARCH_50B_ON_A_LAPTOP.md` section 6.5, the engine-owned per-layer K/V no
   longer reserve the full trained `n_ctx` up front: they are sized to a resident
@@ -200,9 +235,10 @@ families are the remaining quant-coverage gap.
   byte-identical (`max|delta| = 0.000e+00`) and within 1e-3 of the oracle
   (`residentKV == fullKV/64` proves the `W/n_ctx` reservation; coldBytes
   proportional to the 25 evicted positions, far below the full-`n_ctx` cold size
-  2097152 B, proves the cold store is bounded). The DEFAULT stays full-resident
-  (lossless, zero-overhead); an auto KV-window default is a deferred low-risk
-  follow-on. Colab-only: the absolute peak-RSS reduction at real long context on
+  2097152 B, proves the cold store is bounded). When the full-`n_ctx` KV fits the
+  budget the DEFAULT stays full-resident (lossless, zero-overhead); when it would
+  overflow, the auto KV-window default now ENGAGES (see the FEAT-002 Part A item
+  below). Colab-only: the absolute peak-RSS reduction at real long context on
   Mixtral/50B is hardware-only - the re-verify (RUN 2,
   `STRATAFLOW_ENGINE_KV_WINDOW=512`) should now decode byte-identically with
   `resident_kv` ~128 MiB instead of 8192 MiB (~8 GB lower peak RSS); the exact
@@ -254,6 +290,38 @@ families are the remaining quant-coverage gap.
   runs from the OOM report are EXPECTED to DECODE (not OOM) with identical text
   and peak RSS safely under 12 GB, pending the user's Colab re-run; the exact
   re-verify commands and the projected safe peak are in `colab/README.md`.
+- [x] **Auto KV window ENGAGES BY DEFAULT on the real `.strata` load path
+  (FEAT-002 Part A - "fit small now").** The conservative budget + auto KV
+  window above chose a window correctly in the pure-function planner test, but on
+  the REAL Mixtral `.strata` the DEFAULT run (no `STRATAFLOW_ENGINE_KV_WINDOW`,
+  no flags) still reserved the full-`n_ctx` KV (8192 MiB on Mixtral) and the plan
+  line had NO `kv window=` segment - the exact Colab symptom. Two breaks, both
+  fixed: (1) the real synthesized-metadata path read
+  `context_length`/`head_count`/`head_count_kv` with `gguf_get_val_u32`, which
+  aborts or returns 0 when the source stored them under a different GGUF integer
+  encoding (the `n_ctx_train(0)` warning is the tell), so the planner saw zero
+  geometry and its window step-down (gated on non-zero geometry) never fired
+  while the engine independently read `n_ctx` and reserved the full KV; fixed by
+  a robust type-dispatching integer read (`src/common/gguf_meta.h`
+  `gguf_read_u32`) shared by the planner, the engine, and the packer so all three
+  see IDENTICAL geometry on every path. (2) the plan's chosen window reached the
+  engine ONLY through the process-global `STRATAFLOW_ENGINE_KV_WINDOW` env
+  side-channel; now `PlacementPlan::kv_window` is a DIRECT `Engine::load`
+  parameter plumbed through `GgmlModel`, applied by DEFAULT. Resolution order in
+  the engine: explicit `STRATAFLOW_ENGINE_KV_WINDOW` env (user/test) WINS, else
+  the plan-provided window, else full `n_ctx`. Sandbox-proven on a
+  Mixtral-geometry legacy-per-expert fixture (`n_ctx` 32768, `head_dim` 128, GQA
+  `n_head_kv` 2, 32 layers, full KV 2048 MiB) packed through the REAL
+  `strata-pack` -> `.strata` -> `load_strata_model` -> planner -> engine under a
+  simulated 12 GiB budget with NO env override (`tests/test_kv_window_real_path.cpp`):
+  the loaded `ModelShape` reports geometry non-zero, the plan chose
+  `kv_window=16384` (`< n_ctx`), and `resident_kv_bytes()` dropped
+  2147483648 -> 1073741824 with the plan-window greedy decode BIT-IDENTICAL to the
+  full-resident run (`max|delta| = 0.000e+00`) and matching the libllama oracle
+  on the matched stacked fixture. Residency/window sizing only; forward math and
+  graph order unchanged, so decode stays byte-identical. Colab-only: the absolute
+  real-Mixtral peak-RSS drop is hardware-only; the re-verify command and expected
+  plan/stats are in `colab/README.md`.
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.

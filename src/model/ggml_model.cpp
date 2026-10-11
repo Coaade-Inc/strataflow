@@ -19,6 +19,7 @@
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "model/model.h"
 
+#include "common/gguf_meta.h"
 #include "common/log.h"
 #include "hw/gpu_discovery.h"
 #include "model/engine/engine.h"
@@ -92,10 +93,13 @@ public:
     // run inference through the engine (libllama is never used to decode).
     GgmlModel(llama_model *model, llama_context *ctx, const ModelShape &shape,
               llama_token eos, std::string path, bool is_strata,
-              uint32_t plan_expert_slots)
+              uint32_t plan_expert_slots, uint32_t plan_kv_window,
+              uint32_t plan_trunk_pool_layers)
         : model_(model), ctx_(ctx), vocab_(llama_model_get_vocab(model)),
           shape_(shape), eos_(eos), path_(std::move(path)),
-          plan_expert_slots_(plan_expert_slots) {
+          plan_expert_slots_(plan_expert_slots),
+          plan_kv_window_(plan_kv_window),
+          plan_trunk_pool_layers_(plan_trunk_pool_layers) {
         log_debug(std::string("GgmlModel: inference via engine (EC-5) on ") +
                   (is_strata ? ".strata" : "GGUF") + " '" + path_ + "'");
     }
@@ -240,7 +244,19 @@ private:
             if (s != nullptr && s[0] != '\0') {
                 slots = static_cast<uint32_t>(std::strtoul(s, nullptr, 10));
             }
-            engine_ = engine::Engine::load(path_, slots);
+            // KV window W the engine reserves. plan_kv_window_ is the planner's
+            // RAM-aware auto window (PlacementPlan::kv_window, 0 = full/auto);
+            // the engine applies it by DEFAULT. The explicit
+            // STRATAFLOW_ENGINE_KV_WINDOW env still wins inside Engine::load for
+            // user/test control, so the plan-driven default and the override
+            // reconcile in one place.
+            // FEAT-003: the plan's adaptive per-layer trunk-streaming decision
+            // (PlacementPlan::trunk_pool_layers, 0 = whole trunk resident).
+            // Plumbed the SAME way as plan_kv_window_: a load parameter, not an
+            // env side-channel, so the bounded hot-trunk pool applies BY
+            // DEFAULT on the real .strata load path.
+            engine_ = engine::Engine::load(path_, slots, plan_kv_window_,
+                                           plan_trunk_pool_layers_);
             if (engine_ == nullptr) return -1;  // arch unsupported / load failed
         }
         if (n_past_ == 0) engine_->reset_kv();
@@ -272,6 +288,15 @@ private:
     // SlotPool on the default (no explicit --expert-slots) path so the number
     // the engine USES equals the number the plan REPORTS. 0 = engine auto.
     uint32_t             plan_expert_slots_ = 0;
+    // The RAM-aware auto KV window the planner chose (PlacementPlan::kv_window).
+    // 0 = full/auto (engine reserves the full trained n_ctx). Passed to
+    // Engine::load so the windowed KV reservation applies by DEFAULT, no env.
+    uint32_t             plan_kv_window_ = 0;
+    // FEAT-003: the RAM-aware per-layer trunk-streaming decision the planner
+    // chose (PlacementPlan::trunk_pool_layers). 0 = whole trunk resident. >0 =
+    // stream the per-layer attention projections with this many layers hot.
+    // Passed to Engine::load so the bounded hot-trunk pool applies BY DEFAULT.
+    uint32_t             plan_trunk_pool_layers_ = 0;
     std::unique_ptr<engine::Engine> engine_;
 };
 
@@ -393,11 +418,9 @@ bool read_shape_from_gguf(const std::string &path, ModelShape &s) {
     if (gc == nullptr) return false;
 
     auto get_u32 = [&](const std::string &key, uint32_t fallback) -> uint32_t {
-        int64_t id = gguf_find_key(gc, key.c_str());
-        if (id < 0) return fallback;
-        // GGUF integer metadata is commonly stored as u32; be tolerant of the
-        // signed variant too.
-        return gguf_get_val_u32(gc, id);
+        // Robust to the GGUF integer encoding the source used (u32/i32/other
+        // widths); gguf_get_val_u32 would abort on a non-u32 key.
+        return gguf_read_u32_key(gc, key.c_str(), fallback);
     };
 
     std::string arch;
@@ -636,6 +659,27 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
         shape.expert_bytes = idx[0].blob_length;
         // Trunk bytes come straight from the superblock's trunk block size.
         shape.trunk_bytes = sb.trunk_size;
+        // FEAT-003: sum the STREAMABLE per-layer attention projections
+        // (blk.N.attn_q/k/v/output.weight) from the v2 trunk index so the
+        // planner can size the bounded hot-trunk pool. Only available on a v2
+        // trunk-indexed .strata; left 0 otherwise (planner keeps the trunk
+        // fully resident). The names match the engine's streamed set exactly.
+        if (reader.has_trunk_index() && shape.n_layers > 0) {
+            uint64_t attn_total = 0;
+            const char *kinds[4] = {"attn_q.weight", "attn_k.weight",
+                                    "attn_v.weight", "attn_output.weight"};
+            for (uint32_t L = 0; L < shape.n_layers; ++L) {
+                for (const char *k : kinds) {
+                    const std::string nm =
+                        "blk." + std::to_string(L) + "." + k;
+                    uint64_t off = 0, len = 0;
+                    if (reader.trunk_slice_range(nm, off, len)) {
+                        attn_total += len;
+                    }
+                }
+            }
+            shape.attn_trunk_bytes = attn_total;
+        }
         // Total = trunk + the sum of every bundle. Summing (rather than
         // n_layers*n_experts*expert_bytes) stays correct even if a future pack
         // emits non-uniform bundle sizes or a sparse index.
@@ -664,9 +708,8 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
                     if (a != nullptr) arch = a;
                 }
                 if (!arch.empty()) {
-                    int64_t uid =
-                        gguf_find_key(gc, (arch + ".expert_used_count").c_str());
-                    if (uid >= 0) n_used = gguf_get_val_u32(gc, uid);
+                    n_used = gguf_read_u32_key(
+                        gc, (arch + ".expert_used_count").c_str(), 0);
                 }
                 gguf_free(gc);
             }
@@ -703,8 +746,9 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
                 if (a != nullptr) arch = a;
             }
             auto key_u32 = [&](const std::string &k) -> uint32_t {
-                int64_t id = gguf_find_key(gc, k.c_str());
-                return id >= 0 ? gguf_get_val_u32(gc, id) : 0;
+                // Robust to the GGUF integer encoding real Mixtral stores these
+                // keys in; gguf_get_val_u32 aborts/returns 0 on a non-u32 key.
+                return gguf_read_u32_key(gc, k.c_str(), 0);
             };
             if (!arch.empty()) {
                 if (shape.n_ctx == 0)
@@ -738,7 +782,8 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
 
     out = std::unique_ptr<Model>(
         new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/true,
-                      plan.expert_slots_resident));
+                      plan.expert_slots_resident, plan.kv_window,
+                      plan.trunk_pool_layers));
     return SF_OK;
 }
 
@@ -887,7 +932,8 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
 
     out = std::unique_ptr<Model>(
         new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/false,
-                      final_plan.expert_slots_resident));
+                      final_plan.expert_slots_resident, final_plan.kv_window,
+                      final_plan.trunk_pool_layers));
     return SF_OK;
 }
 

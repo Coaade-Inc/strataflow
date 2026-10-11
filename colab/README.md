@@ -114,6 +114,67 @@ identical to before.
   size. Absolute numbers are hardware-dependent on the free runtime; compare the
   before/after `peak RSS` and `resident weights` lines on the SAME model.
 
+### Stream the per-layer attention trunk (adaptive, budget-driven)
+
+Technique 6.4 continued (FEAT-003 Part B). After the KV window, the dominant
+remaining resident cost is the per-layer ATTENTION trunk -
+`blk.N.attn_{q,k,v,output}.weight` across every layer (~5.5 GB on real Mixtral,
+32 layers). StrataFlow now streams those four projections per layer too, into a
+BOUNDED HOT-TRUNK POOL (a ring of `trunk_pool_layers` layers), fetched
+synchronously immediately before each layer's attention segment (same
+resident-before-op discipline as the edge tensors). The tiny per-layer norms +
+router stay HOT (resident).
+
+It is BUDGET-DRIVEN: the planner picks `trunk_pool_layers` from the SAME
+conservative RAM budget, so a big-RAM box keeps the whole trunk resident (streams
+nothing, no per-token trunk traffic) and only a tight box streams it hard (pool
+as low as 1 layer). The plan line gains a `trunk stream[hot=N layers]` segment.
+HONEST TRADEOFF: these weights are touched EVERY token, so streaming them adds
+per-token SSD traffic and is SLOWER on the 2-core / ~4 GB/s box - accepted
+because the FIRST goal is to FIT small. It is LOSSLESS (same bytes, same ops,
+only byte provenance differs) and the `STRATAFLOW_ENGINE_NO_TRUNK_STREAM=1` knob
+forces the whole trunk resident for the byte-identity gate.
+
+- **Sandbox-proven (offline, in CI):** on an attention-trunk-dominated
+  Mixtral-mirroring fixture through the REAL load path (packer -> `.strata` ->
+  `load_strata_model` -> planner -> engine), the plan chose
+  `trunk_pool_layers=5` of 10 layers by DEFAULT under a ~1.27 GiB budget, the
+  engine's `resident_weight_bytes` dropped to the bounded hot set, and the
+  streamed decode was bit-for-bit identical (`max|delta| = 0.000e+00`) to the
+  fully-resident decode on the SAME v2 file and within the oracle quant tolerance
+  over a short AND a longer sequence. A default CLI run on an `n_embd=4096
+  n_layer=16` fixture at `--ram-gb 1.3` reported resident model weights
+  292.9 -> 110.9 MiB and peak RSS 329.5 -> 161.5 MiB with byte-identical text.
+  Re-run the gate on Colab's hardware with:
+
+  ```bash
+  %%bash
+  cd /content/strataflow
+  # An attention-trunk-dominated fixture whose small trunk a tight budget forces
+  # to stream (large n_embd, moderate n_layer); plus the matched stacked GGUF for
+  # the tokenizer + oracle.
+  build/release/bin/make-legacy-moe-gguf /content/ts.gguf /content/ts.stacked.gguf \
+      4096 256 10 4 q4_k 2048 1 128
+  cd build/release
+  STRATAFLOW_TEST_TRUNK_STREAM_GGUF=/content/ts.gguf \
+  STRATAFLOW_TEST_TRUNK_STREAM_STACKED_GGUF=/content/ts.stacked.gguf \
+    ctest -R test_trunk_stream_adaptive --output-on-failure
+  ```
+
+  The `test_trunk_stream_adaptive` log prints the plan's `trunk_pool_layers`,
+  the `res_full` vs `res_stream` resident bytes, and the stream-vs-resident
+  `max|delta|` (`0.000e+00`).
+- **Colab-only (real Mixtral/50B):** the absolute PEAK-RSS reduction from moving
+  the ~5.5 GB resident attention trunk to a bounded hot set. The offline sandbox
+  cannot download Mixtral, so re-verify on Colab by running the SAME real-model
+  decode (Cell 8 RUN A, `--expert-slots 0`) on **current `main` (before)** and on
+  **this branch (after)** and comparing the `resident model weights = ... MiB`
+  and `peak RSS = ... MiB` lines each prints. Expected effect on the after
+  branch: the plan line shows `trunk stream[hot=... layers]`, resident model
+  weights and peak RSS drop (toward an honest ~2-3 GiB projected peak on a 12 GiB
+  box together with the KV window), and the decoded text is byte-identical to the
+  before run (the change is lossless). Absolute numbers are hardware-dependent.
+
 ### Page the KV cache (resident-floor reduction for long context)
 
 Technique 6.5 from [`../docs/RESEARCH_50B_ON_A_LAPTOP.md`](../docs/RESEARCH_50B_ON_A_LAPTOP.md)
@@ -276,6 +337,54 @@ honest projected safe peak of 9495 MiB (`<=` usable 9497 MiB), well under 12 GiB
   the shortfall and exits non-zero, rather than being SIGKILLed with no message.
   The real confirmation of the peak-RSS numbers is this Colab re-run; the
   in-sandbox proof is the synthetic-Mixtral planner unit test above.
+
+### Auto KV window ENGAGES BY DEFAULT on the real model (FEAT-002 Part A)
+
+The conservative budget above chose a lossless KV window correctly in the
+pure-function planner test, but on the REAL Mixtral `.strata` the DEFAULT run
+(no `STRATAFLOW_ENGINE_KV_WINDOW`, no flags) STILL reserved the full-`n_ctx` KV
+(`resident_kv = 8192.0 MiB`) and the plan line had NO `kv window=` segment -
+exactly the field report. Two breaks are now fixed: the planner's geometry read
+on the real synthesized-metadata path is robust to the GGUF integer encoding the
+real Mixtral uses (so `n_ctx`/`head_dim`/`n_head_kv` reach the planner instead of
+reading as 0, the `n_ctx_train(0)` tell), and the plan's chosen window is wired
+to the engine as a DIRECT load parameter applied by DEFAULT (not only via the
+`STRATAFLOW_ENGINE_KV_WINDOW` env; the env still wins when a user/test sets it).
+So the windowed KV reservation now engages on the DEFAULT path with no env.
+
+- **Sandbox-proven (offline, in CI):** the real-load-path gate
+  `tests/test_kv_window_real_path.cpp` packs a Mixtral-geometry legacy
+  per-expert fixture (`n_ctx` 32768, `head_dim` 128, GQA `n_head_kv` 2, 32
+  layers, full KV 2048 MiB) through the REAL `strata-pack` -> `.strata` ->
+  `load_strata_model` -> planner -> engine under a simulated 12 GiB budget with
+  NO env override, and asserts the loaded `ModelShape` geometry is non-zero, the
+  plan chose `kv_window=16384` (`< n_ctx`), and `resident_kv_bytes()` dropped
+  `2147483648 -> 1073741824` with the plan-window greedy decode BIT-IDENTICAL to
+  the full-resident run (`max|delta| = 0.000e+00`) and within tolerance of the
+  libllama oracle on the matched stacked fixture. This is the real-path proof of
+  the exact DEFAULT behavior the Colab run showed broken.
+- **Colab-only (real Mixtral):** re-verify on Colab by running the SAME DEFAULT
+  decode (no env, no window flag) on current `main` (before) and this branch
+  (after):
+
+  ```bash
+  %%bash
+  cd /content/strataflow/build/release
+  ./bin/strataflow --model /content/real_model.strata \
+    --expert-slots 0 --max-tokens 16 --async-prefetch on --prompt "The city of"
+  ```
+
+  Expected after the fix: the plan line now includes a `kv window=...` segment
+  (e.g. `... experts STREAMED (bounded), kv window=4096, est. peak ~N GiB`) and
+  the final `stats:` line reports `resident_kv` in the HUNDREDS of MiB (the
+  windowed figure) instead of `resident_kv = 8192.0 MiB`
+  (`resident_kv_bytes = 8589934592`), with the decoded "The city of ..." text
+  BYTE-IDENTICAL to the current (pre-fix) default output (the windowing is
+  lossless). No `STRATAFLOW_ENGINE_KV_WINDOW` is set. Absolute `peak RSS` is
+  hardware-dependent on the free runtime; compare the before/after plan line,
+  `resident_kv`, `resident_kv_bytes`, and decoded text on the SAME model and
+  prompt. The absolute real-Mixtral peak-RSS number is Colab-only; the window
+  engagement + resident-KV reduction + byte-identity are sandbox-proven above.
 
 ### Which real model, and why
 

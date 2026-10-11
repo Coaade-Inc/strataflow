@@ -41,6 +41,19 @@ sf_add_test(test_kv_paging)
 # the library (pack + engine + reader + oracle), so a plain sf_add_test suffices.
 sf_add_test(test_trunk_stream)
 
+# test_trunk_stream_adaptive is the FEAT-003 Part B real-load-path gate for
+# ADAPTIVE per-layer trunk streaming (technique 6.4): it packs a v2 .strata and
+# (A) proves the engine streaming the per-layer attention projections with a
+# bounded hot pool decodes byte-identically to the fully-resident trunk (same
+# file, STRATAFLOW_ENGINE_NO_TRUNK_STREAM) and to the oracle over a short AND a
+# longer sequence, with resident_weight_bytes strictly lower; and (B) proves the
+# planner engages the per-layer trunk stream BY DEFAULT from the conservative
+# budget on the real sf::load_model path (plan.trunk_pool_layers in
+# (0, n_layers)) and that the plan-driven decode stays bit-identical. Only drives
+# the library (pack + load + plan + engine + oracle), so a plain sf_add_test
+# suffices.
+sf_add_test(test_trunk_stream_adaptive)
+
 # test_mixtral_faithful_pack additionally synthesizes a misnamed-MoE GGUF
 # in-process (the Defect-1 loud-failure negative assertion), so it needs the
 # ggml/gguf writer headers. ggml is linked PRIVATE into StrataFlow and does not
@@ -63,3 +76,14 @@ sf_add_test(test_legacy_per_expert_pack)
 # MoE+streaming (NOT the dense branch). Only drives the library (pack + load +
 # plan), so a plain sf_add_test suffices (no extra ggml linkage).
 sf_add_test(test_strata_shape_prepass)
+
+# test_kv_window_real_path is the FEAT-002 Part A real-load-path gate: it packs
+# the Mixtral-geometry legacy fixture to .strata, loads it through sf::load_model
+# under a simulated budget, and proves the lossless auto KV window ENGAGES BY
+# DEFAULT (no STRATAFLOW_ENGINE_KV_WINDOW) - geometry reaches the planner, the
+# plan chooses kv_window in (0, n_ctx), and an engine loaded with that plan
+# window (via the new Engine::load parameter) reserves less than full KV while
+# decoding bit-identically to the full-resident run and the libllama oracle.
+# Only drives the library (pack + load + plan + engine + oracle), so a plain
+# sf_add_test suffices.
+sf_add_test(test_kv_window_real_path)

@@ -22,10 +22,37 @@
 //
 // Usage:
 //   make-legacy-moe-gguf <out_legacy.gguf> [out_stacked.gguf]
-//                        [n_embd n_ff n_layer n_expert qtype]
-//   defaults: n_embd=256 n_ff=512 n_layer=2 n_expert=8 qtype=q4_k  (CI-small)
+//                        [n_embd n_ff n_layer n_expert qtype n_ctx n_head_kv
+//                         n_head]
+//   defaults: n_embd=256 n_ff=512 n_layer=2 n_expert=8 qtype=q4_k
+//             n_ctx=256 n_head_kv=0 n_head=0
+//             (CI-small; n_head_kv=0 means MHA, i.e. head_count_kv ==
+//              head_count; n_head=0 means auto-derive the head count from
+//              n_embd exactly like the original fixture)
 //   If <out_stacked.gguf> is omitted it defaults to <out_legacy>.stacked.gguf.
 //   qtype in {q3_k, q4_k, q6_k, f32}.
+//
+// MIXTRAL-GEOMETRY MODE (the fixture-blindness breaker for the
+// fit-small-real-mixtral task): pass a large n_ctx and a GQA n_head_kv to make
+// the SYNTHESIZED .strata metadata mirror the real TheBloke Mixtral-8x7B GGUF:
+// a large trained context length, a realistic head_dim, and GQA (head_count_kv
+// < head_count). The engine derives head_dim = n_embd / head_count, so pass
+// n_head explicitly to land on a realistic head_dim (e.g. n_embd=1024,
+// n_head=8 => head_dim=128). With n_layer>=32 the full-n_ctx KV reservation
+// becomes multi-GiB, which is what reproduces the real-model resident_kv
+// symptom through the REAL packer -> .strata -> load path. Keep n_ff and
+// n_vocab tiny so the fixture still packs/streams fast. Example (GQA with
+// head_count_kv=2 < head_count=8, head_dim=128, 32 layers, n_ctx=32768 => full
+// KV = 32 * 2 * 128 * 2 * 4 * 32768 bytes = 2048 MiB, so the pre-fix engine
+// reserves the full un-windowed 2048 MiB KV, mirroring the Colab 8192 MiB
+// full-n_ctx symptom at a CI-fast scale):
+//   make-legacy-moe-gguf mixtral_geom.gguf mixtral_geom.stacked.gguf
+//       1024 256 32 8 q4_k 32768 2 8
+// (args: n_embd=1024 n_ff=256 n_layer=32 n_expert=8 qtype=q4_k n_ctx=32768
+//  n_head_kv=2 n_head=8)
+// The Part A / Part B real-load-path tests read the packed .strata path from
+// the STRATAFLOW_TEST_MIXTRAL_GEOM_STRATA env var (fixture packed via
+// strata-pack).
 //
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier:
 // LicenseRef-Coaade-Source-Available-1.0
@@ -160,19 +187,20 @@ void add_built(gguf_context *gc, ggml_context *mc, const BuiltTensor &bt) {
 // legacy and stacked gguf contexts, so the ONLY difference between the two files
 // is the expert tensor naming/stacking.
 void set_common_meta(gguf_context *gc, int64_t n_embd, int64_t n_ff, int64_t n_layer,
-                     int64_t n_expert, int64_t n_head, int64_t head_dim,
-                     int64_t n_expert_used, int32_t ftype,
-                     const std::vector<std::string> &toks,
+                     int64_t n_expert, int64_t n_head, int64_t n_head_kv,
+                     int64_t head_dim, int64_t n_ctx, int64_t n_expert_used,
+                     int32_t ftype, const std::vector<std::string> &toks,
                      const std::vector<int32_t> &ttypes) {
     const int64_t n_vocab = static_cast<int64_t>(toks.size());
     gguf_set_val_str(gc, "general.architecture", "llama");
     gguf_set_val_str(gc, "general.name", "legacy-per-expert-moe");
-    gguf_set_val_u32(gc, "llama.context_length", 256);
+    gguf_set_val_u32(gc, "llama.context_length", static_cast<uint32_t>(n_ctx));
     gguf_set_val_u32(gc, "llama.embedding_length", static_cast<uint32_t>(n_embd));
     gguf_set_val_u32(gc, "llama.block_count", static_cast<uint32_t>(n_layer));
     gguf_set_val_u32(gc, "llama.feed_forward_length", static_cast<uint32_t>(n_ff));
     gguf_set_val_u32(gc, "llama.attention.head_count", static_cast<uint32_t>(n_head));
-    gguf_set_val_u32(gc, "llama.attention.head_count_kv", static_cast<uint32_t>(n_head));
+    gguf_set_val_u32(gc, "llama.attention.head_count_kv",
+                     static_cast<uint32_t>(n_head_kv));
     gguf_set_val_u32(gc, "llama.rope.dimension_count", static_cast<uint32_t>(head_dim));
     gguf_set_val_f32(gc, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
     gguf_set_val_u32(gc, "llama.expert_count", static_cast<uint32_t>(n_expert));
@@ -218,10 +246,40 @@ int main(int argc, char **argv) {
     const int64_t n_layer = argc > argbase + 2 ? std::atoll(argv[argbase + 2]) : 2;
     const int64_t n_expert = argc > argbase + 3 ? std::atoll(argv[argbase + 3]) : 8;
     const std::string qarg = argc > argbase + 4 ? argv[argbase + 4] : "q4_k";
+    // Optional Mixtral-geometry overrides. n_ctx defaults to 256 (CI-small);
+    // n_head_kv defaults to 0 which means MHA (head_count_kv == head_count), so
+    // existing callers that omit these args are byte-for-byte unchanged.
+    const int64_t n_ctx = argc > argbase + 5 ? std::atoll(argv[argbase + 5]) : 256;
+    const int64_t n_head_kv_arg = argc > argbase + 6 ? std::atoll(argv[argbase + 6]) : 0;
+    const int64_t n_head_arg = argc > argbase + 7 ? std::atoll(argv[argbase + 7]) : 0;
 
-    const int64_t n_head = (32 <= n_embd / 8) ? 32 : 4;
+    // n_head_arg==0 keeps the original auto-derived head count so existing
+    // callers are unchanged; a non-zero value lets a Mixtral-geometry fixture
+    // land on a realistic head_dim (head_dim = n_embd / n_head), e.g.
+    // n_embd=1024,n_head=8 => head_dim=128.
+    const int64_t n_head = (n_head_arg > 0) ? n_head_arg : ((32 <= n_embd / 8) ? 32 : 4);
+    if (n_head <= 0 || n_embd % n_head != 0) {
+        std::fprintf(stderr,
+                     "make-legacy-moe-gguf: n_head (%lld) must divide "
+                     "n_embd (%lld)\n",
+                     static_cast<long long>(n_head), static_cast<long long>(n_embd));
+        return 2;
+    }
     const int64_t head_dim = n_embd / n_head;
+    // GQA: n_head_kv_arg==0 selects MHA (equal to n_head). Otherwise it is the
+    // smaller grouped-query KV head count (e.g. 8 against 32 query heads). The
+    // KV tensors (attn_k / attn_v) then have n_head_kv * head_dim rows instead
+    // of n_embd, exactly like a real GQA checkpoint.
+    const int64_t n_head_kv = (n_head_kv_arg > 0) ? n_head_kv_arg : n_head;
+    const int64_t n_embd_kv = n_head_kv * head_dim;
     const int64_t n_expert_used = 2;
+    if (n_head_kv > n_head || n_head % n_head_kv != 0) {
+        std::fprintf(stderr,
+                     "make-legacy-moe-gguf: n_head_kv (%lld) must divide "
+                     "n_head (%lld)\n",
+                     static_cast<long long>(n_head_kv), static_cast<long long>(n_head));
+        return 2;
+    }
 
     ggml_type qtype = GGML_TYPE_Q4_K;
     int32_t ftype = 15;  // LLAMA_FTYPE_MOSTLY_Q4_K_M
@@ -276,12 +334,23 @@ int main(int argc, char **argv) {
     }
     const int64_t n_vocab = static_cast<int64_t>(toks.size());
 
-    // Generously sized data contexts (one per output file) for the quantized
-    // bytes + ggml tensor overhead.
+    // Generously sized data contexts (one per output file) for the tensor
+    // bytes + ggml tensor overhead. The budget must cover BOTH the experts
+    // (n_embd * n_ff per kind, 3 kinds, n_expert, n_layer) AND the trunk
+    // (token_embd/output at n_embd * n_vocab, and the per-layer attention
+    // projections at ~n_embd^2 each). The per-element cost is 4 bytes for F32
+    // and smaller for the K-quants, so sizing at the F32 upper bound (4 bytes
+    // per element) covers every qtype. An extra 2x fudge absorbs ggml object
+    // overhead and keeps older callers' pools unchanged (they still clamp to
+    // the 512 MiB floor below).
     size_t mem = 512u * 1024u * 1024u;
-    const size_t need = static_cast<size_t>(n_embd) * static_cast<size_t>(n_ff) *
-                        static_cast<size_t>(n_expert) * static_cast<size_t>(n_layer) *
-                        4u * 4u;
+    const size_t expert_elems = static_cast<size_t>(n_embd) * static_cast<size_t>(n_ff) *
+                                3u * static_cast<size_t>(n_expert) *
+                                static_cast<size_t>(n_layer);
+    const size_t attn_elems = static_cast<size_t>(n_embd) * static_cast<size_t>(n_embd) *
+                              4u * static_cast<size_t>(n_layer);
+    const size_t edge_elems = 2u * static_cast<size_t>(n_embd) * static_cast<size_t>(n_vocab);
+    const size_t need = (expert_elems + attn_elems + edge_elems) * 4u * 2u;
     if (need > mem) mem = need;
     ggml_init_params ip{};
     ip.mem_size = mem;
@@ -295,10 +364,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    set_common_meta(gc_legacy, n_embd, n_ff, n_layer, n_expert, n_head, head_dim,
-                    n_expert_used, ftype, toks, ttypes);
-    set_common_meta(gc_stacked, n_embd, n_ff, n_layer, n_expert, n_head, head_dim,
-                    n_expert_used, ftype, toks, ttypes);
+    set_common_meta(gc_legacy, n_embd, n_ff, n_layer, n_expert, n_head, n_head_kv,
+                    head_dim, n_ctx, n_expert_used, ftype, toks, ttypes);
+    set_common_meta(gc_stacked, n_embd, n_ff, n_layer, n_expert, n_head, n_head_kv,
+                    head_dim, n_ctx, n_expert_used, ftype, toks, ttypes);
 
     // IMPORTANT: build every tensor in a FIXED order from the SAME RNG so the
     // legacy and stacked files draw identical floats. We reset the RNG and walk
@@ -325,11 +394,17 @@ int main(int argc, char **argv) {
         const std::string pre = p;
         const int64_t ne_norm[1] = {n_embd};
         trunk.push_back(make_f32_trunk(pre + "attn_norm.weight", 1, ne_norm, true));
-        const int64_t ne_attn[2] = {n_embd, n_embd};
-        trunk.push_back(make_quant_trunk(qtype, pre + "attn_q.weight", 2, ne_attn));
-        trunk.push_back(make_quant_trunk(qtype, pre + "attn_k.weight", 2, ne_attn));
-        trunk.push_back(make_quant_trunk(qtype, pre + "attn_v.weight", 2, ne_attn));
-        trunk.push_back(make_quant_trunk(qtype, pre + "attn_output.weight", 2, ne_attn));
+        // attn_q / attn_output are [n_embd, n_embd]; under GQA attn_k / attn_v
+        // project to the smaller KV width [n_embd, n_head_kv * head_dim], which
+        // is what a real grouped-query checkpoint stores. When n_head_kv ==
+        // n_head (MHA default) n_embd_kv == n_embd and the shapes collapse back
+        // to the original fixture, keeping existing callers unchanged.
+        const int64_t ne_q[2] = {n_embd, n_embd};
+        const int64_t ne_kv[2] = {n_embd, n_embd_kv};
+        trunk.push_back(make_quant_trunk(qtype, pre + "attn_q.weight", 2, ne_q));
+        trunk.push_back(make_quant_trunk(qtype, pre + "attn_k.weight", 2, ne_kv));
+        trunk.push_back(make_quant_trunk(qtype, pre + "attn_v.weight", 2, ne_kv));
+        trunk.push_back(make_quant_trunk(qtype, pre + "attn_output.weight", 2, ne_q));
         trunk.push_back(make_f32_trunk(pre + "ffn_norm.weight", 1, ne_norm, true));
         const int64_t ne_gate_inp[2] = {n_embd, n_expert};
         trunk.push_back(
