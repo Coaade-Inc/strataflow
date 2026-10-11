@@ -642,7 +642,8 @@ uint64_t Engine::streamed_bytes() const {
 }
 
 std::unique_ptr<Engine> Engine::load(const std::string &path,
-                                     uint32_t expert_slots) {
+                                     uint32_t expert_slots,
+                                     uint32_t plan_kv_window) {
     std::unique_ptr<Engine> eng(new Engine());
     Impl &im = *eng->impl_;
 
@@ -788,19 +789,31 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     // FEAT-002 (technique 6.5): resident KV WINDOW W. The resident per-layer
     // K/V tensors are sized to W columns (a ring buffer), not full n_ctx, so
     // the reserved resident KV footprint drops when W < n_ctx. W defaults to
-    // n_ctx (full-resident => byte-identical, zero paging overhead); the test
-    // knob STRATAFLOW_ENGINE_KV_WINDOW (same std::getenv pattern as the other
-    // STRATAFLOW_ENGINE_* knobs, portable/_WIN32-safe) forces a smaller W so
-    // paging engages. W is clamped to [1, n_ctx]; a value >= n_ctx keeps the
-    // full-resident path. A smaller W tiers older positions to a RAM cold store
-    // and re-assembles them losslessly for attention (see forward()).
+    // n_ctx (full-resident => byte-identical, zero paging overhead). A smaller
+    // W tiers older positions to a RAM cold store and re-assembles them
+    // losslessly for attention (see forward()).
+    //
+    // Resolution order (highest priority first):
+    //   1. STRATAFLOW_ENGINE_KV_WINDOW env (same std::getenv pattern as the
+    //      other STRATAFLOW_ENGINE_* knobs, portable/_WIN32-safe): the explicit
+    //      user/test override WINS outright.
+    //   2. `plan_kv_window` (PlacementPlan::kv_window): the RAM-aware window the
+    //      planner chose for this model+budget, plumbed through GgmlModel. This
+    //      is the DEFAULT path and makes the windowed reservation apply with no
+    //      env side-channel.
+    //   3. full n_ctx when neither is set (byte-identical full-resident path).
+    // Any candidate is clamped to [1, n_ctx); a value >= n_ctx keeps the full
+    // window.
     uint32_t kv_window = static_cast<uint32_t>(n_ctx);
+    if (plan_kv_window >= 1 && plan_kv_window < static_cast<uint32_t>(n_ctx)) {
+        kv_window = plan_kv_window;  // plan-provided default window
+    }
     {
         const char *w_env = std::getenv("STRATAFLOW_ENGINE_KV_WINDOW");
         if (w_env != nullptr && w_env[0] != '\0') {
             const long req = std::strtol(w_env, nullptr, 10);
             if (req >= 1 && req < static_cast<long>(n_ctx)) {
-                kv_window = static_cast<uint32_t>(req);
+                kv_window = static_cast<uint32_t>(req);  // explicit override wins
             }
         }
     }

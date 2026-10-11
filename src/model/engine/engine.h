@@ -118,8 +118,18 @@ public:
     // n_expert forces streaming with LRU eviction/reload so a test can prove
     // bounded residency. Must be >= n_expert_used so a single layer's top-k
     // always fits; load() clamps up to that minimum.
+    //
+    // `kv_window` is the resident KV window W (technique 6.5) the PLAN chose for
+    // this model+budget. 0 means "full/auto": reserve the full trained n_ctx
+    // (the pre-FEAT-002 default, byte-identical, zero paging). A positive value
+    // < n_ctx engages lossless KV paging so the resident KV footprint drops by
+    // DEFAULT with no env side-channel. Resolution order inside load(): the
+    // explicit STRATAFLOW_ENGINE_KV_WINDOW env (user/test) WINS, else this
+    // plan-provided window, else full n_ctx. The default 0 keeps every existing
+    // caller (tests, oracle) on the full-resident path unchanged.
     static std::unique_ptr<Engine> load(const std::string &path,
-                                        uint32_t expert_slots = 0);
+                                        uint32_t expert_slots = 0,
+                                        uint32_t kv_window = 0);
 
     const EngineHParams &hparams() const;
 

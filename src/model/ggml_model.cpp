@@ -93,10 +93,11 @@ public:
     // run inference through the engine (libllama is never used to decode).
     GgmlModel(llama_model *model, llama_context *ctx, const ModelShape &shape,
               llama_token eos, std::string path, bool is_strata,
-              uint32_t plan_expert_slots)
+              uint32_t plan_expert_slots, uint32_t plan_kv_window)
         : model_(model), ctx_(ctx), vocab_(llama_model_get_vocab(model)),
           shape_(shape), eos_(eos), path_(std::move(path)),
-          plan_expert_slots_(plan_expert_slots) {
+          plan_expert_slots_(plan_expert_slots),
+          plan_kv_window_(plan_kv_window) {
         log_debug(std::string("GgmlModel: inference via engine (EC-5) on ") +
                   (is_strata ? ".strata" : "GGUF") + " '" + path_ + "'");
     }
@@ -241,7 +242,13 @@ private:
             if (s != nullptr && s[0] != '\0') {
                 slots = static_cast<uint32_t>(std::strtoul(s, nullptr, 10));
             }
-            engine_ = engine::Engine::load(path_, slots);
+            // KV window W the engine reserves. plan_kv_window_ is the planner's
+            // RAM-aware auto window (PlacementPlan::kv_window, 0 = full/auto);
+            // the engine applies it by DEFAULT. The explicit
+            // STRATAFLOW_ENGINE_KV_WINDOW env still wins inside Engine::load for
+            // user/test control, so the plan-driven default and the override
+            // reconcile in one place.
+            engine_ = engine::Engine::load(path_, slots, plan_kv_window_);
             if (engine_ == nullptr) return -1;  // arch unsupported / load failed
         }
         if (n_past_ == 0) engine_->reset_kv();
@@ -273,6 +280,10 @@ private:
     // SlotPool on the default (no explicit --expert-slots) path so the number
     // the engine USES equals the number the plan REPORTS. 0 = engine auto.
     uint32_t             plan_expert_slots_ = 0;
+    // The RAM-aware auto KV window the planner chose (PlacementPlan::kv_window).
+    // 0 = full/auto (engine reserves the full trained n_ctx). Passed to
+    // Engine::load so the windowed KV reservation applies by DEFAULT, no env.
+    uint32_t             plan_kv_window_ = 0;
     std::unique_ptr<engine::Engine> engine_;
 };
 
@@ -737,7 +748,7 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
 
     out = std::unique_ptr<Model>(
         new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/true,
-                      plan.expert_slots_resident));
+                      plan.expert_slots_resident, plan.kv_window));
     return SF_OK;
 }
 
@@ -886,7 +897,7 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
 
     out = std::unique_ptr<Model>(
         new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/false,
-                      final_plan.expert_slots_resident));
+                      final_plan.expert_slots_resident, final_plan.kv_window));
     return SF_OK;
 }
 
