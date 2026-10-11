@@ -28,6 +28,7 @@
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "model/engine/engine.h"
 #include "test_util.h"
+#include "tws/async_io.h"  // kIoAlignment
 #include "tws/strata_file.h"
 #include "tws/strata_format.h"
 #include "tws/strata_pack.h"
@@ -403,12 +404,143 @@ static void test_v1_strata_back_compat() {
     CHECK(seq_match);
 }
 
+// --- Hermetic v1 superblock back-compat -----------------------------------
+// The fixture-based test_v1_strata_back_compat above SKIPS unless a genuine
+// pre-change v1 .strata happens to be on disk, so in a clean CI the delicate
+// version-aware superblock parse (the v1 trailing-scalar relocation in
+// src/tws/strata_file.cpp) is never exercised. This hermetic test HAND-BUILDS a
+// v1 StrataSuperblock in memory with the EXACT v1 field layout - version==1, the
+// four trailing scalars (n_layers/n_experts/align/header_crc32) at their v1
+// offsets 80/84/88/92, the CRC computed over the v1 92-byte range, and NO
+// trunk-index fields or flag - writes a minimal valid .strata (v1 superblock +
+// a small embedded metadata blob + an empty expert index), opens it with
+// StrataReader, and asserts the version-aware parse maps the v1 layout
+// correctly WITHOUT depending on any external fixture. This makes the v1
+// trailing-scalar relocation a HARD gate rather than a skip-prone one; it is
+// additive and does not weaken the fixture-based gate above.
+//
+// StrataReader::open validates magic/version/align/CRC, then reads the metadata
+// blob and the expert index (which may be empty). It does NOT parse the GGUF
+// metadata, decode, or touch the trunk block, so a tiny arbitrary metadata blob
+// and a zero-entry expert index are sufficient for open() to succeed. The point
+// here is the superblock parse, so this stays at the reader layer.
+
+// Little-endian field writers. The .strata format is little-endian throughout
+// (see strata_format.h) and the targets we build/test on are little-endian, so
+// write each scalar byte-by-byte from the low byte up to be explicit about the
+// on-disk v1 layout regardless of host struct packing.
+static void put_u32_le(uint8_t *p, uint32_t v) {
+    p[0] = static_cast<uint8_t>(v & 0xFFu);
+    p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    p[2] = static_cast<uint8_t>((v >> 16) & 0xFFu);
+    p[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
+}
+static void put_u64_le(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        p[i] = static_cast<uint8_t>((v >> (8 * i)) & 0xFFu);
+    }
+}
+
+static void test_v1_superblock_hermetic() {
+    // v1 on-disk superblock layout (offsets, little-endian):
+    //   magic@0 version@8 flags@12 gguf_meta_offset@16 gguf_meta_size@24
+    //   index_offset@32 index_count@40 trunk_offset@48 trunk_size@56
+    //   expert_region_offset@64 expert_region_size@72
+    //   n_layers@80 n_experts@84 align@88 header_crc32@92 reserved[32]@96
+    // (v2 inserts trunk_index_offset/@trunk_index_count ahead of n_layers,
+    //  shifting the four trailing scalars down 16 bytes; v1 has NONE of that.)
+    const uint32_t kN_layers  = 7;
+    const uint32_t kN_experts = 11;
+
+    // Minimal embedded metadata blob: open() only copies these bytes into an
+    // owned buffer (it does not parse them), so any non-empty content works.
+    const char meta_blob[] = "STRATA-V1-HERMETIC-META";
+    const uint64_t meta_size = sizeof(meta_blob);  // includes the NUL
+
+    // Lay the file out: [128 superblock][meta blob][empty expert index].
+    const uint64_t meta_offset  = kStrataSuperblockSize;
+    const uint64_t index_offset = meta_offset + meta_size;
+    const uint64_t index_count  = 0;  // zero expert entries: open() allows this
+
+    uint8_t sb[kStrataSuperblockSize] = {};
+    std::memcpy(sb + 0, kStrataMagic, sizeof(kStrataMagic));
+    put_u32_le(sb + 8,  1u);  // version == 1 (NOT kStrataVersion)
+    put_u32_le(sb + 12, kStrataFlagExpertsBundled | kStrataFlagIndexSorted);
+    put_u64_le(sb + 16, meta_offset);
+    put_u64_le(sb + 24, meta_size);
+    put_u64_le(sb + 32, index_offset);
+    put_u64_le(sb + 40, index_count);
+    put_u64_le(sb + 48, 0u);  // trunk_offset (unused by open())
+    put_u64_le(sb + 56, 0u);  // trunk_size
+    put_u64_le(sb + 64, 0u);  // expert_region_offset
+    put_u64_le(sb + 72, 0u);  // expert_region_size
+    // v1 trailing scalars at their v1 offsets.
+    put_u32_le(sb + 80, kN_layers);
+    put_u32_le(sb + 84, kN_experts);
+    put_u32_le(sb + 88, static_cast<uint32_t>(kIoAlignment));  // align@88
+    // header_crc32@92 over the v1 92-byte range [0, 92).
+    const uint32_t crc = strata_crc32(sb, 92);
+    put_u32_le(sb + 92, crc);
+    // reserved[32]@96 stays zero (v1 had 32 reserved bytes, NO trunk-index).
+
+    // Write the hermetic v1 .strata to a temp path in the current working dir
+    // (the ctest run dir). Avoid std::tmpnam (link-time warnings under
+    // -Werror); the name is unique enough for a single-process test.
+    const std::string path = "hermetic_v1_superblock.strata";
+    {
+        FILE *f = std::fopen(path.c_str(), "wb");
+        CHECK(f != nullptr);
+        if (f == nullptr) return;
+        bool ok = std::fwrite(sb, 1, sizeof(sb), f) == sizeof(sb);
+        ok = ok && std::fwrite(meta_blob, 1, static_cast<size_t>(meta_size), f) ==
+                       static_cast<size_t>(meta_size);
+        // No expert index bytes to write (index_count == 0).
+        std::fclose(f);
+        CHECK(ok);
+        if (!ok) { std::remove(path.c_str()); return; }
+    }
+
+    // Open it and assert the version-aware parse mapped the v1 layout.
+    StrataReader reader;
+    const bool opened = reader.open(path);
+    std::printf("[v1-hermetic open=%s version=%u has_trunk_index=%s "
+                "trunk_index_count=%llu n_layers=%u n_experts=%u align=%u] ",
+                opened ? "yes" : "no", reader.superblock().version,
+                reader.has_trunk_index() ? "yes" : "no",
+                static_cast<unsigned long long>(reader.trunk_index_count()),
+                reader.superblock().n_layers, reader.superblock().n_experts,
+                reader.superblock().align);
+
+    CHECK(opened);
+    if (opened) {
+        CHECK_EQ(reader.superblock().version, static_cast<uint32_t>(1));
+        CHECK(!reader.has_trunk_index());
+        CHECK_EQ(reader.trunk_index_count(), static_cast<uint64_t>(0));
+        // The v1 trailing-scalar relocation read these back from offsets
+        // 80/84/88 rather than the v2 offsets 96/100/104.
+        CHECK_EQ(reader.superblock().n_layers,  kN_layers);
+        CHECK_EQ(reader.superblock().n_experts, kN_experts);
+        CHECK_EQ(reader.superblock().align,
+                 static_cast<uint32_t>(kIoAlignment));
+        // The v2-only trunk-index fields are zeroed on the v1 path.
+        CHECK_EQ(reader.superblock().trunk_index_offset,
+                 static_cast<uint64_t>(0));
+        CHECK_EQ(reader.superblock().trunk_index_count,
+                 static_cast<uint64_t>(0));
+        // The embedded metadata blob round-tripped verbatim.
+        CHECK_EQ(reader.metadata_size(), meta_size);
+    }
+
+    std::remove(path.c_str());
+}
+
 static void run_all() {
     RUN(test_trunk_stream_f32_byte_identical);
     RUN(test_trunk_stream_kquant_byte_identical);
     RUN(test_trunk_stream_resident_drop);
     RUN(test_trunk_stream_resident_drop_kquant);
     RUN(test_v1_strata_back_compat);
+    RUN(test_v1_superblock_hermetic);
 }
 
 TEST_MAIN()
