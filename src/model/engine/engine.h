@@ -143,6 +143,25 @@ public:
     // bounded resident-byte footprint.
     const EngineCacheStats &cache_stats() const;
 
+    // FEAT-002 (technique 6.5, lossless KV paging): the RESERVED resident KV
+    // footprint = n_layer * 2 (K and V) * head_dim * n_head_kv * sizeof(float)
+    // * W, where W is the resident window (STRATAFLOW_ENGINE_KV_WINDOW, default
+    // n_ctx). full_kv_bytes() is the same with W replaced by the full trained
+    // n_ctx (what the pre-FEAT-002 engine always reserved). When the window is
+    // smaller than n_ctx, resident_kv_bytes() is strictly less than
+    // full_kv_bytes() - the in-sandbox FIT win, proven byte-identical. Cold
+    // (evicted) KV lives in a RAM-backed per-layer store and is re-assembled
+    // losslessly for attention, so no past position is dropped.
+    uint64_t resident_kv_bytes() const;
+    uint64_t full_kv_bytes() const;
+
+    // FEAT-002: how many cold (evicted) KV columns the attention assembly has
+    // read back from the RAM cold store since load() - a lifetime counter that
+    // is > 0 iff the paging cold-fetch path actually ran (the window overflowed
+    // and older positions were re-assembled). 0 on the default full-resident
+    // path. Lets the oracle test prove paging engaged.
+    uint64_t kv_cold_fetches() const;
+
     // Run a forward for `token` at `pos`, writing the full logit vector (length
     // n_vocab) to `out`. `token` is appended to the engine-owned KV cache at
     // `pos` and the query attends over all cached positions 0..pos (causal).

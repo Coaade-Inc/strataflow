@@ -60,6 +60,15 @@ public:
     virtual uint64_t prefetch_warmed() const { return 0; }
     virtual uint64_t prefetch_used() const { return 0; }
     virtual uint64_t prefetch_completed_before_use() const { return 0; }
+
+    // FEAT-002 (technique 6.5, lossless KV paging): the RESERVED resident KV
+    // cache footprint in bytes (n_layer * 2 * head_dim * n_head_kv *
+    // sizeof(float) * W, W = the resident window). When the window is smaller
+    // than the trained n_ctx this is strictly less than the full-n_ctx
+    // reservation; older positions are tiered losslessly to a RAM cold store so
+    // decode stays byte-identical. 0 when not applicable (dry-run, or no engine
+    // loaded yet).
+    virtual uint64_t resident_kv_bytes() const { return 0; }
 };
 
 // Factory: inspects `path` and returns the right implementation.

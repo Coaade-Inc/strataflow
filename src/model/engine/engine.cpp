@@ -32,6 +32,7 @@
 #include <gguf.h>
 #include <llama.h>
 
+#include <algorithm>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -76,11 +77,25 @@ bool is_streaming_trunk_tensor(const std::string &name) {
 // across every forward() call.
 //
 // KV cache: one persistent, data-owning context (kvctx) holds a K and a V
-// tensor per layer, each shaped [head_dim, n_head_kv, n_ctx] with real backing
+// tensor per layer, each shaped [head_dim, n_head_kv, W] with real backing
 // (allocated once, filled in-graph via ggml_cpy into a position view). These
 // are graph LEAVES across forwards, so the per-call gallocr leaves their data
 // untouched (same pattern as the resident weight tensors). KvStore is the
-// bookkeeping owner of the current fill position and the n_ctx bound.
+// bookkeeping owner of the current fill position, the n_ctx bound, and the
+// FEAT-002 paging policy (window size, ring mapping, cold/resident split).
+//
+// FEAT-002 (technique 6.5, LOSSLESS KV paging): the resident per-layer K/V are
+// bounded to a recent WINDOW of W columns (a ring buffer keyed by pos % W)
+// instead of reserving the full trained n_ctx. W defaults to min(n_ctx, cap)
+// (so the DEFAULT path reserves exactly today's full n_ctx and is byte-
+// identical and zero-overhead), and a smaller W (STRATAFLOW_ENGINE_KV_WINDOW)
+// engages paging. When a position scrolls out of the window its EXACT F32 K/V
+// bytes are copied into a RAM-backed per-layer cold store (kv_cold_k/v, keyed
+// by absolute position) on the compute thread BEFORE the ring column is
+// overwritten, and attention re-assembles the full history 0..pos (cold columns
+// + resident ring columns in absolute order) and runs the IDENTICAL op sequence
+// over it, so decode stays bit-identical to the full-resident path. SSD spill
+// of cold pages and KV quantization are DEFERRED (approximate / later lever).
 struct Engine::Impl {
     gguf_context *gc   = nullptr;
     ggml_context *wctx = nullptr;  // full weight tensors, resident (backing store)
@@ -89,9 +104,25 @@ struct Engine::Impl {
 
     ggml_context *kvctx = nullptr;              // KV cache tensors, resident
     ggml_backend_buffer_t kvbuf = nullptr;      // backing buffer for kvctx
-    std::vector<ggml_tensor *> k_cache;         // per layer [head_dim, n_head_kv, n_ctx]
-    std::vector<ggml_tensor *> v_cache;         // per layer [head_dim, n_head_kv, n_ctx]
-    std::unique_ptr<KvStore> kv;                // position + capacity bookkeeping
+    std::vector<ggml_tensor *> k_cache;         // per layer [head_dim, n_head_kv, W]
+    std::vector<ggml_tensor *> v_cache;         // per layer [head_dim, n_head_kv, W]
+    std::unique_ptr<KvStore> kv;                // position + capacity + paging policy
+
+    // FEAT-002 paging state. kv_window is the resident ring column count W
+    // (== n_ctx on the default full-resident path). kv_floats_per_col is the
+    // F32 element count of one K/V column (head_dim * n_head_kv). The cold store
+    // holds, per layer, the EXACT F32 bytes of positions evicted from the ring,
+    // appended at [absolute_pos * kv_floats_per_col ...]; it only grows on the
+    // paging path (kv_paging true) and stays empty on the default path. The
+    // copies into/out of these vectors are the only ggml-touching paging code
+    // (KvStore owns the pure bookkeeping). kv_cold_fetches counts how many cold
+    // columns the assembly path has read back (the proof the cold path ran).
+    uint32_t kv_window = 0;
+    uint32_t kv_floats_per_col = 0;
+    bool     kv_paging = false;
+    std::vector<std::vector<float>> kv_cold_k;  // per layer, [n_ctx * floats_per_col]
+    std::vector<std::vector<float>> kv_cold_v;
+    uint64_t kv_cold_fetches = 0;               // cold columns re-assembled (proof)
 
     // EC-3 top-k residency. `estctx`/`estbuf` back the per-layer STAGING
     // stacked expert tensors fed to ggml_mul_mat_id: full ne-shape, but only
@@ -553,6 +584,26 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
 const EngineHParams &Engine::hparams() const { return impl_->hp; }
 const EngineCacheStats &Engine::cache_stats() const { return impl_->cstats; }
 
+uint64_t Engine::resident_kv_bytes() const {
+    // Reserved resident KV = n_layer * 2 (K+V) * floats_per_col * sizeof(float)
+    // * W. This is exactly the backing of the per-layer ring tensors.
+    const Impl &im = *impl_;
+    return static_cast<uint64_t>(im.hp.n_layer) * 2 *
+           static_cast<uint64_t>(im.kv_floats_per_col) * sizeof(float) *
+           static_cast<uint64_t>(im.kv_window);
+}
+
+uint64_t Engine::full_kv_bytes() const {
+    // The pre-FEAT-002 full-n_ctx reservation, for comparison.
+    const Impl &im = *impl_;
+    const uint64_t n_ctx =
+        im.kv != nullptr ? im.kv->capacity() : im.kv_window;
+    return static_cast<uint64_t>(im.hp.n_layer) * 2 *
+           static_cast<uint64_t>(im.kv_floats_per_col) * sizeof(float) * n_ctx;
+}
+
+uint64_t Engine::kv_cold_fetches() const { return impl_->kv_cold_fetches; }
+
 uint64_t Engine::resident_weight_bytes() const {
     // The .strata path backs only the resident trunk tensors in im.wbuf;
     // experts live in the unbacked ectx. The plain-GGUF path lets ggml/llama
@@ -717,10 +768,36 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     // reports 64; fall back to a safe minimum if the key was absent.
     const int n_ctx = hp.n_ctx_orig > 0 ? hp.n_ctx_orig : 64;
 
+    // FEAT-002 (technique 6.5): resident KV WINDOW W. The resident per-layer
+    // K/V tensors are sized to W columns (a ring buffer), not full n_ctx, so
+    // the reserved resident KV footprint drops when W < n_ctx. W defaults to
+    // n_ctx (full-resident => byte-identical, zero paging overhead); the test
+    // knob STRATAFLOW_ENGINE_KV_WINDOW (same std::getenv pattern as the other
+    // STRATAFLOW_ENGINE_* knobs, portable/_WIN32-safe) forces a smaller W so
+    // paging engages. W is clamped to [1, n_ctx]; a value >= n_ctx keeps the
+    // full-resident path. A smaller W tiers older positions to a RAM cold store
+    // and re-assembles them losslessly for attention (see forward()).
+    uint32_t kv_window = static_cast<uint32_t>(n_ctx);
+    {
+        const char *w_env = std::getenv("STRATAFLOW_ENGINE_KV_WINDOW");
+        if (w_env != nullptr && w_env[0] != '\0') {
+            const long req = std::strtol(w_env, nullptr, 10);
+            if (req >= 1 && req < static_cast<long>(n_ctx)) {
+                kv_window = static_cast<uint32_t>(req);
+            }
+        }
+    }
+    const int kv_cols = static_cast<int>(kv_window);
+    im.kv_window = kv_window;
+    im.kv_floats_per_col =
+        static_cast<uint32_t>(hp.head_dim) * static_cast<uint32_t>(hp.n_head_kv);
+    im.kv_paging = kv_window < static_cast<uint32_t>(n_ctx);
+
     // Allocate the engine-owned KV cache (section 3.4): a K and a V tensor per
-    // layer, [head_dim, n_head_kv, n_ctx], in one data-owning context backed by
-    // the CPU buffer type. These persist for the engine's lifetime and are the
-    // store that each forward() appends to and attends over.
+    // layer, [head_dim, n_head_kv, W], in one data-owning context backed by the
+    // CPU buffer type. These persist for the engine's lifetime and are the ring
+    // buffer that each forward() appends to and attends over. W == n_ctx on the
+    // default path reproduces the pre-FEAT-002 full-resident tensor exactly.
     {
         ggml_init_params kp{};
         kp.mem_size   = ggml_tensor_overhead() *
@@ -736,9 +813,9 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         im.v_cache.resize(static_cast<size_t>(hp.n_layer));
         for (int il = 0; il < hp.n_layer; ++il) {
             ggml_tensor *kc = ggml_new_tensor_3d(im.kvctx, GGML_TYPE_F32,
-                                                 hp.head_dim, hp.n_head_kv, n_ctx);
+                                                 hp.head_dim, hp.n_head_kv, kv_cols);
             ggml_tensor *vc = ggml_new_tensor_3d(im.kvctx, GGML_TYPE_F32,
-                                                 hp.head_dim, hp.n_head_kv, n_ctx);
+                                                 hp.head_dim, hp.n_head_kv, kv_cols);
             ggml_set_name(kc, ("kv_k." + std::to_string(il)).c_str());
             ggml_set_name(vc, ("kv_v." + std::to_string(il)).c_str());
             im.k_cache[static_cast<size_t>(il)] = kc;
@@ -752,12 +829,28 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         }
     }
 
+    // FEAT-002: per-layer RAM-backed cold page store for positions that scroll
+    // out of the resident window. Sized to the full n_ctx of F32 K/V columns so
+    // every evicted position has a stable home keyed by absolute position; it
+    // is populated lazily (only columns actually evicted are written) and stays
+    // empty on the default full-resident path (kv_paging false). This holds the
+    // SAME F32 bytes the resident ring held - pure RAM tiering, lossless.
+    if (im.kv_paging) {
+        im.kv_cold_k.assign(static_cast<size_t>(hp.n_layer),
+                            std::vector<float>(static_cast<size_t>(n_ctx) *
+                                               im.kv_floats_per_col, 0.0f));
+        im.kv_cold_v.assign(static_cast<size_t>(hp.n_layer),
+                            std::vector<float>(static_cast<size_t>(n_ctx) *
+                                               im.kv_floats_per_col, 0.0f));
+    }
+
     // bytes_per_token across all layers: K and V, head_dim * n_head_kv F32 each.
     const uint64_t bytes_per_token =
         static_cast<uint64_t>(hp.n_layer) * 2 *
         static_cast<uint64_t>(hp.head_dim) *
         static_cast<uint64_t>(hp.n_head_kv) * sizeof(float);
-    im.kv.reset(new KvStore(static_cast<uint32_t>(n_ctx), bytes_per_token));
+    im.kv.reset(new KvStore(static_cast<uint32_t>(n_ctx), bytes_per_token,
+                            kv_window));
 
     // EC-3: per-layer staging stacked expert tensors + the bounded SlotPool.
     // The staging tensors have the SAME ne-shape as the full expert tensors so
@@ -912,6 +1005,11 @@ void Engine::reset_kv() {
     impl_->pf_prev_warmed = impl_->prefetch_warmed;
     impl_->pf_prev_cbu = impl_->prefetch_completed_before_use;
     if (impl_->kv != nullptr) impl_->kv->reset();
+    // FEAT-002: a fresh sequence re-fills the cold store from position 0, so
+    // drop the cold-fetch proof counter. The cold vectors themselves are keyed
+    // by absolute position and overwritten (by the eviction copy-out) before
+    // they are ever read, so they need no explicit clear.
+    impl_->kv_cold_fetches = 0;
 }
 
 namespace {
@@ -942,19 +1040,197 @@ bool run_segment(ggml_backend_t backend, ggml_gallocr_t galloc,
     return compute_ok;
 }
 
+// FEAT-002: everything the shared attention builder needs to know about the KV
+// window + cold store for one layer. On the default full-resident path
+// (paging==false, window==n_kv-capacity) it reduces to exactly today's write-
+// at-column-pos / read-columns-0..n_kv behavior. When paging, the resident
+// tensor is a ring buffer of `window` columns and `cold_k`/`cold_v` hold the
+// EXACT F32 bytes of positions 0..(cold_count-1), keyed by absolute position
+// (stride floats_per_col). The engine fills the cold store on the compute
+// thread BEFORE the segment is built (eviction copy-out), so by the time the
+// graph runs the cold bytes for every evicted position are present and stable.
+struct KvAttnPaging {
+    bool            paging        = false;  // W < n_ctx
+    uint32_t        window        = 0;      // ring column count W
+    uint32_t        floats_per_col = 0;     // head_dim * n_head_kv
+    const float    *cold_k        = nullptr;  // layer cold K [n_ctx * floats_per_col]
+    const float    *cold_v        = nullptr;  // layer cold V
+    uint64_t       *cold_fetches  = nullptr;  // += cold columns re-assembled
+};
+
+// FEAT-002: a cold-history input tensor and the host bytes that fill it. The
+// builder creates the ggml input leaf (sized to the cold columns) and records
+// where its bytes come from (the per-layer cold store); forward()'s set_inputs
+// callback copies `n_bytes` from `src` into the tensor AFTER graph allocation,
+// exactly like every other segment input. This keeps the ggml-touching copy on
+// the compute thread with no new shared state.
+struct KvColdFill {
+    ggml_tensor *tensor = nullptr;
+    const float *src    = nullptr;
+    size_t       n_bytes = 0;
+};
+
+// FEAT-002: build the attention block (KV write + lossless history assembly +
+// the IDENTICAL permute/mul_mat/soft_max/mul_mat op sequence) shared by the MoE
+// router segment and the dense segment. Returns `cur` [head_dim*n_head,
+// n_tokens], the attention output pre-output-projection. `Qcur`/`Kcur`/`Vcur`
+// are post-RoPE (K), raw (V) and reshaped to [head_dim, n_head(_kv), n_tokens].
+//
+// Default (non-paging) path: write Kcur/Vcur at ring column `pos` (== absolute,
+// since window == capacity) and read columns 0..n_kv directly - byte-identical
+// to the pre-FEAT-002 code. Paging path: write Kcur/Vcur at ring column
+// pos % W, then ASSEMBLE a [head_dim, n_head_kv, n_kv] history whose columns
+// are, in absolute order 0..pos: the cold-store columns (host input, memcpy of
+// the exact evicted F32 bytes) followed by the resident ring columns (copied in
+// via ggml_cpy from ring views, handling wrap). The attention math then runs
+// over the assembled tensor, so the bytes, order, and ops all match the full-
+// resident path exactly => bit-identical result.
+ggml_tensor *build_kv_attention(ggml_context *gctx, const EngineHParams &hp,
+                                ggml_tensor *Qcur, ggml_tensor *Kcur,
+                                ggml_tensor *Vcur, ggml_tensor *k_cache,
+                                ggml_tensor *v_cache, ggml_tensor *kq_mask,
+                                int64_t pos, int64_t n_kv,
+                                const KvAttnPaging &pg,
+                                std::vector<ggml_tensor *> &graph_stores,
+                                std::vector<KvColdFill> &cold_fills) {
+    const int64_t n_tokens = Qcur->ne[2];
+
+    // --- WRITE: append this token's K/V to the resident ring column. On the
+    // default path window == capacity so (pos % window) == pos, reproducing the
+    // original column-pos write exactly. ---
+    const uint32_t ring_col =
+        pg.paging ? static_cast<uint32_t>(pos) % pg.window
+                  : static_cast<uint32_t>(pos);
+    ggml_tensor *k_dst = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
+                                      n_tokens, k_cache->nb[1], k_cache->nb[2],
+                                      static_cast<size_t>(ring_col) * k_cache->nb[2]);
+    ggml_tensor *v_dst = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
+                                      n_tokens, v_cache->nb[1], v_cache->nb[2],
+                                      static_cast<size_t>(ring_col) * v_cache->nb[2]);
+    graph_stores.push_back(ggml_cpy(gctx, Kcur, k_dst));
+    graph_stores.push_back(ggml_cpy(gctx, Vcur, v_dst));
+
+    ggml_tensor *k_hist = nullptr;
+    ggml_tensor *v_hist = nullptr;
+    if (!pg.paging || n_kv <= static_cast<int64_t>(pg.window)) {
+        // Full-resident read: every position 0..pos is still in the ring at its
+        // absolute column (no wrap yet), so read it directly - identical to the
+        // pre-FEAT-002 path (and the fast path while a paged run has not yet
+        // overflowed its window).
+        k_hist = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
+                              n_kv, k_cache->nb[1], k_cache->nb[2], 0);
+        v_hist = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
+                              n_kv, v_cache->nb[1], v_cache->nb[2], 0);
+    } else {
+        // --- ASSEMBLE the full history [head_dim, n_head_kv, n_kv] losslessly.
+        // Columns 0..(cold-1) come from the cold store (host input, exact bytes
+        // the ring once held); columns cold..pos come from the resident ring in
+        // absolute order (handling wrap). Same bytes, same order, same ops. ---
+        const uint32_t W = pg.window;
+        const uint32_t resident = W;                         // n_kv > W here
+        const uint32_t cold = static_cast<uint32_t>(n_kv) - resident;
+
+        ggml_tensor *asm_k = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, hp.head_dim,
+                                                hp.n_head_kv, n_kv);
+        ggml_tensor *asm_v = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, hp.head_dim,
+                                                hp.n_head_kv, n_kv);
+
+        // Cold columns via one host-filled input tensor each (set after alloc).
+        ggml_tensor *cold_k_in = nullptr;
+        ggml_tensor *cold_v_in = nullptr;
+        if (cold > 0) {
+            cold_k_in = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, hp.head_dim,
+                                           hp.n_head_kv, cold);
+            cold_v_in = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, hp.head_dim,
+                                           hp.n_head_kv, cold);
+            ggml_set_input(cold_k_in);
+            ggml_set_input(cold_v_in);
+            // Record the host-byte fills: columns 0..(cold-1) are absolute
+            // positions 0..(cold-1), stored contiguously at the START of the
+            // per-layer cold store (stride floats_per_col). Copied in by
+            // forward()'s set_inputs after allocation.
+            const size_t cold_bytes =
+                static_cast<size_t>(cold) * pg.floats_per_col * sizeof(float);
+            cold_fills.push_back(KvColdFill{cold_k_in, pg.cold_k, cold_bytes});
+            cold_fills.push_back(KvColdFill{cold_v_in, pg.cold_v, cold_bytes});
+            ggml_tensor *dst_k0 = ggml_view_3d(gctx, asm_k, hp.head_dim,
+                                               hp.n_head_kv, cold, asm_k->nb[1],
+                                               asm_k->nb[2], 0);
+            ggml_tensor *dst_v0 = ggml_view_3d(gctx, asm_v, hp.head_dim,
+                                               hp.n_head_kv, cold, asm_v->nb[1],
+                                               asm_v->nb[2], 0);
+            graph_stores.push_back(ggml_cpy(gctx, cold_k_in, dst_k0));
+            graph_stores.push_back(ggml_cpy(gctx, cold_v_in, dst_v0));
+        }
+
+        // Resident ring columns, absolute positions cold..pos. The oldest
+        // resident position is `cold`, at ring column cold % W; the window wraps
+        // at most once, so it is 1 or 2 contiguous runs in the ring. Copy each
+        // run with a single ggml_cpy into the matching assembly columns.
+        uint32_t placed = cold;  // next assembly column to fill
+        uint32_t src_col = cold % W;
+        while (placed < static_cast<uint32_t>(n_kv)) {
+            const uint32_t run = std::min(W - src_col,
+                                          static_cast<uint32_t>(n_kv) - placed);
+            ggml_tensor *src_k = ggml_view_3d(gctx, k_cache, hp.head_dim,
+                                              hp.n_head_kv, run, k_cache->nb[1],
+                                              k_cache->nb[2],
+                                              static_cast<size_t>(src_col) *
+                                                  k_cache->nb[2]);
+            ggml_tensor *src_v = ggml_view_3d(gctx, v_cache, hp.head_dim,
+                                              hp.n_head_kv, run, v_cache->nb[1],
+                                              v_cache->nb[2],
+                                              static_cast<size_t>(src_col) *
+                                                  v_cache->nb[2]);
+            ggml_tensor *dst_k = ggml_view_3d(gctx, asm_k, hp.head_dim,
+                                              hp.n_head_kv, run, asm_k->nb[1],
+                                              asm_k->nb[2],
+                                              static_cast<size_t>(placed) *
+                                                  asm_k->nb[2]);
+            ggml_tensor *dst_v = ggml_view_3d(gctx, asm_v, hp.head_dim,
+                                              hp.n_head_kv, run, asm_v->nb[1],
+                                              asm_v->nb[2],
+                                              static_cast<size_t>(placed) *
+                                                  asm_v->nb[2]);
+            graph_stores.push_back(ggml_cpy(gctx, src_k, dst_k));
+            graph_stores.push_back(ggml_cpy(gctx, src_v, dst_v));
+            placed  += run;
+            src_col  = 0;  // after the first run the ring wrapped to column 0
+        }
+
+        if (pg.cold_fetches != nullptr) *pg.cold_fetches += cold;
+        k_hist = asm_k;
+        v_hist = asm_v;
+    }
+
+    ggml_tensor *q = ggml_permute(gctx, Qcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head]
+    ggml_tensor *k = ggml_cont(gctx, ggml_permute(gctx, k_hist, 0, 2, 1, 3));  // [head_dim, n_kv, n_head_kv]
+    ggml_tensor *v = ggml_cont(gctx, ggml_permute(gctx, v_hist, 0, 2, 1, 3));  // [head_dim, n_kv, n_head_kv]
+    ggml_tensor *kq = ggml_mul_mat(gctx, k, q);             // [n_kv, n_tokens, n_head]
+    ggml_prec_set_acc(kq, GGML_PREC_F32);
+    const float kq_scale = 1.0f / std::sqrt(static_cast<float>(hp.head_dim));
+    kq = ggml_soft_max_ext(gctx, kq, kq_mask, kq_scale, 0.0f);
+    ggml_tensor *vt = ggml_cont(gctx, ggml_transpose(gctx, v));  // [n_kv, head_dim, n_head_kv]
+    ggml_tensor *kqv = ggml_mul_mat(gctx, vt, kq);          // [head_dim, n_tokens, n_head]
+    kqv = ggml_permute(gctx, kqv, 0, 2, 1, 3);              // [head_dim, n_head, n_tokens]
+    return ggml_cont_2d(gctx, kqv, hp.head_dim * hp.n_head, n_tokens);
+}
+
 // EC-7: build one DENSE llama layer as a single segment (no router/experts, so
 // no mid-layer host read-back): attn + residual + ffn_norm + plain gate/up/down
-// FFN (swiglu) + residual. The attention block is intentionally identical to
-// build_router_segment's (duplicated rather than shared, to keep the proven MoE
-// path untouched). Returns the layer output [n_embd, n_tokens] (set as output);
-// KV stores are appended to `graph_stores` so run_segment roots them.
+// FFN (swiglu) + residual. The attention block is shared with the MoE router
+// segment via build_kv_attention (FEAT-002), which also owns the lossless KV
+// paging. Returns the layer output [n_embd, n_tokens] (set as output); KV
+// stores (and any assembly copies) are appended to `graph_stores` so
+// run_segment roots them.
 ggml_tensor *build_dense_layer_segment(ggml_context *gctx, ggml_tensor *inpL,
                                        ggml_tensor *inp_pos, int il,
                                        ggml_context *wctx, const EngineHParams &hp,
                                        ggml_tensor *k_cache, ggml_tensor *v_cache,
                                        ggml_tensor *kq_mask, int64_t pos,
-                                       int64_t n_kv,
-                                       std::vector<ggml_tensor *> &graph_stores) {
+                                       int64_t n_kv, const KvAttnPaging &pg,
+                                       std::vector<ggml_tensor *> &graph_stores,
+                                       std::vector<KvColdFill> &cold_fills) {
     const std::string p = "blk." + std::to_string(il) + ".";
     ggml_tensor *attn_norm_w = ggml_get_tensor(wctx, (p + "attn_norm.weight").c_str());
     ggml_tensor *wq          = ggml_get_tensor(wctx, (p + "attn_q.weight").c_str());
@@ -985,31 +1261,9 @@ ggml_tensor *build_dense_layer_segment(ggml_context *gctx, ggml_tensor *inpL,
                          GGML_ROPE_TYPE_NORMAL, hp.n_ctx_orig, hp.freq_base,
                          hp.freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    const size_t kv_col_nb = k_cache->nb[2];
-    ggml_tensor *k_dst = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
-                                      n_tokens, k_cache->nb[1], k_cache->nb[2],
-                                      static_cast<size_t>(pos) * kv_col_nb);
-    ggml_tensor *v_dst = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
-                                      n_tokens, v_cache->nb[1], v_cache->nb[2],
-                                      static_cast<size_t>(pos) * v_cache->nb[2]);
-    graph_stores.push_back(ggml_cpy(gctx, Kcur, k_dst));
-    graph_stores.push_back(ggml_cpy(gctx, Vcur, v_dst));
-
-    ggml_tensor *k_hist = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
-                                       n_kv, k_cache->nb[1], k_cache->nb[2], 0);
-    ggml_tensor *v_hist = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
-                                       n_kv, v_cache->nb[1], v_cache->nb[2], 0);
-    ggml_tensor *q = ggml_permute(gctx, Qcur, 0, 2, 1, 3);
-    ggml_tensor *k = ggml_cont(gctx, ggml_permute(gctx, k_hist, 0, 2, 1, 3));
-    ggml_tensor *v = ggml_cont(gctx, ggml_permute(gctx, v_hist, 0, 2, 1, 3));
-    ggml_tensor *kq = ggml_mul_mat(gctx, k, q);
-    ggml_prec_set_acc(kq, GGML_PREC_F32);
-    const float kq_scale = 1.0f / std::sqrt(static_cast<float>(hp.head_dim));
-    kq = ggml_soft_max_ext(gctx, kq, kq_mask, kq_scale, 0.0f);
-    ggml_tensor *vt = ggml_cont(gctx, ggml_transpose(gctx, v));
-    ggml_tensor *kqv = ggml_mul_mat(gctx, vt, kq);
-    kqv = ggml_permute(gctx, kqv, 0, 2, 1, 3);
-    cur = ggml_cont_2d(gctx, kqv, hp.head_dim * hp.n_head, n_tokens);
+    // KV write + lossless history assembly + attention (shared, FEAT-002).
+    cur = build_kv_attention(gctx, hp, Qcur, Kcur, Vcur, k_cache, v_cache,
+                             kq_mask, pos, n_kv, pg, graph_stores, cold_fills);
     cur = ggml_mul_mat(gctx, wo, cur);
     ggml_tensor *ffn_inp = ggml_add(gctx, cur, inpSA);
 
@@ -1040,8 +1294,9 @@ void build_router_segment(ggml_context *gctx, ggml_tensor *inpL,
                           ggml_tensor *inp_pos, int il, ggml_context *wctx,
                           const EngineHParams &hp, ggml_tensor *k_cache,
                           ggml_tensor *v_cache, ggml_tensor *kq_mask,
-                          int64_t pos, int64_t n_kv,
+                          int64_t pos, int64_t n_kv, const KvAttnPaging &pg,
                           std::vector<ggml_tensor *> &graph_stores,
+                          std::vector<KvColdFill> &cold_fills,
                           ggml_tensor **out_cur, ggml_tensor **out_ffn_inp,
                           ggml_tensor **out_weights, ggml_tensor **out_selected) {
     const std::string p = "blk." + std::to_string(il) + ".";
@@ -1079,37 +1334,10 @@ void build_router_segment(ggml_context *gctx, ggml_tensor *inpL,
                          GGML_ROPE_TYPE_NORMAL, hp.n_ctx_orig, hp.freq_base,
                          hp.freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    // Append this token's K and V to the per-layer KV cache at column `pos`.
-    const size_t kv_col_nb = k_cache->nb[2];  // bytes per token-column
-    ggml_tensor *k_dst = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
-                                      n_tokens, k_cache->nb[1], k_cache->nb[2],
-                                      static_cast<size_t>(pos) * kv_col_nb);
-    ggml_tensor *v_dst = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
-                                      n_tokens, v_cache->nb[1], v_cache->nb[2],
-                                      static_cast<size_t>(pos) * v_cache->nb[2]);
-    graph_stores.push_back(ggml_cpy(gctx, Kcur, k_dst));
-    graph_stores.push_back(ggml_cpy(gctx, Vcur, v_dst));
-
-    // Attention over KV history (explicit non-flash branch of build_attn_mha).
-    ggml_tensor *k_hist = ggml_view_3d(gctx, k_cache, hp.head_dim, hp.n_head_kv,
-                                       n_kv, k_cache->nb[1], k_cache->nb[2], 0);
-    ggml_tensor *v_hist = ggml_view_3d(gctx, v_cache, hp.head_dim, hp.n_head_kv,
-                                       n_kv, v_cache->nb[1], v_cache->nb[2], 0);
-
-    ggml_tensor *q = ggml_permute(gctx, Qcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head]
-    ggml_tensor *k = ggml_cont(gctx, ggml_permute(gctx, k_hist, 0, 2, 1, 3));  // [head_dim, n_kv, n_head_kv]
-    ggml_tensor *v = ggml_cont(gctx, ggml_permute(gctx, v_hist, 0, 2, 1, 3));  // [head_dim, n_kv, n_head_kv]
-
-    ggml_tensor *kq = ggml_mul_mat(gctx, k, q);             // [n_kv, n_tokens, n_head]
-    // The reference forces GGML_PREC_F32 accumulation on kq; match it.
-    ggml_prec_set_acc(kq, GGML_PREC_F32);
-    const float kq_scale = 1.0f / std::sqrt(static_cast<float>(hp.head_dim));
-    kq = ggml_soft_max_ext(gctx, kq, kq_mask, kq_scale, 0.0f);
-
-    ggml_tensor *vt = ggml_cont(gctx, ggml_transpose(gctx, v));  // [n_kv, head_dim, n_head_kv]
-    ggml_tensor *kqv = ggml_mul_mat(gctx, vt, kq);          // [head_dim, n_tokens, n_head]
-    kqv = ggml_permute(gctx, kqv, 0, 2, 1, 3);              // [head_dim, n_head, n_tokens]
-    cur = ggml_cont_2d(gctx, kqv, hp.head_dim * hp.n_head, n_tokens);
+    // KV write + lossless history assembly + attention (explicit non-flash
+    // branch of build_attn_mha), shared with the dense segment (FEAT-002).
+    cur = build_kv_attention(gctx, hp, Qcur, Kcur, Vcur, k_cache, v_cache,
+                             kq_mask, pos, n_kv, pg, graph_stores, cold_fills);
 
     // Output projection + residual.
     cur = ggml_mul_mat(gctx, wo, cur);
@@ -1789,6 +2017,52 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     const size_t embd = static_cast<size_t>(hp.n_embd);
     const size_t n_used = static_cast<size_t>(hp.n_expert_used);
 
+    // FEAT-002 lossless paging: BEFORE any layer's segment overwrites a ring
+    // column, copy the position that column currently holds into the per-layer
+    // RAM cold store, keyed by its absolute position. All layers write the same
+    // `pos` and evict the same absolute position (pos - W), and the column each
+    // holds is a stable leaf from a prior forward, so snapshot every layer's
+    // to-be-evicted column up front on this (compute) thread. No-op on the
+    // default full-resident path (kv_paging false) or until the window first
+    // overflows (pos < W). This is the ONLY place cold bytes are produced; the
+    // exact F32 bytes the ring held are preserved verbatim (lossless).
+    if (im.kv_paging && pos >= static_cast<int32_t>(im.kv_window)) {
+        const uint32_t W = im.kv_window;
+        const uint32_t evict_pos = static_cast<uint32_t>(pos) - W;
+        const uint32_t ring_col = static_cast<uint32_t>(pos) % W;
+        const size_t fpc = im.kv_floats_per_col;
+        const size_t col_bytes = fpc * sizeof(float);
+        const size_t ring_off  = static_cast<size_t>(ring_col) * col_bytes;
+        const size_t cold_off  = static_cast<size_t>(evict_pos) * fpc;
+        for (int il = 0; il < hp.n_layer; ++il) {
+            const size_t L = static_cast<size_t>(il);
+            ggml_backend_tensor_get(im.k_cache[L],
+                                    im.kv_cold_k[L].data() + cold_off,
+                                    ring_off, col_bytes);
+            ggml_backend_tensor_get(im.v_cache[L],
+                                    im.kv_cold_v[L].data() + cold_off,
+                                    ring_off, col_bytes);
+        }
+    }
+
+    // FEAT-002: per-layer paging descriptor passed into the shared attention
+    // builder. cold_k/cold_v point at the layer's cold store (filled above);
+    // the builder reads only columns 0..(cold_count-1) from them. Constructed
+    // per layer in the loop so cold_k/cold_v target the right layer.
+    auto make_pg = [&](int il) -> KvAttnPaging {
+        KvAttnPaging pg;
+        pg.paging         = im.kv_paging;
+        pg.window         = im.kv_window;
+        pg.floats_per_col = im.kv_floats_per_col;
+        pg.cold_fetches   = &im.kv_cold_fetches;
+        if (im.kv_paging) {
+            const size_t L = static_cast<size_t>(il);
+            pg.cold_k = im.kv_cold_k[L].data();
+            pg.cold_v = im.kv_cold_v[L].data();
+        }
+        return pg;
+    };
+
     // The layer-boundary hidden state carried on the host between segments.
     // Segment 0's embedding lookup is folded into the first router segment's
     // input tensor, so compute the embedding here into `hidden`.
@@ -1848,10 +2122,13 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
             ggml_set_input(kq_mask);
 
             std::vector<ggml_tensor *> stores;
+            std::vector<KvColdFill> cold_fills;
+            const KvAttnPaging pg = make_pg(il);
             ggml_tensor *layer_out = build_dense_layer_segment(
                 gctx, inpL, inp_pos, il, im.wctx, hp,
                 im.k_cache[static_cast<size_t>(il)],
-                im.v_cache[static_cast<size_t>(il)], kq_mask, pos, n_kv, stores);
+                im.v_cache[static_cast<size_t>(il)], kq_mask, pos, n_kv, pg,
+                stores, cold_fills);
 
             std::vector<ggml_tensor *> roots = stores;
             roots.push_back(layer_out);
@@ -1862,6 +2139,9 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
                 std::vector<float> mask(static_cast<size_t>(n_kv), 0.0f);
                 ggml_backend_tensor_set(kq_mask, mask.data(), 0,
                                         mask.size() * sizeof(float));
+                for (const KvColdFill &cf : cold_fills) {
+                    ggml_backend_tensor_set(cf.tensor, cf.src, 0, cf.n_bytes);
+                }
             });
             if (ok) {
                 ggml_backend_tensor_get(layer_out, hidden.data(), 0, embd * sizeof(float));
@@ -1889,12 +2169,15 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
             ggml_set_input(kq_mask);
 
             std::vector<ggml_tensor *> stores;
+            std::vector<KvColdFill> cold_fills;
+            const KvAttnPaging pg = make_pg(il);
             ggml_tensor *r_cur = nullptr, *r_ffn = nullptr, *r_w = nullptr,
                         *r_sel = nullptr;
             build_router_segment(gctx, inpL, inp_pos, il, im.wctx, hp,
                                  im.k_cache[static_cast<size_t>(il)],
                                  im.v_cache[static_cast<size_t>(il)], kq_mask,
-                                 pos, n_kv, stores, &r_cur, &r_ffn, &r_w, &r_sel);
+                                 pos, n_kv, pg, stores, cold_fills, &r_cur,
+                                 &r_ffn, &r_w, &r_sel);
 
             std::vector<ggml_tensor *> roots = stores;
             roots.push_back(r_cur);
@@ -1908,6 +2191,9 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
                 std::vector<float> mask(static_cast<size_t>(n_kv), 0.0f);
                 ggml_backend_tensor_set(kq_mask, mask.data(), 0,
                                         mask.size() * sizeof(float));
+                for (const KvColdFill &cf : cold_fills) {
+                    ggml_backend_tensor_set(cf.tensor, cf.src, 0, cf.n_bytes);
+                }
             });
             if (ok) {
                 ggml_backend_tensor_get(r_cur, cur_host.data(), 0, embd * sizeof(float));

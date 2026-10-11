@@ -217,6 +217,18 @@ int main(int argc, char **argv) {
                         static_cast<unsigned long long>(
                             rs.prefetch_completed_before_use));
         }
+        // FEAT-002 (technique 6.5): the RESERVED resident KV footprint. Appended
+        // as new ', key = value' fields (existing fields kept verbatim, so the
+        // Python bench parser is unaffected). Printed only when the engine
+        // actually loaded a KV cache (resident_kv_bytes > 0); the raw byte count
+        // lets the harness confirm the windowed reservation shrank vs full
+        // n_ctx when STRATAFLOW_ENGINE_KV_WINDOW is set.
+        if (rs.resident_kv_bytes > 0) {
+            std::printf(", resident_kv = %.1f MiB",
+                        static_cast<double>(rs.resident_kv_bytes) / mib);
+            std::printf(", resident_kv_bytes = %llu",
+                        static_cast<unsigned long long>(rs.resident_kv_bytes));
+        }
         std::printf("\n");
     }
 

@@ -215,6 +215,16 @@ typedef struct sf_runtime_stats {
      * (prefetch_used / prefetch_warmed). 0 when not applicable. Appended for ABI
      * backward-compatibility (END of struct only). */
     uint64_t prefetch_warmed;
+    /* FEAT-002 (technique 6.5, lossless KV paging): the RESERVED resident KV
+     * cache footprint in bytes = n_layer * 2 (K and V) * head_dim * n_head_kv *
+     * sizeof(float) * W, where W is the resident window
+     * (STRATAFLOW_ENGINE_KV_WINDOW, default the full trained n_ctx). When the
+     * window is smaller than n_ctx this is strictly less than the full-n_ctx
+     * reservation, and older positions are tiered losslessly to a RAM cold
+     * store (decode stays byte-identical). 0 before the engine has loaded / on
+     * the dry-run path. Appended for ABI backward-compatibility (END of struct
+     * only). */
+    uint64_t resident_kv_bytes;
 } sf_runtime_stats;
 
 /* Fill `out` with current runtime stats. Call after sf_generate to see the
