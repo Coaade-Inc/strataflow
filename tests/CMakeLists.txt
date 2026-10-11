@@ -63,3 +63,14 @@ sf_add_test(test_legacy_per_expert_pack)
 # MoE+streaming (NOT the dense branch). Only drives the library (pack + load +
 # plan), so a plain sf_add_test suffices (no extra ggml linkage).
 sf_add_test(test_strata_shape_prepass)
+
+# test_kv_window_real_path is the FEAT-002 Part A real-load-path gate: it packs
+# the Mixtral-geometry legacy fixture to .strata, loads it through sf::load_model
+# under a simulated budget, and proves the lossless auto KV window ENGAGES BY
+# DEFAULT (no STRATAFLOW_ENGINE_KV_WINDOW) - geometry reaches the planner, the
+# plan chooses kv_window in (0, n_ctx), and an engine loaded with that plan
+# window (via the new Engine::load parameter) reserves less than full KV while
+# decoding bit-identically to the full-resident run and the libllama oracle.
+# Only drives the library (pack + load + plan + engine + oracle), so a plain
+# sf_add_test suffices.
+sf_add_test(test_kv_window_real_path)
