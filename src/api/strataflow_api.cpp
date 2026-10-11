@@ -278,6 +278,9 @@ sf_status sf_session_stats(sf_session *session, sf_runtime_stats *out) {
         have_model ? session->ctx->model->prefetch_used() : 0;
     out->prefetch_warmed =
         have_model ? session->ctx->model->prefetch_warmed() : 0;
+    // FEAT-002 lossless KV paging: reserved resident KV footprint (windowed).
+    out->resident_kv_bytes =
+        have_model ? session->ctx->model->resident_kv_bytes() : 0;
     return SF_OK;
 }
 

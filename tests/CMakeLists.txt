@@ -22,6 +22,16 @@ sf_add_test(test_async_io)
 sf_add_test(test_engine_oracle)
 sf_add_test(test_strata_decode)
 
+# test_kv_paging is the FEAT-002 lossless KV-paging gate (technique 6.5): it
+# forces a SMALL resident window (STRATAFLOW_ENGINE_KV_WINDOW) and decodes a
+# prompt + N tokens longer than the window so cold KV is paged out and re-
+# assembled, proving the paged decode is byte-identical to the full-resident
+# engine (per-step logit max|delta|==0.0) AND to the libllama oracle, while
+# resident_kv_bytes() < full_kv_bytes() and the cold-fetch path actually ran.
+# Covers the F32 MoE and K-quant fixtures. Drives only the library (engine +
+# oracle), so a plain sf_add_test suffices.
+sf_add_test(test_kv_paging)
+
 # test_trunk_stream is the FEAT-003 "stream the trunk" gate (technique 6.4): it
 # packs a fixture to a v2 trunk-indexed .strata and proves the trunk-streaming
 # decode is byte-identical to the fully-resident decode (same file, toggled via

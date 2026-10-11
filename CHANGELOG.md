@@ -11,6 +11,38 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- Lossless KV paging (technique 6.5 from `docs/RESEARCH_50B_ON_A_LAPTOP.md`, the
+  lossless half). The engine-owned per-layer K/V cache no longer reserves the
+  full trained `n_ctx` up front: it is bounded to a resident recent WINDOW `W`
+  (the per-layer `kvctx` tensors become `[head_dim, n_head_kv, W]`, a ring buffer
+  keyed by `pos % W`), and positions that scroll out of the window are tiered to
+  a RAM-backed per-layer COLD page store (keyed by absolute position, holding the
+  EXACT F32 bytes the ring held). Attention re-assembles the full history
+  `0..pos` - cold columns from the store plus the resident ring columns in
+  absolute position order (handling ring wrap) - and runs the IDENTICAL
+  permute/`mul_mat`/`soft_max_ext`/`mul_mat` op sequence over it, so decode is
+  BYTE-IDENTICAL to the full-resident path and the libllama oracle; no past
+  position is dropped (this is deliberately NOT lossy StreamingLLM/SnapKV
+  eviction). The window `W` defaults to the full `n_ctx` (so the DEFAULT path is
+  byte-identical and zero-overhead) and is overridable via the
+  `STRATAFLOW_ENGINE_KV_WINDOW` env knob (same `std::getenv` pattern as the other
+  `STRATAFLOW_ENGINE_*` knobs) to engage paging. `KvStore` (`src/kv/kv_store.h`)
+  owns the paging bookkeeping (window, ring mapping, cold/resident split); the
+  ggml-touching copies live in `engine.cpp`; the cold store is populated and read
+  on the single compute thread only, so no new cross-thread state is added (TSan
+  clean) and it composes with the streamed trunk, the bounded expert `SlotPool`,
+  and async prefetch. New `Engine::resident_kv_bytes()` / `full_kv_bytes()`
+  accessors, plus a `resident_kv_bytes` field APPENDED (ABI-safe) to
+  `sf_runtime_stats` and wired through `sf_session_stats` and the CLI, measure the
+  reserved-KV reduction. Sandbox-proven byte-identical and resident-KV-lower on
+  the generated fixtures (`tests/test_kv_paging.cpp`): with
+  `STRATAFLOW_ENGINE_KV_WINDOW=4` over an 8-token generation (sequence longer than
+  the window, so cold KV is paged out and fetched back; cold-fetch counter 462),
+  resident KV drops 32,768 -> 2,048 B on the F32 tiny MoE (`n_ctx` 64) and
+  1,048,576 -> 16,384 B on the K-quant MoE (`n_ctx` 256), with the paged decode
+  bit-for-bit identical to the full-resident engine (`max|delta| = 0.000e+00`)
+  and matching the oracle (F32 within 1e-3; Q4_K seq-identical). SSD spill of cold
+  pages (option b) and KV quantization (approximate, Stage 4) are deferred.
 - Stream the trunk: lossless streaming of the large edge tensors (technique 6.4
   from `docs/RESEARCH_50B_ON_A_LAPTOP.md`). The two biggest trunk tensors, each
   touched exactly once per token at the input/output edges - `token_embd.weight`
