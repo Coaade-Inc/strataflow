@@ -1,0 +1,678 @@
+# Research and Feasibility: a 50B-class MoE on a normal laptop
+
+**Owner: Coaade Inc.**
+
+> **Scope.** This is a research + feasibility design doc, not an implementation.
+> It names the two hard ceilings that stop a ~50B-class Mixture-of-Experts (MoE)
+> model from running usefully on an everyday no-GPU laptop, analyzes each
+> candidate technique for breaking them (mechanism, 50B-on-12GB memory and
+> throughput math, oracle-safety, complexity, feasibility verdict), gives a
+> concrete memory-budget and throughput model, and ends with a sequenced,
+> impact-ordered implementation plan. The orchestrator will drive implementation
+> of the feasible techniques from this doc, one oracle-gated PR at a time.
+>
+> This doc refines and connects to the existing roadmap; it does not contradict
+> it. Read alongside [`ROADMAP.md`](./ROADMAP.md), [`PLAN.md`](./PLAN.md),
+> [`ENGINE_CORE_DESIGN.md`](./ENGINE_CORE_DESIGN.md), and
+> [`RESEARCH.md`](./RESEARCH.md).
+
+---
+
+## 0. The target machine and the mission
+
+The target is a normal laptop, and we calibrate it to the free Colab CPU box,
+because that box is both representative and the machine where the real runs
+below were measured:
+
+- ~12 GB usable RAM
+- 2 CPU cores
+- SSD at roughly 4 GiB/s sequential and comparable large-random throughput, QD1
+- no GPU
+
+The mission (from `ROADMAP.md`): run a very large MoE in a bounded RAM budget by
+streaming experts from disk, in any GGUF weight type, with no GPU required, and
+with output byte-identical to the libllama oracle wherever we claim exactness.
+This doc narrows that mission to a concrete, researcher-level question: **what
+has to change for a ~50B-class MoE to both FIT and run at a usable speed on the
+12 GB / 2-core / no-GPU box?**
+
+The user explicitly asked for out-of-the-box thinking, including using the SSD
+itself as a virtual-RAM tier so that lack of RAM stops being a hard capability
+ceiling. We take that seriously and formalize it (Section 4), while being honest
+about what it does and does not buy.
+
+---
+
+## 1. The calibration run: real Mixtral on the free Colab box
+
+These are measured facts from real runs through StrataFlow. They are the
+calibration point for every estimate in this doc. We do not invent new numbers;
+we extrapolate from these and state assumptions when we do.
+
+Model: Mixtral-8x7B-Instruct, Q3_K_M, packed to `.strata`, ~19 GB on disk.
+Shape: 32 layers, 8 experts/layer, top-2 routing.
+
+Measured on the 12 GB / 2-core / ~4 GiB/s SSD / no-GPU box:
+
+| Quantity | Measured |
+|---|---|
+| Output | coherent, correct greedy decode end to end |
+| Resident StrataFlow model weights (trunk only) | ~939 MiB |
+| Peak process RSS | ~10.6 - 10.7 GB |
+| Bytes streamed from SSD (16 tokens, after PR #39) | ~40 GB (was ~51 GB before #39) |
+| Time to first token (TTFT) | ~52 s |
+| Decode throughput | ~0.06 - 0.07 tok/s |
+| Async prefetch `completed-before-use` | 0 |
+
+Two facts in that table are in tension and define the whole problem:
+
+1. StrataFlow's own resident model weights are tiny (~939 MiB) because the
+   bounded SlotPool keeps only the hot experts resident. Yet peak RSS is ~10.6
+   GB. **Something other than resident experts is eating the RAM.**
+2. For 16 tokens the engine streamed ~40 GB, which is *more than twice* the
+   entire ~18 GB expert set. **The hot working set does not fit, so the engine
+   re-reads most of the model every handful of tokens.**
+
+`completed-before-use = 0` is not a bug. With 2 cores the per-layer compute
+window is smaller than the time to read the next layer's experts off the SSD, so
+the background prefetch read never finishes before the authoritative load needs
+it. I/O cannot hide behind compute on this hardware. This is a structural
+property of 2-core + SSD-bound streaming, and the async worker already
+self-backs-off when it observes it (PR #39). Any throughput plan has to assume
+I/O overlap buys nothing here and win by reading *fewer / larger* bytes instead.
+
+---
+
+## 2. The two ceilings
+
+### Ceiling A - the fixed resident floor (why peak RSS is ~10.6 GB)
+
+Resident experts are small and bounded. Peak RSS is dominated by a fixed
+resident floor that does NOT shrink with `--expert-slots`:
+
+- **Fully-resident trunk.** On both the GGUF and `.strata` paths the trunk
+  (attention projections, norms, embeddings, output head, routers for all
+  layers) is held fully resident in a ggml weight context (`wctx`), filled once
+  at load. See `Engine::load_strata_weights` in
+  `src/model/engine/engine.cpp`: the trunk tensors are allocated resident via
+  `ggml_backend_alloc_ctx_tensors_from_buft` and filled from the trunk block;
+  only the expert tensors live in the unbacked `ectx` and stream. The trunk is
+  NOT streamed today.
+- **Fully-resident KV cache.** `src/model/engine/engine.cpp` allocates, in a
+  persistent `kvctx`, one K and one V tensor per layer shaped
+  `[head_dim, n_head_kv, n_ctx]` as F32, backed once for the engine lifetime.
+  `KvStore` (`src/kv/kv_store.h`) only does bookkeeping; the bytes are a fixed
+  resident cost that grows with `n_ctx`. Not paged, not quantized today.
+- **The process floor.** `libllama` is still linked (for the tokenizer / vocab;
+  see the `llama_*` includes in `src/model/engine/engine.cpp` and
+  `src/model/ggml_model.cpp`) and, with the ggml backend and vocab, contributes
+  a fixed ~132 MiB floor measured in-sandbox (a 3.9 MiB model and a
+  `--plan-only` run both measure ~132 MiB; see `ROADMAP.md`
+  "Per-layer staging no longer scales with model size").
+- **One-layer staging + compute buffer.** A single reused staging buffer sized
+  to one layer's FULL `n_expert` footprint (not the slot budget) plus the ggml
+  compute buffer. Bounded, but non-trivial for a large layer.
+
+For Mixtral Q3_K_M the trunk is ~939 MiB and the floor is small, so on paper the
+resident floor looks like ~1-2 GB. The measured ~10.6 GB peak RSS tells us the
+rest is the OS page cache plus transient allocations around the ~40 GB of
+streaming (buffered reads, staging churn) sitting on top of the floor. For the
+budget model we treat the *controllable* resident floor as trunk + KV + process
+floor + one-layer staging + compute buffer, and we treat uncontrolled page-cache
+growth as a thing to suppress with direct / unbuffered I/O (Section 7).
+
+The point for a 50B target: a 50B-class MoE has a much larger trunk and (at
+useful context) a much larger KV cache than Mixtral-8x7B. If the trunk alone
+does not fit in a few GB, the model does not load at all, regardless of how well
+experts stream. **The resident floor is the FIT ceiling.**
+
+### Ceiling B - per-token byte traffic (why it is ~0.06 tok/s)
+
+Decode throughput on this box is bounded below by:
+
+```
+seconds_per_token  >=  bytes_streamed_per_token / ssd_bandwidth
+                       + compute_per_token / cores
+```
+
+With ~40 GB over 16 tokens that is ~2.5 GB/token. At ~4 GiB/s that alone is
+~0.6 s/token of pure I/O in the best case; the measured ~15 s/token says the
+real effective streaming rate is far below peak sequential bandwidth, because
+the reads are many smaller blob reads at low queue depth, not one big sequential
+gulp, and because `completed-before-use = 0` means none of it overlaps compute.
+
+The root cause of the huge per-token traffic: the model's hot expert working set
+exceeds the number of expert bundles that fit in 12 GB. For Mixtral, ~18 GB of
+experts means only ~121 of 256 bundles fit in RAM, so more than half the experts
+touched each token are cold and must be re-streamed. **Per-token byte traffic is
+the SPEED ceiling.**
+
+Layer-stratified residency + prefetch gating (PR #39) already cut this (37%
+fewer streamed bytes at a tight budget, async no longer increasing traffic), but
+it cannot change the fundamental fact that the working set does not fit. To go
+further we must either make the resident set hold more of the working set (fit
+more experts in the same RAM) or read fewer bytes per expert (sub-expert
+streaming) or touch the big model on fewer steps (speculative decode).
+
+---
+
+## 3. 50B-class extrapolation assumptions
+
+Mixtral-8x7B has no single "50B-class" successor shape, so we state explicit
+assumptions and carry them through. We model a representative 50B-class MoE as:
+
+- Total parameters ~50B, quantized ~3.5-4 bits/param -> ~22-25 GB on disk.
+- MoE with a modest active fraction (e.g. ~8-16 experts/layer, top-2), active
+  params per token ~5-7B, consistent with the gpt-oss-120b-class row in
+  `PLAN.md` section 2 scaled down.
+- Trunk (attention + norms + embeddings + output + routers across all layers)
+  ~3-5 GB at the shipped quant. This is the number that must drop for the model
+  to FIT; it is larger than Mixtral's ~0.9 GB trunk because 50B has more / wider
+  layers.
+- KV cache at a useful context (say 8K-32K): F32 per-layer K and V as today puts
+  this in the multi-GB range and growing with context.
+
+These are assumptions, not measurements. The budget model (Section 5) is
+expressed symbolically so the verdicts hold as the real 50B shape firms up; the
+Mixtral row stays the only measured calibration.
+
+---
+
+## 4. The SSD-as-virtual-RAM idea, done right
+
+The user's framing: instead of needing more RAM, use the SSD as a virtual-RAM
+tier so a bigger model can run. This is correct in spirit and is in fact already
+the core of what StrataFlow does for experts. The important part is doing it as
+a MODEL-AWARE tier, not as naive OS swap or `mmap`-as-generic-RAM.
+
+### Why naive OS swap / mmap thrashes
+
+If you `mmap` the whole 25 GB model and let the OS page it in on fault, or add a
+25 GB swapfile and let the kernel evict, you get:
+
+- **Random, page-granular, QD1 faults.** A page fault pulls 4 KiB (or a small
+  readahead window) at a time, synchronously, at the worst point in the SSD's
+  curve (small random QD1). Our weights want large aligned contiguous reads
+  where the SSD runs near its ~4 GiB/s sequential number.
+- **No routing knowledge.** The kernel evicts by generic LRU / working-set
+  heuristics. It does not know that this expert will not be touched again for 30
+  layers, or that the trunk is hot every token. It will happily evict a hot
+  trunk page to make room for a cold expert it faulted on.
+- **Page-cache double-buffering.** Buffered reads land in the page cache, which
+  then competes with our own RAM budget - exactly the ~10.6 GB RSS blowup
+  pattern. `PLAN.md` section 3.3 already calls for direct I/O that bypasses the
+  page cache for this reason.
+
+### What the model-aware tier is
+
+StrataFlow's existing design already is a userspace, MoE-routing-aware virtual
+RAM for *experts*: the `.strata` file is the authoritative weight store on disk
+(`StrataReader`, `src/tws/strata_file.h`), reads are large aligned per-expert
+blobs via `read_blob` (direct-I/O capable `BlockFile`), eviction is driven by
+our router read-back and predictor (layer-stratified `SlotPool`,
+`src/tws/weight_store.h`), and residency is bounded to a RAM budget. The
+authoritative synchronous load keeps it byte-identical to the oracle.
+
+The "SSD as a proper tier done right" program is to extend this same
+model-aware paging from experts to EVERY weight class that currently sits in the
+fixed resident floor: the trunk (Section 6.4) and cold KV pages (Section 6.5),
+with large aligned reads and routing/position-aware eviction, never OS swap.
+
+**Honest framing.** This REMOVES the hard RAM ceiling for weights: a 50B model's
+weights can live on SSD and be paged in model-aware, so the box can *load and
+run* a model whose weights far exceed RAM. It does NOT by itself raise token
+speed; if anything, paging more weight classes adds bytes to move. Its value is
+that it is the framing that makes the FIT levers possible and lets the SPEED
+levers (which cut bytes/token) operate on a model that otherwise would not fit
+at all. Verdict: this is not a single feature but the organizing principle; the
+concrete features that realize it are "stream the trunk" and "page the KV",
+analyzed below.
+
+---
+
+## 5. The 50B-on-12GB memory budget model
+
+All figures below are for the representative 50B-class MoE of Section 3 on the
+12 GB box. The goal is to get the resident floor comfortably under ~6 GB so
+there is headroom for staging, compute, and the OS, while cutting per-token
+streaming. "Resident" means must-be-in-RAM; everything else lives on SSD and
+streams.
+
+### Before (today's residency model applied to 50B)
+
+| Component | Resident today | Note |
+|---|---|---|
+| Trunk (attn/norm/embd/output/routers, all layers) | ~3-5 GB | fully resident in `wctx` |
+| KV cache (F32, useful context) | ~2-4 GB and growing | fully resident `kvctx` |
+| Process floor (libllama + ggml + vocab) | ~0.13 GB | fixed |
+| One-layer expert staging | ~0.3-1 GB | one layer's full `n_expert` footprint |
+| Compute buffer | ~0.2-0.5 GB | ggml gallocr |
+| Resident expert cache | bounded, small | SlotPool |
+| **Resident floor subtotal** | **~6-11 GB** | **may not fit; trunk + KV dominate** |
+
+A 50B trunk + full KV can approach or exceed the whole 12 GB before a single
+expert is cached. **Conclusion: today's residency model does not fit a 50B on 12
+GB. The FIT levers are mandatory, not optional.**
+
+### After (apply the FIT levers)
+
+| Component | Resident after | Lever |
+|---|---|---|
+| Trunk | ~0.5-1.5 GB resident hot set; rest streamed | 6.4 stream the trunk (lossless) |
+| KV cache | ~0.5-1.5 GB (recent window resident; cold paged and/or quantized) | 6.5 page / quantize KV |
+| Process floor | ~0.02-0.05 GB | 6.6 tiny tokenizer, drop libllama |
+| One-layer staging | ~0.3-1 GB | unchanged (bounded already) |
+| Compute buffer | ~0.2-0.5 GB | unchanged |
+| Resident expert cache | fill remaining budget (several GB) | more RAM for experts |
+| **Resident floor subtotal** | **~1.5-4.5 GB floor + experts filling to ~6-10 GB** | **fits with headroom** |
+
+The key move is that trunk-streaming and KV-paging convert multi-GB *fixed*
+resident costs into *bounded, streamable* costs, which (a) makes the model fit
+and (b) frees several GB to enlarge the resident expert cache, which directly
+attacks Ceiling B by holding more of the hot working set.
+
+### SPEED levers' effect on bytes/token
+
+With more RAM freed for experts, a larger fraction of the ~22-25 GB expert set
+is resident, so fewer cold misses per token. The sub-expert and sub-byte levers
+cut the remaining traffic further:
+
+- **Sub-byte resident experts** (2-bit in RAM, dequant-at-compute): 2-3x more
+  experts fit in the same RAM, so cold-miss rate drops roughly proportionally.
+- **Sub-expert / activation-sparse streaming**: read only the contributing rows
+  / columns, cutting bytes per *streamed* expert, potentially several-fold.
+- **Sequential batched I/O**: same bytes but nearer the ~4 GiB/s sequential
+  number instead of the measured low-QD1 effective rate, cutting wall-clock per
+  byte.
+- **Speculative decode**: the expensive expert streaming happens on a fraction
+  of steps (verification bursts), cutting *effective* bytes/token across the
+  sequence.
+
+---
+
+## 6. Technique-by-technique analysis
+
+Each technique: mechanism, 50B-on-12GB math, oracle-safety (can it stay
+byte-identical, or is it approximate), complexity + dependencies, and a verdict:
+`feasible-now`, `feasible-with-effort`, `research-risky`, or `not-worth-it`.
+
+"Lossless" below means byte-identical to the libllama oracle and buildable under
+the existing correctness gate. "Approximate" means it changes outputs and must
+be validated with a quality metric (perplexity / KLD / accuracy vs oracle)
+instead of byte-identity.
+
+### 6.1 SSD-as-a-proper-tier (model-aware weight paging)
+
+- **Mechanism.** Section 4: SSD is the authoritative store; large aligned blob
+  reads; router/predictor-driven eviction; never OS swap. Already true for
+  experts; extend to trunk and KV.
+- **50B math.** Removes the hard RAM ceiling for weights: a 25 GB weight file
+  runs on 12 GB. No direct speed effect on its own.
+- **Oracle-safety.** Lossless (pure residency / byte provenance, same bytes same
+  ops), the same property that keeps expert streaming byte-identical today.
+- **Complexity / deps.** This is the framing; realized by 6.4 and 6.5. No new
+  standalone work beyond those.
+- **Verdict: feasible-now (as the organizing principle).** The concrete,
+  shippable pieces are 6.4 and 6.5.
+
+### 6.2 Sub-expert / activation-sparse streaming
+
+- **Mechanism.** Stream only the rows / columns of an expert's gate/up/down that
+  actually contribute for this token, grounded in the published activation-
+  sparsity line of work: Apple "LLM in a Flash" (load only predicted-active
+  neuron columns), Deja Vu (contextual sparsity predictors), PowerInfer
+  (hot/cold neuron split). `PLAN.md` sections 3.8 and 3.10 already anticipate
+  row-column bundling and neuron-bundle reads.
+- **50B math.** This is the single biggest lever on Ceiling B. If only ~30-50%
+  of each expert's neurons are active for a token, per-expert bytes drop
+  2-3x, cutting the ~2.5 GB/token traffic toward ~1 GB/token and shrinking the
+  resident footprint of a cached expert correspondingly.
+- **Oracle-safety.** This is where byte-identity breaks, and the doc is explicit:
+  - Streaming only the experts the router actually selected is LOSSLESS and is
+    *already what we do* (top-k residency). That is not this technique.
+  - Predicting / pruning *intra-expert* rows is APPROXIMATE: dropping a row that
+    turns out to contribute changes the output. There is no lossless variant of
+    *predicted* intra-expert sparsity. A lossless variant exists only if the
+    activation is exactly zero (e.g. a true ReLU producing exact zeros, which we
+    can detect post-activation) - but Mixtral-class SwiGLU/SiLU experts do not
+    produce exact structural zeros, so for our target this is inherently lossy.
+  - Validation path for the approximate case: measure perplexity / KLD vs the
+    oracle on a held-out set at each sparsity threshold, report the quality cost,
+    and ship it as an opt-in "fast mode" (consistent with `PLAN.md` principle 4
+    and section 3.8's calibrated thresholds), never as the default exact path.
+- **Complexity / deps.** High. Needs a per-layer sparsity predictor or threshold
+  calibration, sparse GEMV kernels that skip zeroed input channels, a `.strata`
+  layout that allows sub-blob row/column reads (today a bundle is one aligned
+  blob), and a quality-regression harness. Depends on the quality-metric gate
+  existing.
+- **Verdict: research-risky (highest-impact-but-approximate).** Biggest
+  bytes/token win, but it is lossy for our model family, needs new kernels and a
+  new quality gate, and the aligned-blob `.strata` layout would need sub-blob
+  addressing. Sequence it after the lossless levers, behind an opt-in flag with
+  a measured perplexity cost. De-risk with a spike (Section 9).
+
+### 6.3 Sub-byte resident weights with compute-time dequant
+
+- **Mechanism.** Hold experts in RAM at a lower bit-width than disk (e.g. 2-bit
+  trellis / LUT) so 2-3x more experts fit resident; dequantize to the compute
+  type at matmul time. Ties to Phase 6 (T-MAC/LUT low-bit CPU kernels) and Phase
+  7 (trellis 2-bit) in `PLAN.md`/`ROADMAP.md`.
+- **50B math.** If experts resident double or triple, the cold-miss rate per
+  token drops roughly proportionally, directly cutting Ceiling B's bytes/token.
+  E.g. if 50% of the working set fits today, 2x density could fit ~all of it,
+  collapsing re-streaming.
+- **Oracle-safety.** Two cases:
+  - If the in-RAM sub-byte format is a *different* quantization than the model
+    shipped, it is APPROXIMATE (re-quantizing Q3_K experts to 2-bit changes the
+    numbers) and needs the quality-metric gate.
+  - If the model already ships at that sub-byte format, computing it natively is
+    LOSSLESS and is just "support this quant family" (the engine is already
+    type-agnostic; it stages each expert at its source ggml type). That is quant
+    coverage, not this technique.
+- **Complexity / deps.** High on this hardware: dequant costs CPU, and CPU is the
+  scarce resource on 2 cores. A 2-bit LUT kernel must be fast enough that the
+  extra dequant does not eat the I/O savings. Needs the T-MAC/LUT kernels
+  (Phase 6) which do not exist yet.
+- **Verdict: feasible-with-effort, but approximate and CPU-gated.** Real win on a
+  box with spare CPU; on 2 cores the dequant cost competes with the I/O savings,
+  so it must be measured. Sequence after the LUT kernels exist. Lower priority
+  than the lossless FIT levers.
+
+### 6.4 Stream the trunk (not just experts)
+
+- **Mechanism.** Today the trunk is fully resident (`wctx`) and is a big part of
+  the resident floor; for a 50B it may not fit. Stream attention / norm /
+  embedding / output / router weights layer-by-layer the same way experts stream
+  from `.strata`, keeping only a bounded hot-trunk working set resident. The
+  `.strata` format already stores the trunk as a contiguous block
+  (`superblock().trunk_offset`); the change is to make trunk tensors
+  stream-backed (like `ectx` experts) rather than fully allocated in `wctx`,
+  with their own residency policy.
+- **50B math.** Converts the ~3-5 GB fixed trunk into a bounded resident hot set
+  (~0.5-1.5 GB) plus streamed cold trunk. This is the dominant FIT lever: it is
+  likely MANDATORY for a 50B to load at all on 12 GB. Trunk weights are touched
+  every token (unlike cold experts), so the hot set must be chosen carefully -
+  attention and norms are hot and should stay resident; the embedding matrix and
+  output head are large and touched once per token at the edges and are the best
+  streaming candidates.
+- **Oracle-safety.** LOSSLESS. This is pure residency / byte provenance, exactly
+  like expert streaming: same bytes, same ops, byte-identical to the oracle.
+  Buildable under the existing gate.
+- **Complexity / deps.** Medium. Reuses the `StrataReader` + `SlotPool` +
+  staging machinery; the new work is a trunk residency policy and making trunk
+  graph leaves stream-backed. Risk: trunk tensors are referenced throughout the
+  graph build (`get_weight`), so the staging/lifetime discipline must match the
+  expert path's "resident before the op is built" contract.
+- **Verdict: feasible-now (lossless, high-impact, FIT).** This is the top FIT
+  lever and a strong first implementation target: it is lossless, reuses
+  existing streaming machinery, and without it a 50B does not fit.
+
+### 6.5 Page / quantize the KV cache
+
+- **Mechanism.** KV grows with context and is pure resident cost today
+  (`kvctx`, F32, `[head_dim, n_head_kv, n_ctx]` per layer). Two independent
+  sub-levers (Phase 6, `PLAN.md` section 3.9):
+  - **KV paging**: keep a recent-window of KV resident, page cold KV pages to
+    SSD (or just RAM for shorter contexts), fetch on demand for attention.
+  - **KV quantization**: store K/V at q8 or 4-bit (optionally Hadamard-rotated)
+    instead of F32.
+- **50B math.** F32 KV at useful context is multi-GB. q8 KV is ~4x smaller;
+  4-bit ~8x. Paging bounds resident KV to the recent window regardless of total
+  context. Together these turn a growing multi-GB fixed cost into a bounded
+  sub-GB resident cost, freeing RAM for experts (Ceiling A) and enabling long
+  context on the box.
+- **Oracle-safety.**
+  - KV *paging* is LOSSLESS (same F32 bytes, just moved tiers) if paged
+    faithfully. Byte-identical to the oracle.
+  - KV *quantization* is APPROXIMATE (q8/4-bit K/V changes attention numerics)
+    and needs the quality-metric gate; ship as opt-in with measured perplexity
+    cost. StreamingLLM/SnapKV-style windowed eviction is also lossy and opt-in.
+- **Complexity / deps.** Medium for paging (new KV residency + attention fetch),
+  medium-high for quantized KV (quantized attention path / dequant). Paging has
+  no new-kernel dependency; quantization needs quantized-KV attention kernels.
+- **Verdict: KV paging feasible-with-effort and LOSSLESS (FIT lever); KV
+  quantization feasible-with-effort but APPROXIMATE.** Prioritize paging (or at
+  minimum making KV depth-bounded) as a lossless FIT lever; treat quantization
+  as an opt-in follow-on with a quality metric.
+
+### 6.6 Shrink the process floor (drop libllama from the runtime)
+
+- **Mechanism.** `libllama` is linked only for the tokenizer / vocab (the
+  `llama_*` calls in `src/model/engine/engine.cpp` and
+  `src/model/ggml_model.cpp`) yet contributes to the fixed ~132 MiB process
+  floor. Replace it with a tiny standalone tokenizer (BPE/SPM reading the vocab
+  already embedded in the GGUF/.strata metadata) so the runtime no longer links
+  libllama.
+- **50B math.** Frees ~0.1 GB of fixed floor for weights. Modest in absolute
+  terms, but it is pure lossless headroom and it removes the libllama dependency
+  from the shipped runtime (libllama remains only as the test oracle), which is
+  architecturally clean and shrinks the "fixed floor" that dominated peak RSS.
+- **Oracle-safety.** LOSSLESS for decode (the tokenizer must produce identical
+  token ids; validate the standalone tokenizer against `llama_tokenize` on a
+  corpus as its own gate). Does not touch the forward pass.
+- **Complexity / deps.** Medium: a correct BPE/SPM tokenizer matching
+  llama.cpp's behavior (special tokens, byte fallback, normalization) is fiddly
+  but well-trodden. Independent of the other levers (can be parallelized).
+- **Verdict: feasible-with-effort, lossless, modest-impact.** Worth doing for
+  architectural cleanliness and a bit of floor, but it is not what makes 50B fit;
+  sequence it after the big FIT levers unless done in parallel.
+
+### 6.7 Sequential / batched I/O to beat random-read stalls
+
+- **Mechanism.** Instead of many separate `read_blob` calls, read several
+  upcoming layers' predicted experts in one large SEQUENTIAL read, exploiting
+  that SSD sequential (~4 GiB/s) far exceeds low-QD1 random. The co-activation
+  placement in `PLAN.md` section 3.10 (experts used together placed adjacently
+  on disk) is the enabling layout.
+- **50B math.** Does not reduce bytes/token, but raises the *effective* streaming
+  rate toward the sequential number. If today's effective rate is well below 4
+  GiB/s (the ~15 s/token for ~2.5 GB/token implies ~0.17 GB/s effective), moving
+  toward sequential could cut wall-clock per token several-fold without changing
+  a single output byte.
+- **Oracle-safety.** LOSSLESS (same bytes, same order of use, just fetched in
+  bigger reads). Reconciles honestly with `completed-before-use = 0`: overlap
+  cannot hide reads on 2 cores, but FEWER and LARGER reads still cut wall-clock
+  because they run nearer peak bandwidth and pay less per-read overhead.
+- **Complexity / deps.** Medium: batched/coalesced reads in `StrataReader`, a
+  predicted-expert batch from the predictor, and a `.strata` layout that places
+  co-activated / sequential-layer experts adjacently (packer change). The
+  predictor already exists (`src/predict/predictor.h`); the layout and the
+  coalesced read are the new work.
+- **Verdict: feasible-now, lossless, speed lever.** This is the most promising
+  LOSSLESS speed lever on 2-core hardware because it attacks the real
+  bottleneck (effective bandwidth, not overlap). Strong candidate right after
+  the FIT levers.
+
+### 6.8 Speculative / draft decoding
+
+- **Mechanism.** A tiny always-resident draft (EAGLE head / MTP head / n-gram /
+  prompt-lookup) proposes K tokens; the big model verifies them in one batched
+  forward; accepted tokens are emitted. Because verifying K tokens touches the
+  expensive experts on roughly one step instead of K, the per-token expert
+  streaming is amortized over the accepted run. `PLAN.md` section 3.6 and Phase 5
+  already scope this and call it "the biggest single gain for low-end PCs".
+- **50B math.** If the draft achieves acceptance length ~L, effective bytes/token
+  for the big model drop by ~L (the expert streaming happens once per verified
+  burst, not per token). On an I/O-bound box this is potentially the biggest
+  *effective* tok/s multiplier, and it composes with every byte-reducing lever.
+- **Oracle-safety.** The DRAFT is approximate, but speculative decoding with
+  exact verification is designed so the FINAL emitted sequence is identical to
+  plain greedy decoding (reject-and-correct). So it is LOSSLESS at the output
+  level under greedy, consistent with `PLAN.md` section 7's determinism contract
+  ("speculative paths must produce output identical to the plain path"). The
+  draft model/head is extra resident state but does not change results.
+- **Complexity / deps.** High. Needs a draft source (an n-gram / prompt-lookup
+  draft needs no model and is the cheapest entry; EAGLE/MTP need a trained head
+  shipped with the model), tree/batch verification in the engine, and adaptive K.
+  Verification does a multi-token forward, which interacts with the KV cache and
+  the streaming path.
+- **Verdict: feasible-with-effort, output-lossless, high effective-speed
+  impact.** The n-gram / prompt-lookup variant is the lowest-dependency entry and
+  is output-identical under greedy. It is more engine work than the FIT levers,
+  so sequence it after fit is solved, but it is the headline speed lever and
+  should not be skipped.
+
+### 6.9 Additional sound out-of-box ideas
+
+- **Lower precision only for cold / long-tail experts (asymmetric precision).**
+  Keep hot experts at their shipped quant (exact), compute rarely-used cold
+  experts at a lower precision streamed from a low-bit side-store. Approximate
+  only on the long tail, so the perplexity cost is small and measurable. Ties to
+  the mixed-precision `.strata` presets in `PLAN.md` section 3.7. Verdict:
+  research-risky (approximate), interesting as a follow-on to 6.3.
+- **Cache dequantized hot experts.** If dequant is on the critical path (6.3),
+  cache the dequantized form of the few hottest experts so their dequant cost is
+  paid once, not per token. Lossless (it is just a compute cache). Verdict:
+  feasible-with-effort, a composable optimization on top of 6.3.
+- **Cross-token expert-reuse exploitation.** Adjacent tokens often route to
+  overlapping experts; the layer-stratified pool already exploits this
+  implicitly. A stronger version pins the measured top-N experts per layer as a
+  near-permanent resident core and only streams the tail. Lossless (residency
+  policy only). Verdict: feasible-now, a refinement of PR #39's policy; low risk,
+  modest win.
+- **Disaggregate prefill from decode.** Prefill is compute-bound and touches many
+  experts; decode is I/O-bound and touches few. Stream experts without caching
+  during prefill (the `PLAN.md` section 3.3 "prefill bypass" rule) so prefill
+  does not evict the decode hot set, and size residency for the decode pattern.
+  Lossless. Verdict: feasible-now, a residency/scheduling refinement; helps TTFT
+  and protects the decode cache.
+
+---
+
+## 7. Throughput model
+
+Decode wall-clock per token is bounded below by the max of the I/O term and the
+compute term, with no overlap credit on 2 cores:
+
+```
+t_token  ~  bytes_streamed_per_token / effective_ssd_bandwidth
+            + compute_flops_per_token / (cores * per_core_flops)
+```
+
+Honest statement for the target box: with 2 cores and ~4 GiB/s SSD, this is
+hardware-bound. We do not promise a tok/s number; we show how each lever moves
+the terms.
+
+| Lever | bytes/token | effective_bandwidth | compute/token | net on t_token |
+|---|---|---|---|---|
+| Stream the trunk (6.4) | slightly up (trunk now streams) | - | - | enables FIT; small speed cost, bought back by more expert RAM |
+| Page/quantize KV (6.5) | - | - | - (quant: small up) | frees RAM -> more experts resident -> fewer misses -> bytes/token DOWN |
+| Shrink floor (6.6) | - | - | - | frees RAM -> more experts resident -> bytes/token DOWN (small) |
+| Sub-byte resident (6.3) | DOWN (more experts fit) | - | UP (dequant) | net win only if dequant cheaper than the saved I/O; measure on 2 cores |
+| Sub-expert streaming (6.2) | DOWN (fewer bytes/expert) | - | ~flat | biggest bytes/token cut; approximate |
+| Batched sequential I/O (6.7) | flat | UP toward 4 GiB/s | - | biggest LOSSLESS wall-clock cut on this box |
+| Speculative decode (6.8) | DOWN by ~acceptance length | - | UP (verify batch) | biggest EFFECTIVE tok/s multiplier; composes with all above |
+
+Direct / unbuffered I/O (already designed in `PLAN.md` 3.3) is assumed
+throughout so the OS page cache does not double-count against the RAM budget;
+suppressing page-cache growth is also what keeps peak RSS near the controllable
+resident floor rather than ballooning as in the Mixtral run.
+
+---
+
+## 8. Sequenced implementation plan
+
+Ordered by (impact x tractability x oracle-safety), separating FIT levers (make
+50B load in a small resident floor) from SPEED levers (cut bytes/token or
+wall-clock). "Lossless" items build under the existing byte-identity gate;
+"approximate" items need a new quality-metric (perplexity/KLD vs oracle) harness
+first and ship opt-in.
+
+### Stage 1 - FIT, lossless (makes 50B load at all; highest priority)
+
+1. **Stream the trunk (6.4)** - LOSSLESS, mandatory for 50B to fit. Converts the
+   ~3-5 GB fixed trunk into a bounded hot set. Reuses `StrataReader`/`SlotPool`/
+   staging. **Recommended FIRST implementation target.**
+2. **Page / depth-bound the KV cache (6.5 paging)** - LOSSLESS. Bounds the
+   growing multi-GB KV to a resident recent window; frees RAM for experts.
+3. **Shrink the process floor / standalone tokenizer (6.6)** - LOSSLESS, modest,
+   independent (parallelizable with 1-2).
+
+### Stage 2 - SPEED, lossless (cut wall-clock without touching outputs)
+
+4. **Batched sequential I/O + co-activation packing (6.7)** - LOSSLESS. Attacks
+   the real 2-core bottleneck (effective bandwidth). Needs a packer layout
+   change plus coalesced reads.
+5. **Cross-token reuse pinning + prefill/decode disaggregation (6.9)** - LOSSLESS
+   residency/scheduling refinements on top of PR #39; low risk.
+
+### Stage 3 - SPEED, higher effort, output-lossless under greedy
+
+6. **Speculative decode, n-gram/prompt-lookup first (6.8)** - output-identical
+   under greedy; the headline effective-tok/s lever. Start with the
+   no-extra-model n-gram draft, then MTP/EAGLE heads when a Coaade model ships
+   them.
+
+### Stage 4 - approximate, opt-in, needs a quality gate (research-risky)
+
+7. **KV quantization (6.5 quant)** - approximate; q8/4-bit KV with measured
+   perplexity cost.
+8. **Sub-byte resident experts + dequant (6.3)** - approximate (unless the model
+   ships at that quant); needs Phase 6 LUT kernels; CPU-gated on 2 cores.
+9. **Sub-expert / activation-sparse streaming (6.2)** - approximate, highest
+   bytes/token upside, highest risk; needs sparse kernels, sub-blob `.strata`
+   addressing, and the quality gate.
+10. **Asymmetric cold-expert precision + dequant caching (6.9)** - approximate
+    follow-ons to 6.3.
+
+Prerequisite for Stage 4: a perplexity / KLD regression harness vs the oracle
+(the `PLAN.md` section 7 quality plan), since byte-identity no longer applies.
+
+---
+
+## 9. Risks and unknowns (what needs a spike)
+
+- **Trunk streaming lifetime discipline.** Trunk tensors are referenced
+  throughout graph build (`get_weight`); making them stream-backed must preserve
+  the "resident before the op is built" contract the expert path relies on.
+  Spike: prototype trunk streaming on Mixtral and confirm byte-identity + bounded
+  resident floor.
+- **Does trunk streaming hurt speed more than it helps?** Trunk is touched every
+  token, so streaming it adds per-token bytes. The thesis is that freeing RAM for
+  experts nets positive. Spike: measure bytes/token and tok/s with trunk
+  streamed vs resident at a 50B-shaped budget on Colab.
+- **Effective sequential bandwidth on the real box.** The ~0.17 GB/s implied
+  effective rate vs ~4 GiB/s sequential is the single biggest unknown for the
+  speed story. Spike: micro-benchmark `read_blob` coalesced vs per-expert on the
+  Colab SSD and confirm the gain is real at QD1.
+- **Activation-sparsity quality cost for SwiGLU experts.** Unknown perplexity
+  cost; may be too high to be useful. Spike: offline sparsity-vs-perplexity sweep
+  before committing kernel work.
+- **Dequant cost on 2 cores.** Whether a 2-bit LUT dequant is cheap enough that
+  the I/O savings survive. Spike: micro-benchmark a LUT kernel on the 2-core box.
+- **Speculative acceptance length on Coaade models.** The effective-tok/s win is
+  proportional to acceptance length, which is model/prompt dependent. Spike:
+  measure n-gram/prompt-lookup acceptance on representative prompts.
+- **50B trunk/KV absolute sizes.** The budget model is symbolic; the real 50B
+  shape must be measured to confirm the resident floor lands under ~6 GB after
+  the FIT levers.
+
+---
+
+## 10. Summary of verdicts and the recommended first target
+
+| # | Technique | Oracle-safety | Verdict |
+|---|---|---|---|
+| 6.4 | Stream the trunk | lossless | feasible-now (FIT, top) |
+| 6.5 | KV paging | lossless | feasible-with-effort (FIT) |
+| 6.6 | Standalone tokenizer / drop libllama | lossless | feasible-with-effort (modest) |
+| 6.7 | Batched sequential I/O + co-activation packing | lossless | feasible-now (SPEED, top lossless) |
+| 6.9 | Cross-token pinning / prefill-decode split | lossless | feasible-now (refinement) |
+| 6.8 | Speculative decode (n-gram first) | output-lossless (greedy) | feasible-with-effort (headline SPEED) |
+| 6.5 | KV quantization | approximate | feasible-with-effort (opt-in) |
+| 6.3 | Sub-byte resident + dequant | approximate (unless shipped quant) | feasible-with-effort (CPU-gated) |
+| 6.2 | Sub-expert / activation-sparse streaming | approximate | research-risky (highest upside) |
+| 6.1 | SSD-as-tier (model-aware paging) | lossless | feasible-now (organizing principle; realized by 6.4/6.5) |
+
+**Lossless, feasible-now set, in order:** (1) stream the trunk, (2) batched
+sequential I/O + co-activation packing, (3) cross-token pinning / prefill-decode
+split, with KV paging and the standalone tokenizer as the next lossless items.
+
+**Recommended FIRST implementation target: stream the trunk (6.4).** It is
+lossless (byte-identical under the existing gate), it reuses the existing
+`StrataReader`/`SlotPool`/staging machinery, and it is the one lever without
+which a 50B-class model cannot fit in the 12 GB resident floor at all. Everything
+else either depends on the model fitting first or is a speed multiplier on top of
+a model that fits.
+
+Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
