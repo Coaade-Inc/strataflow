@@ -332,10 +332,18 @@ static void test_adaptive_trunk_budget_driven_real_path() {
     }
     const ModelShape &shape = model->shape();
 
-    // The budget-driven decision engaged BY DEFAULT: a bounded hot pool strictly
-    // inside (0, n_layers). If the fixture's attention trunk was too small for
-    // this budget to force streaming, say so and skip the rest (the engine-level
-    // half A already proves byte-identity on any v2 fixture).
+    // The budget-driven decision MUST engage BY DEFAULT: a bounded hot pool
+    // strictly inside (0, n_layers). Because the fixture env var IS set, this
+    // test is meant to exercise the real-path planner decision, so a plan that
+    // did NOT force streaming is a HARD FAILURE (not a silent skip): it means a
+    // budget-math or fixture-size drift has stopped the fixture from forcing
+    // the decision, which is exactly the fixture-blindness this task exists to
+    // kill. The fixture + simulated budget (kSimRamBudget, see the top comment
+    // and the geometry in the usage note) are dimensioned so streaming is
+    // always forced when the fixture is present; the ONLY clean skip is when
+    // the fixture env var is UNSET (handled above). If this CHECK ever trips,
+    // raise the fixture's n_embd/n_layer or tighten kSimRamBudget so the full
+    // attention trunk again overflows the budget.
     std::printf("[real-path plan: n_layers=%u trunk_pool_layers=%u "
                 "trunk_resident=%lluB attn_trunk=%lluB kv_window=%u] ",
                 shape.n_layers, plan.trunk_pool_layers,
@@ -343,10 +351,10 @@ static void test_adaptive_trunk_budget_driven_real_path() {
                 static_cast<unsigned long long>(shape.attn_trunk_bytes),
                 plan.kv_window);
     if (plan.trunk_pool_layers == 0) {
-        std::printf("[note: budget did not force trunk streaming on this "
-                    "fixture - raise n_embd/n_layer; skipping byte-identity] ");
-        std::remove(strata_path.c_str());
-        return;
+        std::printf("[FAIL: fixture present but budget did not force trunk "
+                    "streaming (trunk_pool_layers==0) - the real-path planner "
+                    "decision is no longer exercised; raise n_embd/n_layer or "
+                    "tighten kSimRamBudget] ");
     }
     CHECK(plan.trunk_pool_layers > 0u);
     CHECK(plan.trunk_pool_layers < shape.n_layers);
