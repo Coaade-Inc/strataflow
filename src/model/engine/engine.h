@@ -127,9 +127,22 @@ public:
     // explicit STRATAFLOW_ENGINE_KV_WINDOW env (user/test) WINS, else this
     // plan-provided window, else full n_ctx. The default 0 keeps every existing
     // caller (tests, oracle) on the full-resident path unchanged.
+    //
+    // `trunk_pool_layers` is the FEAT-003 adaptive per-layer trunk-streaming
+    // decision the PLAN made for this model+budget (technique 6.4). 0 means
+    // "do not stream the per-layer attention trunk" - the whole trunk stays
+    // resident (the pre-FEAT-003 behavior, byte-identical, no per-token trunk
+    // SSD traffic). A positive value engages per-layer attention-projection
+    // streaming with a BOUNDED hot-trunk pool of exactly that many layers
+    // resident at once (as low as 1 on a tight box), so the resident
+    // attention-trunk footprint drops from all n_layer layers to this bound.
+    // Only meaningful on a v2 trunk-indexed .strata; a v1/plain path ignores it
+    // and stays fully resident. The explicit STRATAFLOW_ENGINE_NO_TRUNK_STREAM
+    // env (user/test) still forces the fully-resident trunk inside load().
     static std::unique_ptr<Engine> load(const std::string &path,
                                         uint32_t expert_slots = 0,
-                                        uint32_t kv_window = 0);
+                                        uint32_t kv_window = 0,
+                                        uint32_t trunk_pool_layers = 0);
 
     const EngineHParams &hparams() const;
 
@@ -147,6 +160,14 @@ public:
     // resident_weight_bytes() accessor; does not include the one-time trunk
     // load. Lets the benchmark harness report bytes-streamed-per-token.
     uint64_t streamed_bytes() const;
+
+    // FEAT-003: total per-layer TRUNK bytes streamed from the .strata via
+    // StrataReader::read_trunk_tensor since load() (the adaptive per-layer
+    // attention-projection streaming plus the two edge tensors). Kept DISTINCT
+    // from streamed_bytes() (experts) so the benchmark harness's per-token
+    // expert number is unchanged. 0 on the plain-GGUF path (no StrataReader)
+    // and on a fully-resident v2 .strata (nothing streamed).
+    uint64_t streamed_trunk_bytes() const;
 
     // Top-k residency cache stats accumulated across all forward() calls since
     // load() (EC-3). Lets the oracle test assert hits/misses/evictions and the
@@ -211,6 +232,14 @@ private:
     // authoritative residency pass re-acquires exactly what the router selects).
     void warm_expert(int il, int expert);
     const EngineHParams &hp_() const;
+
+    // FEAT-003: fetch layer `il`'s four attention projection weights from the
+    // .strata trunk block into the bounded hot-trunk pool (a ring slot keyed by
+    // il % trunk_pool_layers) and repoint the layer's metadata tensors (in
+    // pltctx) at that slot, so they are RESIDENT BEFORE the segment that reads
+    // them. Synchronous on the compute thread. No-op (returns true) unless
+    // per-layer trunk streaming engaged. Returns false if a read fails.
+    bool stream_layer_trunk(int il);
 
     // FEAT-002: async/overlapped expert prefetch. All defined in
     // model/engine/engine.cpp. See the Impl prefetch members for the full

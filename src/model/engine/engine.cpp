@@ -70,6 +70,41 @@ bool is_streaming_trunk_tensor(const std::string &name) {
     return name == "token_embd.weight" || name == "output.weight";
 }
 
+// FEAT-003: the four LARGE per-layer attention projection weights that stream
+// on the adaptive per-layer trunk path when the plan engages it. They are the
+// bulk of the per-layer trunk; the per-layer norms + router are left HOT
+// (tiny, resident) so only these projections pay the per-token SSD traffic.
+// Returns the projection KIND (0..3 for q/k/v/output) and the layer index when
+// `name` is one of them, else valid=false. Matches "blk.<N>.attn_{q,k,v,output}
+// .weight" exactly (same name space the v2 trunk index covers by name).
+struct LayerProj {
+    bool valid = false;
+    int  layer = 0;
+    int  kind  = 0;  // 0=q, 1=k, 2=v, 3=output
+};
+LayerProj parse_layer_proj(const std::string &name) {
+    LayerProj r;
+    if (name.rfind("blk.", 0) != 0) return r;
+    const size_t dot = name.find('.', 4);
+    if (dot == std::string::npos) return r;
+    const std::string num = name.substr(4, dot - 4);
+    if (num.empty()) return r;
+    for (char c : num) {
+        if (c < '0' || c > '9') return r;
+    }
+    const std::string suffix = name.substr(dot + 1);
+    int kind = -1;
+    if (suffix == "attn_q.weight") kind = 0;
+    else if (suffix == "attn_k.weight") kind = 1;
+    else if (suffix == "attn_v.weight") kind = 2;
+    else if (suffix == "attn_output.weight") kind = 3;
+    if (kind < 0) return r;
+    r.valid = true;
+    r.layer = std::atoi(num.c_str());
+    r.kind = kind;
+    return r;
+}
+
 } // namespace
 
 // Private state: the resident weight context (ggml owns + fills the tensors via
@@ -348,6 +383,58 @@ struct Engine::Impl {
     // the staging-tensor sizing can read their ne-shape and nb[2] stride.
     ggml_context *ectx = nullptr;
 
+    // ---- FEAT-003: ADAPTIVE per-layer TRUNK streaming (technique 6.4) ------
+    // After the KV window (FEAT-002/Part A) the dominant remaining resident
+    // cost on a tight box is the per-layer attention trunk: blk.N.attn_q/k/v/
+    // output.weight across every layer (~5.5 GiB on real Mixtral). This
+    // generalizes the edge-tensor streaming above to those per-layer
+    // projections: when the PLAN decides the trunk must stream (budget-driven,
+    // see Engine::load's plan_trunk_stream), the four attention projection
+    // weights of EVERY layer live in `pltctx` as METADATA ONLY (no resident
+    // backing in wbuf), and are fetched synchronously via
+    // reader->read_trunk_tensor into a bounded HOT-TRUNK pool
+    // (layer_trunk_buf) IMMEDIATELY BEFORE the router/dense segment that reads
+    // them - the SAME resident-before-op discipline as the experts and the
+    // edge tensors. The HOT, tiny per-layer tensors (attn_norm/ffn_norm/router
+    // ffn_gate_inp) stay fully resident in wctx, so only the LARGE projections
+    // stream.
+    //
+    // BOUNDED HOT SET: the pool holds `trunk_pool_layers` layers' worth of the
+    // four projections at once (a ring keyed by il % trunk_pool_layers). On a
+    // tight box this is a small number (as low as 1), so the resident
+    // attention-trunk working set is bounded to a few layers instead of all 32,
+    // which is the FIT win. Segments run strictly sequentially on the single
+    // compute thread and a layer's projections are read ONLY inside that
+    // layer's own segment, so a 1-layer pool is already correct; a larger pool
+    // only lets a bigger budget keep more layers hot. The fetch is synchronous
+    // on the compute thread; the async I/O worker and the SlotPool are NEVER
+    // involved in trunk streaming (keeps the TSan surface unchanged).
+    //
+    // BYTE-IDENTICAL: streaming changes only the byte PROVENANCE of the
+    // projection weights (disk vs resident buffer), never the bytes, the ops,
+    // or the graph order, so decode stays bit-identical to the fully-resident
+    // trunk and to the libllama oracle. The STRATAFLOW_ENGINE_NO_TRUNK_STREAM
+    // knob forces the fully-resident trunk (edge AND per-layer) so a test can
+    // decode the SAME v2 file both ways and assert bit-identity.
+    ggml_context *pltctx = nullptr;         // per-layer streamed projections (metadata)
+    bool trunk_stream_layers = false;       // per-layer attention projections stream
+    uint32_t trunk_pool_layers = 0;         // bounded hot-trunk ring depth (layers)
+    // One shared backing buffer holding `trunk_pool_layers` ring slots, each
+    // sized to ONE layer's four projection weights (q|k|v|output concatenated
+    // at fixed sub-offsets). A ring slot is refilled from disk immediately
+    // before the segment that reads its layer, so this bounds the resident
+    // attention-trunk floor to trunk_pool_layers layers.
+    std::vector<uint8_t> layer_trunk_buf;
+    uint64_t trunk_slot_bytes = 0;          // bytes of one layer's 4 projections
+    // Sub-offsets of the four projections within one ring slot (uniform across
+    // layers because every layer shares the same projection shapes).
+    uint64_t off_attn_q = 0, off_attn_k = 0, off_attn_v = 0, off_attn_o = 0;
+    uint64_t len_attn_q = 0, len_attn_k = 0, len_attn_v = 0, len_attn_o = 0;
+    // Which absolute layer each ring slot currently holds, or -1 if empty, so a
+    // re-fetch of an already-resident layer is skipped (it never happens on the
+    // single sequential sweep, but the guard keeps the accounting honest).
+    std::vector<int> trunk_slot_layer;
+
     // Signal the prefetch worker to stop and JOIN it before freeing any buffer
     // or reader it reads through, so there is no use-after-free. Safe to call
     // when the worker was never started (joinable() is false then).
@@ -376,6 +463,8 @@ struct Engine::Impl {
         if (wctx != nullptr) ggml_free(wctx);
         if (tctx != nullptr) ggml_free(tctx);  // no backend buffer: data points
                                                // into trunk_stream_buf (owned)
+        if (pltctx != nullptr) ggml_free(pltctx);  // no buffer: data points into
+                                                   // layer_trunk_buf (owned)
         if (ectx != nullptr) ggml_free(ectx);  // no buffer: metadata only
         if (gc != nullptr) gguf_free(gc);
     }
@@ -442,6 +531,11 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
     // drop). When set, token_embd.weight and output.weight go into wctx (resident)
     // exactly like a v1 file, and no per-forward trunk fetch is issued.
     im.trunk_streaming = reader->has_trunk_index();
+    // FEAT-003: the PLAN's per-layer attention-projection streaming decision
+    // (im.trunk_pool_layers, stashed in load() before this call). It only
+    // engages on a v2 trunk-indexed .strata (same gate as the edge tensors);
+    // on a v1/plain path it is forced off and the trunk stays fully resident.
+    im.trunk_stream_layers = im.trunk_streaming && im.trunk_pool_layers > 0;
     {
         const char *no_stream = std::getenv("STRATAFLOW_ENGINE_NO_TRUNK_STREAM");
         if (no_stream != nullptr &&
@@ -449,6 +543,8 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
              no_stream[0] == 'y' || no_stream[0] == 'Y' || no_stream[0] == 't' ||
              no_stream[0] == 'T')) {
             im.trunk_streaming = false;
+            im.trunk_stream_layers = false;  // the knob forces the WHOLE trunk
+                                             // resident (edge AND per-layer)
         }
     }
     {
@@ -460,11 +556,17 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         im.wctx = ggml_init(ip);
         ggml_init_params ep = ip;
         im.ectx = ggml_init(ep);
-        // A tiny context for just the streamed trunk tensors (<=2 leaves).
+        // A tiny context for just the streamed EDGE trunk tensors (<=2 leaves).
         ggml_init_params tp = ip;
         tp.mem_size = ggml_tensor_overhead() * 4;
         im.tctx = ggml_init(tp);
-        if (im.wctx == nullptr || im.ectx == nullptr || im.tctx == nullptr) {
+        // FEAT-003: a context for the per-layer streamed attention projections
+        // (up to 4 per layer, metadata only). Sized to all layers' four
+        // projections plus slack; harmless when per-layer streaming is off.
+        ggml_init_params pp = ip;
+        im.pltctx = ggml_init(pp);
+        if (im.wctx == nullptr || im.ectx == nullptr || im.tctx == nullptr ||
+            im.pltctx == nullptr) {
             log_warn("engine: .strata weight context init failed");
             return false;
         }
@@ -479,15 +581,23 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         const int64_t *src_ne = gguf_get_tensor_ne(im.gc, i);
         int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
         for (int d = 0; d < GGML_MAX_DIMS; ++d) ne[d] = src_ne[d];
-        // Expert tensors -> ectx (metadata only). When trunk streaming is on,
-        // the two streamed edge tensors -> tctx (own small backing). Everything
-        // else (the HOT resident trunk) -> wctx.
+        // Expert tensors -> ectx (metadata only). When edge streaming is on,
+        // the two streamed edge tensors -> tctx (own small backing). FEAT-003:
+        // when per-layer trunk streaming is on, the four per-layer attention
+        // projections -> pltctx (metadata only, backed by the hot-trunk pool).
+        // Everything else (the HOT resident trunk) -> wctx.
         const bool is_expert = parse_expert_tensor_name(name).valid;
         const bool is_streamed_trunk =
             im.trunk_streaming && !is_expert &&
             is_streaming_trunk_tensor(name);
-        ggml_context *into = is_expert ? im.ectx
-                                       : (is_streamed_trunk ? im.tctx : im.wctx);
+        const bool is_streamed_proj =
+            im.trunk_stream_layers && !is_expert &&
+            parse_layer_proj(name).valid;
+        ggml_context *into =
+            is_expert ? im.ectx
+                      : (is_streamed_trunk
+                             ? im.tctx
+                             : (is_streamed_proj ? im.pltctx : im.wctx));
         ggml_tensor *t = ggml_new_tensor(into, type, GGML_MAX_DIMS, ne);
         if (t == nullptr) {
             log_warn("engine: .strata tensor create failed for '" +
@@ -534,6 +644,57 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         im.trunk_stream_owner    = Impl::TrunkBufOwner::None;
     }
 
+    // FEAT-003: size the bounded HOT-TRUNK pool for the per-layer attention
+    // projections. Every layer shares the same four projection shapes, so one
+    // ring SLOT holds q|k|v|output of ONE layer at fixed sub-offsets, and the
+    // pool is `trunk_pool_layers` such slots. The projection metadata tensors
+    // (in pltctx, no resident backing) are repointed into the right slot
+    // immediately before the segment that reads them (see stream_layer_trunk).
+    // If the plan engaged per-layer streaming but a projection tensor is
+    // missing from the metadata (should not happen for the llama MoE arch),
+    // fall back to the fully-resident trunk rather than fail the load.
+    if (im.trunk_stream_layers) {
+        ggml_tensor *q0 = ggml_get_tensor(im.pltctx, "blk.0.attn_q.weight");
+        ggml_tensor *k0 = ggml_get_tensor(im.pltctx, "blk.0.attn_k.weight");
+        ggml_tensor *v0 = ggml_get_tensor(im.pltctx, "blk.0.attn_v.weight");
+        ggml_tensor *o0 = ggml_get_tensor(im.pltctx, "blk.0.attn_output.weight");
+        if (q0 == nullptr || k0 == nullptr || v0 == nullptr || o0 == nullptr) {
+            // The projections were routed to pltctx above but one is absent;
+            // this means the arch does not match the expected layer-0 names.
+            // Disable per-layer streaming; those tensors stay metadata-only but
+            // we will resolve them from wctx (where they are NOT present) which
+            // would fail - so instead refuse per-layer streaming cleanly by
+            // moving them back is not possible post-hoc; log and bail to a
+            // fully-resident reload is out of scope here. Treat as a load
+            // failure so the caller stays on a safe path.
+            log_warn("engine: per-layer trunk projections missing; cannot "
+                     "stream the trunk");
+            return false;
+        }
+        // ggml pads each tensor's byte length; read_trunk_tensor copies exactly
+        // the index `length` (== ggml_nbytes of the packed tensor) which equals
+        // ggml_nbytes here (same type/shape), so use ggml_nbytes for the slot
+        // layout and align each sub-slice start so the per-tensor ->data lands
+        // on a natural boundary.
+        auto align64 = [](uint64_t x) -> uint64_t { return (x + 63) & ~uint64_t(63); };
+        im.len_attn_q = ggml_nbytes(q0);
+        im.len_attn_k = ggml_nbytes(k0);
+        im.len_attn_v = ggml_nbytes(v0);
+        im.len_attn_o = ggml_nbytes(o0);
+        im.off_attn_q = 0;
+        im.off_attn_k = align64(im.off_attn_q + im.len_attn_q);
+        im.off_attn_v = align64(im.off_attn_k + im.len_attn_k);
+        im.off_attn_o = align64(im.off_attn_v + im.len_attn_v);
+        im.trunk_slot_bytes = align64(im.off_attn_o + im.len_attn_o);
+        // trunk_pool_layers is the plan-chosen ring depth (>= 1). The real
+        // n_layer clamp happens in load() right after hparams are read; here we
+        // allocate exactly the plan's requested slots (a small number).
+        const uint32_t pool = im.trunk_pool_layers;
+        im.trunk_slot_layer.assign(pool, -1);
+        im.layer_trunk_buf.resize(static_cast<size_t>(im.trunk_slot_bytes) *
+                                  static_cast<size_t>(pool));
+    }
+
     // Fill the TRUNK tensors from the trunk block. The trunk block packs the
     // non-expert tensors contiguously in GGUF tensor order (tools/strata-pack),
     // so iterate in that order and track the running trunk-relative offset.
@@ -553,6 +714,14 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         // correct - we just do not read it into a resident buffer here (it is
         // fetched per-forward into the shared trunk_stream_buf instead).
         if (im.trunk_streaming && is_streaming_trunk_tensor(name)) {
+            trunk_rel += sz;
+            continue;
+        }
+        // FEAT-003: a per-layer streamed attention projection likewise keeps
+        // its contiguous trunk slot (advance trunk_rel) but is NOT read into a
+        // resident buffer here - it is fetched per-layer into the hot-trunk
+        // pool by stream_layer_trunk(). It lives in pltctx (metadata only).
+        if (im.trunk_stream_layers && parse_layer_proj(name).valid) {
             trunk_rel += sz;
             continue;
         }
@@ -632,6 +801,15 @@ uint64_t Engine::resident_weight_bytes() const {
     // copy of the larger tensor, never the full embedding+lm_head resident
     // cost - so the net stays strictly below the fully-resident-trunk baseline.
     bytes += static_cast<uint64_t>(impl_->trunk_stream_buf.size());
+    // FEAT-003: likewise the per-layer attention projections are no longer in
+    // wbuf (they moved to the metadata-only pltctx), so wbuf already dropped by
+    // ALL layers' projection bytes; add back only the BOUNDED hot-trunk pool
+    // (trunk_pool_layers slots, each one layer's four projections). This is the
+    // resident attention-trunk working set - a few layers instead of all
+    // n_layer - so resident_weight_bytes reflects the bounded hot set when
+    // per-layer streaming engages, and is unchanged when it does not (the
+    // buffer is empty then).
+    bytes += static_cast<uint64_t>(impl_->layer_trunk_buf.size());
     return bytes;
 }
 
@@ -641,11 +819,77 @@ uint64_t Engine::streamed_bytes() const {
     return impl_->reader ? impl_->reader->streamed_bytes() : 0;
 }
 
+uint64_t Engine::streamed_trunk_bytes() const {
+    // FEAT-003: TRUNK bytes streamed via read_trunk_tensor (the two edge
+    // tensors + the adaptive per-layer attention projections), kept DISTINCT
+    // from streamed_bytes() (experts) so the bench harness's per-token expert
+    // number is unchanged. 0 on the plain-GGUF path / a fully-resident .strata.
+    return impl_->reader ? impl_->reader->streamed_trunk_bytes() : 0;
+}
+
+// FEAT-003: fetch layer `il`'s four attention projections into the hot-trunk
+// pool and repoint its pltctx metadata tensors at the slot. See the method
+// declaration in engine.h and the Impl FEAT-003 members for the contract. The
+// read goes through StrataReader::read_trunk_tensor (so streamed_trunk_bytes
+// counts it) directly into the owned pool buffer; the metadata tensors' ->data
+// then alias that slot as a stable graph leaf for the one segment that reads
+// them. Because segments run strictly sequentially and a layer's projections
+// are read ONLY inside that layer's segment, a slot can be reused for a later
+// layer (ring) without any live-read hazard.
+bool Engine::stream_layer_trunk(int il) {
+    Impl &im = *impl_;
+    if (!im.trunk_stream_layers) return true;  // not engaged: whole trunk resident
+    if (im.reader == nullptr || im.trunk_pool_layers == 0) return false;
+
+    const uint32_t slot = static_cast<uint32_t>(il) % im.trunk_pool_layers;
+    uint8_t *base = im.layer_trunk_buf.data() +
+                    static_cast<size_t>(slot) * im.trunk_slot_bytes;
+    const std::string p = "blk." + std::to_string(il) + ".";
+
+    struct Proj {
+        const char *suffix;
+        uint64_t off;
+        uint64_t len;
+    };
+    const Proj projs[4] = {
+        {"attn_q.weight", im.off_attn_q, im.len_attn_q},
+        {"attn_k.weight", im.off_attn_k, im.len_attn_k},
+        {"attn_v.weight", im.off_attn_v, im.len_attn_v},
+        {"attn_output.weight", im.off_attn_o, im.len_attn_o},
+    };
+    for (const Proj &pr : projs) {
+        const std::string name = p + pr.suffix;
+        ggml_tensor *t = ggml_get_tensor(im.pltctx, name.c_str());
+        if (t == nullptr) {
+            log_error("engine: streamed projection missing '" + name + "'");
+            return false;
+        }
+        uint8_t *dst = base + pr.off;
+        const int64_t n = im.reader->read_trunk_tensor(name, dst);
+        if (n != static_cast<int64_t>(pr.len) ||
+            static_cast<uint64_t>(ggml_nbytes(t)) != pr.len) {
+            log_error("engine: per-layer trunk read failed for '" + name + "'");
+            return false;
+        }
+        // Repoint the metadata tensor at the freshly-filled slot. Safe stable
+        // graph leaf for THIS layer's single segment (resident before op).
+        t->data = dst;
+    }
+    im.trunk_slot_layer[slot] = il;
+    return true;
+}
+
 std::unique_ptr<Engine> Engine::load(const std::string &path,
                                      uint32_t expert_slots,
-                                     uint32_t plan_kv_window) {
+                                     uint32_t plan_kv_window,
+                                     uint32_t plan_trunk_pool_layers) {
     std::unique_ptr<Engine> eng(new Engine());
     Impl &im = *eng->impl_;
+    // FEAT-003: stash the plan's per-layer trunk-streaming decision before
+    // load_strata_weights builds the contexts (it consults im.trunk_pool_layers
+    // to decide whether to route the per-layer attention projections into the
+    // metadata-only pltctx vs resident wctx).
+    im.trunk_pool_layers = plan_trunk_pool_layers;
 
     // EC-4: a .strata single file is our own split trunk/expert format. We read
     // its embedded GGUF metadata + trunk tensors directly here (NO
@@ -756,6 +1000,25 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         return nullptr;
     }
     hp.head_dim = hp.n_embd / hp.n_head;
+
+    // FEAT-003: now that n_layer is known, clamp the per-layer trunk pool to
+    // [1, n_layer]. A pool >= n_layer keeps every layer's projections resident
+    // simultaneously (no FIT win, but still correct); the plan never asks for
+    // that - it sizes the pool below n_layer to stream. Resize the ring arrays
+    // to the clamped depth so the forward() ring index stays in bounds.
+    if (im.trunk_stream_layers) {
+        uint32_t pool = im.trunk_pool_layers;
+        if (pool > static_cast<uint32_t>(hp.n_layer)) {
+            pool = static_cast<uint32_t>(hp.n_layer);
+        }
+        if (pool != im.trunk_pool_layers) {
+            im.trunk_pool_layers = pool;
+            im.trunk_slot_layer.assign(pool, -1);
+            im.layer_trunk_buf.resize(
+                static_cast<size_t>(im.trunk_slot_bytes) *
+                static_cast<size_t>(pool));
+        }
+    }
 
     if (im.is_moe) {
         if (hp.n_expert_used <= 0) {
@@ -1263,9 +1526,25 @@ ggml_tensor *build_kv_attention(ggml_context *gctx, const EngineHParams &hp,
 // paging. Returns the layer output [n_embd, n_tokens] (set as output); KV
 // stores (and any assembly copies) are appended to `graph_stores` so
 // run_segment roots them.
+// FEAT-003: resolve a per-layer trunk weight by name. The four attention
+// projections may live in the streamed-projection context `sctx` (metadata
+// whose ->data was repointed into the hot-trunk pool before this segment); the
+// norms/router and every other trunk tensor live resident in `wctx`. Checking
+// sctx first makes streamed-vs-resident transparent to the graph builder, so
+// the ops and graph order are byte-identical whether or not the trunk streams.
+static ggml_tensor *layer_weight(ggml_context *wctx, ggml_context *sctx,
+                                 const std::string &name) {
+    if (sctx != nullptr) {
+        ggml_tensor *t = ggml_get_tensor(sctx, name.c_str());
+        if (t != nullptr) return t;
+    }
+    return ggml_get_tensor(wctx, name.c_str());
+}
+
 ggml_tensor *build_dense_layer_segment(ggml_context *gctx, ggml_tensor *inpL,
                                        ggml_tensor *inp_pos, int il,
-                                       ggml_context *wctx, const EngineHParams &hp,
+                                       ggml_context *wctx, ggml_context *sctx,
+                                       const EngineHParams &hp,
                                        ggml_tensor *k_cache, ggml_tensor *v_cache,
                                        ggml_tensor *kq_mask, int64_t pos,
                                        int64_t n_kv, const KvAttnPaging &pg,
@@ -1273,10 +1552,10 @@ ggml_tensor *build_dense_layer_segment(ggml_context *gctx, ggml_tensor *inpL,
                                        std::vector<KvColdFill> &cold_fills) {
     const std::string p = "blk." + std::to_string(il) + ".";
     ggml_tensor *attn_norm_w = ggml_get_tensor(wctx, (p + "attn_norm.weight").c_str());
-    ggml_tensor *wq          = ggml_get_tensor(wctx, (p + "attn_q.weight").c_str());
-    ggml_tensor *wk          = ggml_get_tensor(wctx, (p + "attn_k.weight").c_str());
-    ggml_tensor *wv          = ggml_get_tensor(wctx, (p + "attn_v.weight").c_str());
-    ggml_tensor *wo          = ggml_get_tensor(wctx, (p + "attn_output.weight").c_str());
+    ggml_tensor *wq          = layer_weight(wctx, sctx, p + "attn_q.weight");
+    ggml_tensor *wk          = layer_weight(wctx, sctx, p + "attn_k.weight");
+    ggml_tensor *wv          = layer_weight(wctx, sctx, p + "attn_v.weight");
+    ggml_tensor *wo          = layer_weight(wctx, sctx, p + "attn_output.weight");
     ggml_tensor *ffn_norm_w  = ggml_get_tensor(wctx, (p + "ffn_norm.weight").c_str());
     ggml_tensor *w_gate      = ggml_get_tensor(wctx, (p + "ffn_gate.weight").c_str());
     ggml_tensor *w_up        = ggml_get_tensor(wctx, (p + "ffn_up.weight").c_str());
@@ -1332,6 +1611,7 @@ ggml_tensor *build_dense_layer_segment(ggml_context *gctx, ggml_tensor *inpL,
 // them (attention reads the cache tensor, not the cpy node).
 void build_router_segment(ggml_context *gctx, ggml_tensor *inpL,
                           ggml_tensor *inp_pos, int il, ggml_context *wctx,
+                          ggml_context *sctx,
                           const EngineHParams &hp, ggml_tensor *k_cache,
                           ggml_tensor *v_cache, ggml_tensor *kq_mask,
                           int64_t pos, int64_t n_kv, const KvAttnPaging &pg,
@@ -1342,10 +1622,10 @@ void build_router_segment(ggml_context *gctx, ggml_tensor *inpL,
     const std::string p = "blk." + std::to_string(il) + ".";
 
     ggml_tensor *attn_norm_w = ggml_get_tensor(wctx, (p + "attn_norm.weight").c_str());
-    ggml_tensor *wq          = ggml_get_tensor(wctx, (p + "attn_q.weight").c_str());
-    ggml_tensor *wk          = ggml_get_tensor(wctx, (p + "attn_k.weight").c_str());
-    ggml_tensor *wv          = ggml_get_tensor(wctx, (p + "attn_v.weight").c_str());
-    ggml_tensor *wo          = ggml_get_tensor(wctx, (p + "attn_output.weight").c_str());
+    ggml_tensor *wq          = layer_weight(wctx, sctx, p + "attn_q.weight");
+    ggml_tensor *wk          = layer_weight(wctx, sctx, p + "attn_k.weight");
+    ggml_tensor *wv          = layer_weight(wctx, sctx, p + "attn_v.weight");
+    ggml_tensor *wo          = layer_weight(wctx, sctx, p + "attn_output.weight");
     ggml_tensor *ffn_norm_w  = ggml_get_tensor(wctx, (p + "ffn_norm.weight").c_str());
     ggml_tensor *gate_inp    = ggml_get_tensor(wctx, (p + "ffn_gate_inp.weight").c_str());
 
@@ -2174,6 +2454,18 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     // Per-layer SEGMENTED execution (section 3.2): router segment -> host read
     // back top-k ids -> make resident -> expert segment.
     for (int il = 0; il < hp.n_layer; ++il) {
+        // --- FEAT-003: stream this layer's attention projections into the
+        // bounded hot-trunk pool IMMEDIATELY before its segment reads them -
+        // the resident-before-op discipline shared with the experts and the
+        // edge tensors. No-op unless per-layer trunk streaming engaged. The
+        // read is synchronous on this (compute) thread; the async I/O worker
+        // and the SlotPool are never involved. On failure the decode fails
+        // loudly rather than running an op over stale/zero bytes.
+        if (!stream_layer_trunk(il)) {
+            log_error("engine: per-layer trunk stream failed at layer " +
+                      std::to_string(il));
+            return false;
+        }
         // --- EC-7: dense layer runs as ONE segment (no router read-back) ---
         if (!im.is_moe) {
             ggml_context *gctx = new_segment_ctx();
@@ -2188,8 +2480,9 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
             std::vector<ggml_tensor *> stores;
             std::vector<KvColdFill> cold_fills;
             const KvAttnPaging pg = make_pg(il);
+            ggml_context *sctx = im.trunk_stream_layers ? im.pltctx : nullptr;
             ggml_tensor *layer_out = build_dense_layer_segment(
-                gctx, inpL, inp_pos, il, im.wctx, hp,
+                gctx, inpL, inp_pos, il, im.wctx, sctx, hp,
                 im.k_cache[static_cast<size_t>(il)],
                 im.v_cache[static_cast<size_t>(il)], kq_mask, pos, n_kv, pg,
                 stores, cold_fills);
@@ -2237,7 +2530,8 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
             const KvAttnPaging pg = make_pg(il);
             ggml_tensor *r_cur = nullptr, *r_ffn = nullptr, *r_w = nullptr,
                         *r_sel = nullptr;
-            build_router_segment(gctx, inpL, inp_pos, il, im.wctx, hp,
+            ggml_context *sctx = im.trunk_stream_layers ? im.pltctx : nullptr;
+            build_router_segment(gctx, inpL, inp_pos, il, im.wctx, sctx, hp,
                                  im.k_cache[static_cast<size_t>(il)],
                                  im.v_cache[static_cast<size_t>(il)], kq_mask,
                                  pos, n_kv, pg, stores, cold_fills, &r_cur,
