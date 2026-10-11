@@ -11,6 +11,48 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- Adaptive per-layer trunk streaming engages BY DEFAULT on the real `.strata`
+  load path (FEAT-003 Part B, technique 6.4 from
+  `docs/RESEARCH_50B_ON_A_LAPTOP.md`). After the auto KV window, the dominant
+  remaining resident cost is the per-layer attention trunk
+  (`blk.N.attn_{q,k,v,output}.weight`, ~5.5 GB across 32 layers on real
+  Mixtral). Those four projections per layer now stream from the `.strata` v2
+  trunk index into a BOUNDED HOT-TRUNK POOL (a ring of `trunk_pool_layers`
+  layers) fetched synchronously immediately before each layer's attention
+  segment (the same resident-before-op discipline as the edge tensors and the
+  experts); the tiny per-layer norms + router stay HOT (resident). The
+  aggressiveness is BUDGET-DRIVEN: `plan_placement` derives `trunk_pool_layers`
+  from the SAME conservative usable-RAM budget (`ModelShape::attn_trunk_bytes`,
+  summed from the trunk index), so a big-RAM box keeps the whole trunk resident
+  (pool 0, no per-token trunk traffic) and a tight 12 GB-class box streams it
+  hard (pool as low as 1 layer). The decision is a DIRECT `trunk_pool_layers`
+  parameter to `engine::Engine::load` (default 0 = whole trunk resident,
+  preserving every existing caller), plumbed from `PlacementPlan::trunk_pool_
+  layers` through `GgmlModel` - not an env side-channel - so the bounded pool
+  applies by default; the plan summary gains a `trunk stream[hot=N layers]`
+  segment. `Engine::resident_weight_bytes()` reflects the bounded hot pool and
+  the new `Engine::streamed_trunk_bytes()` / `StrataReader::streamed_trunk_
+  bytes()` count the per-layer trunk reads DISTINCTLY from the expert
+  `streamed_bytes()` (the bench per-token expert number is unchanged). HONEST
+  TRADEOFF: these weights are touched every token, so streaming adds per-token
+  SSD traffic and is slower on a slow box - accepted because the FIRST goal is
+  to FIT small. Residency / byte-provenance only: same bytes, same ops, same
+  graph order, single compute thread (the async I/O worker is untouched), so
+  decode stays byte-identical to the libllama oracle; the authoritative
+  resident-before-op read is the correctness backstop and
+  `STRATAFLOW_ENGINE_NO_TRUNK_STREAM=1` forces the whole trunk resident.
+  Sandbox-proven on an attention-trunk-dominated Mixtral-mirroring fixture
+  through the REAL load path (packer -> `.strata` -> `load_strata_model` ->
+  planner -> engine): the plan chose `trunk_pool_layers=5` of 10 layers by
+  default under a ~1.27 GiB budget, `resident_weight_bytes` dropped (default CLI
+  run on an `n_embd=4096 n_layer=16` fixture at `--ram-gb 1.3`: resident model
+  weights 292.9 -> 110.9 MiB, peak RSS 329.5 -> 161.5 MiB), and the streamed
+  decode was bit-for-bit identical (`max|delta| = 0.000e+00`) to the
+  fully-resident decode on the SAME v2 file and within the oracle quant
+  tolerance over a short AND a longer sequence
+  (`tests/test_trunk_stream_adaptive.cpp`). Colab-only: the absolute
+  real-Mixtral peak-RSS drop is hardware-only (the offline sandbox cannot
+  download Mixtral); the re-verify command is in `colab/README.md`.
 - Auto KV window ENGAGES BY DEFAULT on the real `.strata` Mixtral load path
   (FEAT-002 Part A, technique 6.5 from `docs/RESEARCH_50B_ON_A_LAPTOP.md`). A
   DEFAULT run (no `STRATAFLOW_ENGINE_KV_WINDOW`, no flags) now reserves a

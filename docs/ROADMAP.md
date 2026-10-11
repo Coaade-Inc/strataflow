@@ -153,9 +153,44 @@ families are the remaining quant-coverage gap.
   identically to the oracle too. Colab-only: the absolute peak-RSS reduction on
   the real Mixtral/50B case (where the multi-GB resident embeddings + lm_head
   previously blocked the fit) is hardware-only; the exact re-verify command and
-  expected effect are in `colab/README.md`. Deferred follow-ons: streaming the
-  per-layer attention weights, a budget-aware trunk residency policy, and async
-  (prefetched) trunk streaming.
+  expected effect are in `colab/README.md`.
+- [x] **Adaptive per-layer trunk streaming (technique 6.4, FEAT-003 Part B).**
+  Generalizes the edge-tensor streaming above to the DOMINANT remaining resident
+  cost after the KV window: the four large per-layer attention projections
+  (`blk.N.attn_{q,k,v,output}.weight`), ~5.5 GB across 32 layers on real
+  Mixtral. They now live metadata-only in a per-layer context (`pltctx`) and are
+  fetched into a BOUNDED HOT-TRUNK POOL (a ring of `trunk_pool_layers` layers)
+  immediately before each layer's attention segment, reusing the SAME v2 trunk
+  index (`read_trunk_tensor`) and resident-before-op discipline as the edge
+  tensors; the tiny per-layer norms + router stay HOT (resident). BUDGET-DRIVEN:
+  the planner derives `trunk_pool_layers` from the SAME conservative usable-RAM
+  budget (`ModelShape::attn_trunk_bytes` summed from the trunk index), so a
+  big-RAM box keeps the whole trunk resident (pool 0, zero per-token trunk
+  traffic) and a tight 12 GB-class box streams it hard (pool as low as 1). The
+  decision is plumbed to `Engine::load` as a load parameter via `GgmlModel`
+  (exactly like `plan.kv_window`), so it applies BY DEFAULT with no env
+  side-channel; the plan line gains a `trunk stream[hot=N layers]` segment.
+  HONEST TRADEOFF: these weights are touched every token, so streaming adds
+  per-token SSD traffic and is slower on a slow box - accepted because the FIRST
+  goal is to FIT small, and the policy streams only as much as the budget
+  forces. `resident_weight_bytes()` reflects the bounded hot pool;
+  `StrataReader::streamed_trunk_bytes()` counts the per-layer trunk reads
+  DISTINCTLY from the expert `streamed_bytes()` (the bench per-token expert
+  number is unchanged). LOSSLESS (pure residency / byte provenance; same bytes,
+  ops, graph order), single compute thread (no new TSan surface), with the
+  `STRATAFLOW_ENGINE_NO_TRUNK_STREAM=1` knob forcing the whole trunk resident.
+  Sandbox-proven on an attention-trunk-dominated Mixtral-mirroring fixture
+  through the REAL load path (packer -> `.strata` -> `load_strata_model` ->
+  planner -> engine): the plan chose `trunk_pool_layers=5` of 10 layers by
+  default under a ~1.27 GiB budget, `resident_weight_bytes` dropped (e.g. the
+  default CLI run on an `n_embd=4096 n_layer=16` fixture at `--ram-gb 1.3`:
+  resident model weights 292.9 -> 110.9 MiB, peak RSS 329.5 -> 161.5 MiB), and
+  the streamed decode was bit-for-bit identical (`max|delta| = 0.000e+00`) to the
+  fully-resident decode on the SAME file and within the oracle quant tolerance,
+  over a short AND a longer sequence (`tests/test_trunk_stream_adaptive.cpp`).
+  Colab-only: the absolute real-Mixtral peak-RSS drop (the ~5.5 GB resident
+  attention trunk heading toward a bounded hot set) is hardware-only; the
+  re-verify command and expected effect are in `colab/README.md`.
 - [x] **Lossless KV paging (technique 6.5, lossless half).** Per
   `RESEARCH_50B_ON_A_LAPTOP.md` section 6.5, the engine-owned per-layer K/V no
   longer reserve the full trained `n_ctx` up front: they are sized to a resident

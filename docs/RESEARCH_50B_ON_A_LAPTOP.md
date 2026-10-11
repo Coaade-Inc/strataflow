@@ -278,7 +278,7 @@ GB. The FIT levers are mandatory, not optional.**
 
 | Component | Resident after | Lever |
 |---|---|---|
-| Trunk | ~0.5-1.5 GB resident hot set; rest streamed | 6.4 stream the trunk (lossless) |
+| Trunk | bounded resident hot set (a few layers); rest streamed per token | 6.4 stream the trunk (SHIPPED, lossless, budget-driven adaptive) |
 | KV cache | ~0.5-1.5 GB (recent window `W` resident; cold columns tiered to RAM, re-assembled losslessly) | 6.5 KV paging (SHIPPED, lossless); SSD spill + quant deferred |
 | Process floor | ~0.02-0.05 GB | 6.6 tiny tokenizer, drop libllama |
 | One-layer staging | ~0.3-1 GB | unchanged (bounded already) |
@@ -453,34 +453,60 @@ instead of byte-identity.
   so it must be measured. Sequence after the LUT kernels exist. Lower priority
   than the lossless FIT levers.
 
-### 6.4 Stream the trunk (not just experts)
+### 6.4 Stream the trunk (not just experts) [SHIPPED, lossless, ADAPTIVE]
 
-- **Mechanism.** Today the trunk is fully resident (`wctx`) and is a big part of
-  the resident floor; for a 50B it may not fit. Stream attention / norm /
-  embedding / output / router weights layer-by-layer the same way experts stream
-  from `.strata`, keeping only a bounded hot-trunk working set resident. The
-  `.strata` format already stores the trunk as a contiguous block
-  (`superblock().trunk_offset`); the change is to make trunk tensors
-  stream-backed (like `ectx` experts) rather than fully allocated in `wctx`,
-  with their own residency policy.
-- **50B math.** Converts the ~3-5 GB fixed trunk into a bounded resident hot set
-  (~0.5-1.5 GB) plus streamed cold trunk. This is the dominant FIT lever: it is
-  likely MANDATORY for a 50B to load at all on 12 GB. Trunk weights are touched
-  every token (unlike cold experts), so the hot set must be chosen carefully -
-  attention and norms are hot and should stay resident; the embedding matrix and
-  output head are large and touched once per token at the edges and are the best
-  streaming candidates.
-- **Oracle-safety.** LOSSLESS. This is pure residency / byte provenance, exactly
-  like expert streaming: same bytes, same ops, byte-identical to the oracle.
-  Buildable under the existing gate.
-- **Complexity / deps.** Medium. Reuses the `StrataReader` + `SlotPool` +
-  staging machinery; the new work is a trunk residency policy and making trunk
-  graph leaves stream-backed. Risk: trunk tensors are referenced throughout the
-  graph build (`get_weight`), so the staging/lifetime discipline must match the
-  expert path's "resident before the op is built" contract.
-- **Verdict: feasible-now (lossless, high-impact, FIT).** This is the top FIT
-  lever and a strong first implementation target: it is lossless, reuses
-  existing streaming machinery, and without it a 50B does not fit.
+- **Mechanism [SHIPPED].** The trunk was fully resident (`wctx`) and a big part
+  of the resident floor; for a 50B it may not fit. The trunk now streams in two
+  tiers, both reusing the v2 `.strata` per-trunk-tensor index
+  (`TrunkIndexEntry`, `StrataReader::read_trunk_tensor`) and the engine's
+  resident-before-op discipline:
+  - **Edge tensors (PR #41):** the two LARGE edge-touched tensors
+    (`token_embd.weight`, `output.weight`), each `n_vocab x n_embd` and read
+    once per token, live metadata-only in `tctx` with a single shared working
+    buffer, fetched immediately before the segment that reads them.
+  - **Per-layer attention projections (FEAT-003, ADAPTIVE):** the four large
+    per-layer projections (`blk.N.attn_{q,k,v,output}.weight`), the dominant
+    remaining resident cost after the KV window, live metadata-only in `pltctx`
+    and are fetched into a BOUNDED HOT-TRUNK POOL (a ring of `trunk_pool_layers`
+    layers) immediately before each layer's attention segment. The per-layer
+    norms + router are tiny and stay HOT (resident).
+- **Budget-driven aggressiveness.** The planner decides `trunk_pool_layers` from
+  the SAME conservative usable-RAM budget: a big-RAM box keeps the whole trunk
+  resident (`trunk_pool_layers == 0`, stream nothing, zero per-token trunk
+  traffic); a tight 12 GB-class box streams the per-layer attention trunk hard
+  (pool as low as 1 layer). The decision is plumbed to `Engine::load` as a load
+  parameter (via `GgmlModel`), exactly like the FEAT-002 KV window - NOT an env
+  side-channel - so it applies BY DEFAULT on the real `.strata` load path.
+- **50B math.** Converts the ~3-5 GB fixed trunk (on real Mixtral the per-layer
+  attention trunk alone is ~5.5 GB across 32 layers) into a bounded resident hot
+  set (a few layers) plus streamed cold trunk, heading the honest projected peak
+  toward ~2-3 GB on a 12 GB box. This is the dominant FIT lever and is MANDATORY
+  for a 50B to load at all on 12 GB.
+- **HONEST TRADEOFF.** Per-layer attention weights are touched EVERY token
+  (unlike cold experts), so streaming them adds per-token SSD traffic and is
+  SLOWER on the 2-core / ~4 GB/s box. This is accepted because the user's FIRST
+  goal is to FIT small: the budget-driven policy streams only as much trunk as
+  the budget forces, so a machine with headroom pays nothing. The streamed trunk
+  bytes are counted by `StrataReader::streamed_trunk_bytes()`, kept DISTINCT
+  from the expert `streamed_bytes()` so the per-token expert number is unchanged.
+- **Oracle-safety.** LOSSLESS. Pure residency / byte provenance, exactly like
+  expert streaming: same bytes, same ops, same graph order, byte-identical to
+  the oracle. The authoritative resident-before-op synchronous read is the
+  correctness backstop; the fetch stays on the single compute thread (the async
+  I/O worker is never involved, so no new TSan surface). The
+  `STRATAFLOW_ENGINE_NO_TRUNK_STREAM=1` knob forces the whole trunk resident so
+  a test can decode the SAME v2 file both ways and assert bit-identity.
+- **Sandbox-proven.** On a Mixtral-mirroring fixture through the REAL load path
+  (packer -> `.strata` -> `load_strata_model` -> planner -> engine): the plan
+  chooses `trunk_pool_layers` in `(0, n_layers)` by default under a tight
+  budget, `resident_weight_bytes()` drops to the bounded hot set, and the
+  streamed decode is bit-identical (`max|delta| == 0.0`) to the fully-resident
+  decode and within the oracle quant tolerance over a short AND a longer
+  sequence (`tests/test_trunk_stream_adaptive.cpp`). The absolute real-Mixtral
+  peak-RSS drop is Colab-only (the offline sandbox cannot download Mixtral).
+- **Verdict: SHIPPED (lossless, high-impact, FIT).** The top FIT lever: lossless,
+  reuses existing streaming machinery, budget-driven, and without it a 50B does
+  not fit.
 
 ### 6.5 Page / quantize the KV cache
 
