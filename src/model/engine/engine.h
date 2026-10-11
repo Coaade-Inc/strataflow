@@ -162,6 +162,14 @@ public:
     // path. Lets the oracle test prove paging engaged.
     uint64_t kv_cold_fetches() const;
 
+    // FEAT-002: current total bytes held by the per-layer RAM cold store (sum
+    // of the per-layer K and V vector sizes * sizeof(float)). This GROWS on
+    // demand with the positions actually decoded on the paging path - it is
+    // NEVER pre-sized to the full trained n_ctx - and is 0 on the default
+    // full-resident path. Lets a regression test assert the cold store stays
+    // bounded by the real decode length rather than the trained context.
+    uint64_t kv_cold_bytes() const;
+
     // Run a forward for `token` at `pos`, writing the full logit vector (length
     // n_vocab) to `out`. `token` is appended to the engine-owned KV cache at
     // `pos` and the query attends over all cached positions 0..pos (causal).

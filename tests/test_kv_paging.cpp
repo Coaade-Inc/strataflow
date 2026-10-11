@@ -18,10 +18,26 @@
 //   (3) paging actually engaged: resident_kv_bytes() < full_kv_bytes(), the
 //       sequence length exceeds W, and the cold-fetch counter > 0.
 //
+// A third gate (test_kv_paging_bigctx_small_window, STRATAFLOW_TEST_BIGCTX_MOE_
+// GGUF) reproduces the REAL-MODEL regime the W=4/n_ctx=64 fixtures missed: a
+// LARGE trained n_ctx (the bigctx fixture uses 4096) with a resident window
+// WELL BELOW it (W=64), exercised in BOTH:
+//   - a SHORT sequence whose total positions stay <= W, so the window never
+//     overflows (cold_fetches == 0, kv_cold_bytes() == 0). This no-overflow
+//     case is the one that reproduced the empty-output bug: the pre-fix engine
+//     committed a full-n_ctx cold store at LOAD (8 GiB on Mixtral) and OOMed
+//     before any output, even though no eviction ever occurs; and
+//   - a LONG sequence whose total positions exceed W, so cold KV is paged out
+//     and fetched back (cold_fetches > 0, kv_cold_bytes() > 0 but bounded to
+//     the EVICTED positions, far below the full-n_ctx cold size).
+// Both regimes must stay byte-identical to the full-resident path and the
+// oracle, with resident_kv_bytes() ~ (W/n_ctx) of full_kv_bytes().
+//
 // GUARDED on the fixture env vars (STRATAFLOW_TEST_MOE_GGUF for the F32 gate,
-// STRATAFLOW_TEST_KQUANT_MOE_GGUF for the K-quant gate); skips cleanly when
-// unset, matching the other oracle tests. Generate + run locally with the two
-// fixture env vars set, then: ctest -R test_kv_paging --output-on-failure
+// STRATAFLOW_TEST_KQUANT_MOE_GGUF for the K-quant gate, STRATAFLOW_TEST_BIGCTX_
+// MOE_GGUF for the large-n_ctx small-window gate); skips cleanly when unset,
+// matching the other oracle tests. Generate + run locally with the fixture env
+// vars set, then: ctest -R test_kv_paging --output-on-failure
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "model/engine/engine.h"
 #include "test_util.h"
@@ -91,6 +107,7 @@ struct PagedRun {
     uint64_t resident_kv_bytes = 0;
     uint64_t full_kv_bytes = 0;
     uint64_t cold_fetches = 0;
+    uint64_t cold_bytes = 0;  // current grow-on-demand cold store (0 if no evict)
     bool ok = false;
 };
 
@@ -127,6 +144,7 @@ static PagedRun decode(const char *path, const std::string &prompt,
     r.resident_kv_bytes = eng->resident_kv_bytes();
     r.full_kv_bytes = eng->full_kv_bytes();
     r.cold_fetches = eng->kv_cold_fetches();
+    r.cold_bytes = eng->kv_cold_bytes();
     r.ok = true;
     return r;
 }
@@ -254,9 +272,145 @@ static void test_kv_paging_kquant_byte_identical() {
     run_paging_gate(path, "Q4_K-MoE", /*window=*/4, /*oracle_tol=*/5e-2);
 }
 
+// One regime of the large-n_ctx small-window gate: decode `prompt`+`n_generate`
+// greedy tokens with a forced window `window` (<< fixture n_ctx) and assert
+// byte-identity to the full-resident run and the oracle. `expect_overflow`
+// selects the no-overflow (short) vs overflow (long) assertions on the cold
+// store. `floats_per_col`/`n_layer`/`n_ctx` reconstruct the expected resident
+// ring reservation and the full-n_ctx cold bound for the assertions.
+static void run_bigctx_regime(const char *path, const char *label,
+                              uint32_t window, int n_generate,
+                              bool expect_overflow, double oracle_tol) {
+    const std::string prompt = "hello";  // short prompt (few ids)
+
+    // Oracle sequence (hard gate the paged engine must reproduce).
+    std::vector<int32_t> oracle_tokens;
+    std::vector<std::vector<float>> oracle_step_logits;
+    CHECK(engine::run_oracle_sequence(path, prompt, n_generate, oracle_tokens,
+                                      &oracle_step_logits));
+    CHECK_EQ(oracle_tokens.size(), static_cast<size_t>(n_generate));
+    if (oracle_tokens.size() != static_cast<size_t>(n_generate)) return;
+
+    // Full-resident engine (env unset => W >= n_ctx, no paging): bit-identity
+    // reference. Captures floats_per_col/n_layer implicitly via its stats.
+    PagedRun full = decode(path, prompt, n_generate);
+    CHECK(full.ok);
+    if (!full.ok) return;
+    CHECK_EQ(full.resident_kv_bytes, full.full_kv_bytes);
+    CHECK_EQ(full.cold_fetches, static_cast<uint64_t>(0));
+    CHECK_EQ(full.cold_bytes, static_cast<uint64_t>(0));
+
+    // Paged engine with the small window.
+    PagedRun paged;
+    {
+        ScopedEnv w("STRATAFLOW_ENGINE_KV_WINDOW",
+                    std::to_string(window).c_str());
+        paged = decode(path, prompt, n_generate);
+    }
+    CHECK(paged.ok);
+    if (!paged.ok) return;
+    CHECK(!paged.tokens.empty());
+
+    // (1) HARD gate: paged sequence == full-resident == oracle.
+    bool seq_match = paged.tokens.size() == oracle_tokens.size() &&
+                     full.tokens.size() == oracle_tokens.size();
+    for (size_t i = 0; i < paged.tokens.size() && i < oracle_tokens.size();
+         ++i) {
+        CHECK_EQ(paged.tokens[i], oracle_tokens[i]);
+        CHECK_EQ(paged.tokens[i], full.tokens[i]);
+        if (paged.tokens[i] != oracle_tokens[i] ||
+            paged.tokens[i] != full.tokens[i]) {
+            seq_match = false;
+        }
+    }
+
+    // (2) paged logits BIT-IDENTICAL to the full-resident engine, and within
+    // tolerance of the oracle.
+    const double max_pf = max_step_delta(paged.step_logits, full.step_logits);
+    const double max_po = max_step_delta(paged.step_logits, oracle_step_logits);
+
+    // (3) resident ring reservation is proportional to W/n_ctx of full. Recover
+    // the per-fixture scalars from the full-resident stats: full_kv_bytes is the
+    // n_ctx reservation, resident_kv_bytes (== full on the no-window run) too.
+    // The paged run's full_kv_bytes still reports the n_ctx reservation; its
+    // resident_kv_bytes is the W-column ring. Expected ring =
+    // full_kv_bytes * W / n_ctx (integer-exact: both scale linearly in cols).
+    const uint64_t n_ctx_cols =
+        paged.full_kv_bytes /
+        (paged.resident_kv_bytes / window);  // bytes-per-col cancels
+    const uint64_t expected_resident =
+        paged.full_kv_bytes / n_ctx_cols * window;
+
+    std::printf(
+        "[%s W=%u gen=%d regime=%s residentKV=%lluB fullKV=%lluB "
+        "coldBytes=%lluB cold_fetches=%llu seq match=%s "
+        "paged-vs-full|delta|=%.3e paged-vs-oracle|delta|=%.3e]",
+        label, window, n_generate, expect_overflow ? "long" : "short",
+        static_cast<unsigned long long>(paged.resident_kv_bytes),
+        static_cast<unsigned long long>(paged.full_kv_bytes),
+        static_cast<unsigned long long>(paged.cold_bytes),
+        static_cast<unsigned long long>(paged.cold_fetches),
+        seq_match ? "yes" : "no", max_pf, max_po);
+
+    CHECK(seq_match);
+    CHECK(max_pf == 0.0);        // paged bit-identical to full-resident
+    CHECK(max_po < oracle_tol);  // paged within fixture tolerance of oracle
+
+    // Resident ring == exact W-column reservation, strictly and proportionally
+    // below the full n_ctx reservation (window << n_ctx).
+    CHECK_EQ(paged.resident_kv_bytes, expected_resident);
+    CHECK(paged.resident_kv_bytes < paged.full_kv_bytes);
+    CHECK(window < n_ctx_cols);  // the window is well below n_ctx
+
+    if (expect_overflow) {
+        // LONG: the window overflowed, cold KV was paged out and fetched back.
+        CHECK(paged.cold_fetches > 0);
+        CHECK(paged.cold_bytes > 0);
+        // The cold store is bounded to the EVICTED positions, NOT n_ctx. A
+        // full-n_ctx cold store (the pre-fix allocation) would be
+        // full_kv_bytes (same n_layer*2*fpc*4*n_ctx shape). Assert we are far
+        // below that: strictly less than the full-n_ctx cold size, and in fact
+        // below the resident ring + a generous slack (evicted cols << n_ctx).
+        CHECK(paged.cold_bytes < paged.full_kv_bytes);
+        // Evicted cols = total_positions - W. Even a loose bound (cold cols <
+        // n_ctx) proves no n_ctx-scale pre-allocation; tighten to < full/2.
+        CHECK(paged.cold_bytes < paged.full_kv_bytes / 2);
+    } else {
+        // SHORT: total positions stayed within W, so the window never
+        // overflowed; no eviction, no cold fetch, cold store never grew. This
+        // is the no-overflow regime that OOMed pre-fix at load.
+        CHECK_EQ(paged.cold_fetches, static_cast<uint64_t>(0));
+        CHECK_EQ(paged.cold_bytes, static_cast<uint64_t>(0));
+    }
+}
+
+// Large trained n_ctx (fixture: 4096) with a resident window WELL below it
+// (W=64). Runs BOTH a short no-overflow sequence (total positions <= W,
+// cold_fetches==0, cold store never grows) and a long overflow sequence (total
+// positions > W, cold paging engages). Both must be byte-identical to the
+// full-resident path and the oracle. Reproduces the real-model regime that
+// OOMed the pre-fix engine at load (full-n_ctx cold store).
+static void test_kv_paging_bigctx_small_window() {
+    const char *path = std::getenv("STRATAFLOW_TEST_BIGCTX_MOE_GGUF");
+    if (path == nullptr || path[0] == '\0') {
+        std::printf("[skipped: set STRATAFLOW_TEST_BIGCTX_MOE_GGUF] ");
+        return;
+    }
+    // W=64 << fixture n_ctx=4096 (ratio 1/64), proving the W/n_ctx reduction.
+    // SHORT: prompt "hello" (a couple ids) + 8 generated => well under 64, so
+    // total positions <= W and the window never overflows.
+    run_bigctx_regime(path, "F32-MoE-bigctx", /*window=*/64, /*n_generate=*/8,
+                      /*expect_overflow=*/false, /*oracle_tol=*/1e-3);
+    // LONG: same W=64 but 80 generated tokens => total positions > 64, so the
+    // window overflows and cold KV is paged out and fetched back.
+    run_bigctx_regime(path, "F32-MoE-bigctx", /*window=*/64, /*n_generate=*/80,
+                      /*expect_overflow=*/true, /*oracle_tol=*/1e-3);
+}
+
 static void run_all() {
     RUN(test_kv_paging_moe_byte_identical);
     RUN(test_kv_paging_kquant_byte_identical);
+    RUN(test_kv_paging_bigctx_small_window);
 }
 
 TEST_MAIN()

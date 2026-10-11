@@ -120,9 +120,13 @@ Technique 6.5 from [`../docs/RESEARCH_50B_ON_A_LAPTOP.md`](../docs/RESEARCH_50B_
 (the LOSSLESS half). Before this lever the engine reserved the full trained
 `n_ctx` of F32 K/V resident per layer up front, regardless of how many positions
 were actually used - a fixed, growing multi-GB cost at a useful context. Now the
-resident per-layer K/V are bounded to a recent WINDOW `W` (a ring buffer), and
-positions that scroll out of the window are tiered to a RAM-backed per-layer COLD
-page store (keyed by absolute position, the EXACT F32 bytes the ring held).
+resident per-layer K/V are bounded to a recent WINDOW `W` (a ring buffer,
+reserving only `W/n_ctx` of the old resident cost), and positions that scroll out
+of the window are tiered to a RAM-backed per-layer COLD page store (keyed by
+absolute position, the EXACT F32 bytes the ring held). The cold store is BOUNDED:
+it is empty at load and GROWS ON DEMAND only to the positions actually evicted
+(never the full `n_ctx`), so engaging paging on a large-`n_ctx` model costs no
+multi-GB up-front allocation.
 Attention re-assembles the full history `0..pos` (cold columns + resident ring
 columns in absolute order) and runs the IDENTICAL op sequence over it, so decode
 stays BYTE-IDENTICAL and no past position is dropped (this is NOT lossy
@@ -155,31 +159,48 @@ the DEFAULT is byte-identical and zero-overhead) and is set via the
 
   The `test_kv_paging` log prints, per fixture, `residentKV` vs `fullKV` byte
   numbers, the `cold_fetches` count (> 0 proves the cold path ran), and the
-  paged-vs-full `max|delta|` (`0.000e+00`).
+  paged-vs-full `max|delta|` (`0.000e+00`). A dedicated large-`n_ctx` gate
+  (`test_kv_paging_bigctx_small_window` over the `n_ctx` 4096 fixture
+  `make_tiny_moe_bigctx_gguf.py`, `STRATAFLOW_TEST_BIGCTX_MOE_GGUF`, `W=64` so
+  `W/n_ctx` = 1/64) exercises the real-model regime a window WELL below `n_ctx`,
+  in BOTH a short no-overflow and a long overflow run: SHORT (gen=8)
+  `residentKV 32768 B`, `fullKV 2097152 B`, `coldBytes 0 B`, `cold_fetches 0`;
+  LONG (gen=80) `residentKV 32768 B`, `fullKV 2097152 B`, `coldBytes 12800 B`,
+  `cold_fetches 650`. `residentKV == fullKV/64` proves the `W/n_ctx` resident
+  reservation and `coldBytes 12800` (proportional to the 25 evicted positions,
+  far below the full-`n_ctx` cold size `2,097,152 B`) proves the cold store is
+  bounded to used positions, not `n_ctx`. The MECHANISM (byte-identity) and the
+  proportional resident-KV reduction are sandbox-proven here; the absolute
+  real-Mixtral peak-RSS drop is the Colab re-verify below.
 - **Colab-only (real Mixtral/50B, long context):** the absolute PEAK-RSS
-  reduction at a useful context, and "useful context now fits where it did not
-  before". The offline sandbox cannot run a real long-context Mixtral, so
-  re-verify on Colab by running the SAME real-model decode (Cell 8 RUN A) with a
-  long prompt/`--max-tokens`, once on **current `main` (before)** and once on
-  **this branch with a bounded window (after)**, setting the window before the
-  CLI:
+  reduction. A real-hardware regression was found and fixed here: on Mixtral
+  (`n_ctx` 32768) a RUN 2 with `STRATAFLOW_ENGINE_KV_WINDOW=512` previously
+  produced NO output at all (empty cell, no plan line, no error) because the cold
+  store was pre-allocated at full `n_ctx` (8 GiB) and OOMed at LOAD; with the
+  grow-on-demand bound RUN 2 now DECODES. The offline sandbox cannot download
+  Mixtral, so re-verify on Colab by running RUN 1 (default, full-resident KV) and
+  RUN 2 (bounded window) on the SAME model and prompt and comparing the lines
+  each prints:
 
   ```bash
   %%bash
   cd /content/strataflow/build/release
-  # before: full-resident KV (default). after: bounded window.
-  STRATAFLOW_ENGINE_KV_WINDOW=512 ./bin/strataflow \
-    --model /content/mixtral.strata --expert-slots 0 \
-    --max-tokens 256 --prompt "<a long prompt>"
+  # RUN 1 (before/reference): full-resident KV (default window == n_ctx).
+  ./bin/strataflow --model /content/mixtral.strata \
+    --expert-slots 0 --max-tokens 16 --async-prefetch on --prompt "The city of"
+  # RUN 2 (after/fix): bounded 512-column window.
+  STRATAFLOW_ENGINE_KV_WINDOW=512 ./bin/strataflow --model /content/mixtral.strata \
+    --expert-slots 0 --max-tokens 16 --async-prefetch on --prompt "The city of"
   ```
 
-  Compare the `peak RSS = ... MiB` and `resident_kv_bytes = N` lines the CLI
-  prints: the bounded-window run holds only `W` columns of K/V resident, so its
-  reserved KV (and thus peak RSS at long context) is lower, and a context that
-  OOM'd on the full-`n_ctx` reservation can now complete the decode. Expected
-  effect: lower peak RSS, lower `resident_kv_bytes`, IDENTICAL decoded text (the
-  change is lossless). Absolute numbers are hardware-dependent on the free
-  runtime; compare the before/after lines on the SAME model and prompt.
+  Expected after the fix: RUN 2 DECODES text BYTE-IDENTICAL to RUN 1 (the change
+  is lossless) and its `stats:` line reports `resident_kv = 128.0 MiB`
+  (`resident_kv_bytes = 134217728`, i.e. `512/32768 * 8192 MiB`) instead of
+  RUN 1's `resident_kv = 8192.0 MiB` (`resident_kv_bytes = 8589934592`), cutting
+  peak RSS by ~8 GB (from ~10.6 GB toward ~2.5 GB). Absolute numbers are
+  hardware-dependent on the free runtime; compare the before/after
+  `resident_kv`, `resident_kv_bytes`, `peak RSS` and the decoded text on the SAME
+  model and prompt.
 
 ### Which real model, and why
 

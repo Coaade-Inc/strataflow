@@ -103,10 +103,15 @@ resident floor that does NOT shrink with `--expert-slots`:
   V tensor per layer shaped `[head_dim, n_head_kv, n_ctx]` as F32, a fixed
   resident cost that grew with `n_ctx`. FEAT-002 (technique 6.5, lossless KV
   paging) sizes those tensors to a recent WINDOW `W` (ring buffer,
-  `[head_dim, n_head_kv, W]`, default `W == n_ctx`) and tiers cold columns to a
-  RAM store, re-assembling them losslessly for attention. `KvStore`
+  `[head_dim, n_head_kv, W]`, default `W == n_ctx`), reserving only `W/n_ctx` of
+  the old resident cost, and tiers cold columns to a RAM store (BOUNDED - empty
+  at load, grown on demand only to the positions actually evicted, never the full
+  `n_ctx`), re-assembling them losslessly for attention. `KvStore`
   (`src/kv/kv_store.h`) now owns the paging bookkeeping (window, ring mapping,
-  cold/resident split). KV quantization is still deferred (approximate).
+  cold/resident split). A real-model empty-output bug - the cold store was first
+  pre-allocated at full `n_ctx` (8 GiB on Mixtral) and OOMed at load when a
+  sub-`n_ctx` window was set - was found on hardware and fixed by the
+  grow-on-demand bound. KV quantization is still deferred (approximate).
 - **The process floor.** `libllama` is still linked (for the tokenizer / vocab;
   see the `llama_*` includes in `src/model/engine/engine.cpp` and
   `src/model/ggml_model.cpp`) and, with the ggml backend and vocab, contributes
@@ -418,13 +423,24 @@ instead of byte-identity.
   sub-levers (Phase 6, `PLAN.md` section 3.9):
   - **KV paging [SHIPPED, lossless]**: keep a recent-window `W` of KV resident
     (the per-layer `kvctx` tensors are now sized `[head_dim, n_head_kv, W]`, a
-    ring buffer, instead of the full `n_ctx`), tier cold KV columns to a
+    ring buffer, instead of the full `n_ctx`, so the resident reservation is just
+    `W` columns, i.e. `W/n_ctx` of the full cost), tier cold KV columns to a
     RAM-backed per-layer cold page store (SSD spill is the deferred follow-on,
     option b), and RE-ASSEMBLE the full history losslessly for attention so
     every past position `0..pos` is still attended over with the SAME F32 bytes.
-    The window `W` defaults to the full `n_ctx` (so the DEFAULT path is
-    byte-identical and zero-overhead) and is overridable via
-    `STRATAFLOW_ENGINE_KV_WINDOW` to engage paging. Shipped in FEAT-002.
+    The cold store is BOUNDED: it is NOT pre-allocated at `n_ctx` - it is empty
+    at load and GROWS ON DEMAND, sized only to the positions actually evicted
+    (never the full `n_ctx`), so engaging paging on a large-`n_ctx` model does
+    not cost a multi-GB up-front allocation. The window `W` defaults to the full
+    `n_ctx` (so the DEFAULT path is byte-identical and zero-overhead) and is
+    overridable via `STRATAFLOW_ENGINE_KV_WINDOW` to engage paging. Shipped in
+    FEAT-002. A follow-up fixed a real-hardware regression: the cold store was
+    first pre-allocated at full `n_ctx` (8 GiB on Mixtral: `n_layer` 32 x 2 x
+    `n_ctx` 32768 x `floats_per_col` 1024 x 4 B), which OOMed at LOAD on a 12 GB
+    box and produced NO output at all (empty cell, before any plan line) when a
+    sub-`n_ctx` window was requested; grow-on-demand is the fix, and a genuine
+    allocation failure now logs an ASCII error and fails the decode cleanly
+    rather than silently yielding nothing.
   - **KV quantization [DEFERRED, approximate]**: store K/V at q8 or 4-bit
     (optionally Hadamard-rotated) instead of F32. NOT shipped: it is approximate
     (changes attention numerics) and belongs behind the quality-metric gate
@@ -446,7 +462,19 @@ instead of byte-identity.
     and match the libllama oracle (F32 within 1e-3; Q4_K seq-identical). Resident
     KV dropped from 32768 B to 2048 B (F32 MoE, `n_ctx` 64 -> `W` 4) and from
     1048576 B to 16384 B (Q4_K MoE, `n_ctx` 256 -> `W` 4) with byte-identical
-    output.
+    output. The real-model regime (large `n_ctx`, window WELL below it) that the
+    tiny W=4 fixtures missed is now also covered by a dedicated gate
+    (`test_kv_paging_bigctx_small_window` over the `n_ctx` 4096 fixture
+    `make_tiny_moe_bigctx_gguf.py`, `STRATAFLOW_TEST_BIGCTX_MOE_GGUF`) at `W=64`
+    (`W/n_ctx` 1/64), in BOTH a short no-overflow and a long overflow regime:
+    SHORT (gen=8) `residentKV 32768 B`, `fullKV 2097152 B`, `coldBytes 0 B`,
+    `cold_fetches 0`; LONG (gen=80) `residentKV 32768 B`, `fullKV 2097152 B`,
+    `coldBytes 12800 B`, `cold_fetches 650`. Both are byte-identical to the
+    full-resident engine (`max|delta| = 0.000e+00`) and within 1e-3 of the
+    oracle; `residentKV == fullKV/64` confirms the `W/n_ctx` reservation and
+    `coldBytes 12800` (proportional to the 25 evicted positions, far below the
+    full-`n_ctx` cold size 2097152 B) confirms the cold store is bounded to used
+    positions, not `n_ctx`.
   - KV *quantization* is APPROXIMATE (q8/4-bit K/V changes attention numerics)
     and needs the quality-metric gate; DEFERRED as an opt-in follow-on with
     measured perplexity cost. StreamingLLM/SnapKV-style windowed EVICTION is also
