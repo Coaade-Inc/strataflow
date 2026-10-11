@@ -30,6 +30,8 @@ bool StrataReader::open(const std::string &path) {
     index_.clear();
     map_.clear();
     meta_.clear();
+    trunk_index_.clear();
+    trunk_map_.clear();
 
     if (!file_.open(path)) {
         log_warn("StrataReader: cannot open '" + path + "'");
@@ -41,32 +43,74 @@ bool StrataReader::open(const std::string &path) {
         log_warn("StrataReader: '" + path + "' too small for a superblock");
         return false;
     }
-    if (file_.read_at(&sb_, sizeof(sb_), 0) !=
-        static_cast<int64_t>(sizeof(sb_))) {
+    // Read the raw 128 superblock bytes once. We parse version-aware from these
+    // bytes (v1 and v2 differ in trailing-field offsets), then normalize into
+    // the in-memory v2 struct sb_.
+    uint8_t raw[kStrataSuperblockSize];
+    if (file_.read_at(raw, sizeof(raw), 0) !=
+        static_cast<int64_t>(sizeof(raw))) {
         log_warn("StrataReader: failed to read superblock from '" + path + "'");
         return false;
     }
+    std::memcpy(&sb_, raw, sizeof(sb_));
     if (std::memcmp(sb_.magic, kStrataMagic, sizeof(kStrataMagic)) != 0) {
         log_warn("StrataReader: bad magic in '" + path + "'");
         return false;
     }
-    if (sb_.version != kStrataVersion) {
+    // Read the version from its fixed offset first (it is identical in v1 and
+    // v2: right after the 8-byte magic). The superblock FIELD LAYOUT differs
+    // between v1 and v2 for everything after expert_region_size: v2 inserts
+    // trunk_index_offset + trunk_index_count (two uint64 = 16 bytes) ahead of
+    // n_layers, which shifts n_layers/n_experts/align/header_crc32 down by 16
+    // bytes. So a v1 file CANNOT be interpreted with the v2 struct layout: we
+    // must re-map the trailing fields from their v1 offsets. We accept v1 and
+    // v2; v1 has no trunk index, so it reports trunk_index_count()==0 and the
+    // engine falls back to a fully-resident trunk (byte-identical to before).
+    uint32_t version = 0;
+    std::memcpy(&version, raw + 8, sizeof(version));
+    if (version != 1 && version != kStrataVersion) {
         log_warn("StrataReader: unsupported version in '" + path + "'");
         return false;
     }
-    if (sb_.align != static_cast<uint32_t>(kIoAlignment)) {
-        log_warn("StrataReader: alignment mismatch in '" + path + "'");
-        return false;
+
+    // v1 header_crc32 covers [0, 92); v2 covers [0, kStrataHeaderCrcOffset)
+    // (==108). Validate the CRC against the ON-DISK bytes at the version's own
+    // layout, then normalize into the in-memory v2 struct so the rest of the
+    // reader (and all callers) see a single consistent sb_.
+    size_t crc_cover = kStrataHeaderCrcOffset;  // v2
+    if (version == 1) {
+        // v1 on-disk layout (offsets, little-endian):
+        //   [96] = header_crc32 position is 92; fields:
+        //   n_layers@80 n_experts@84 align@88 header_crc32@92 reserved[32]@96
+        crc_cover = 92;
     }
     {
-        // Validate header_crc32 over the bytes it covers.
-        StrataSuperblock copy = sb_;
-        const uint32_t stored = copy.header_crc32;
-        const uint32_t computed = strata_crc32(&copy, kStrataHeaderCrcOffset);
+        uint32_t stored = 0;
+        std::memcpy(&stored, raw + crc_cover, sizeof(stored));
+        const uint32_t computed = strata_crc32(raw, crc_cover);
         if (stored != computed) {
             log_warn("StrataReader: header CRC mismatch in '" + path + "'");
             return false;
         }
+    }
+
+    if (version == 1) {
+        // Re-map the v1 trailing fields (which the v2 struct read placed at the
+        // wrong offsets) and zero the v2-only trunk-index fields. Everything up
+        // to and including expert_region_size (offset 79) is byte-identical, so
+        // only the four trailing scalars need relocation.
+        std::memcpy(&sb_.n_layers,     raw + 80, sizeof(sb_.n_layers));
+        std::memcpy(&sb_.n_experts,    raw + 84, sizeof(sb_.n_experts));
+        std::memcpy(&sb_.align,        raw + 88, sizeof(sb_.align));
+        std::memcpy(&sb_.header_crc32, raw + 92, sizeof(sb_.header_crc32));
+        sb_.version            = version;
+        sb_.trunk_index_offset = 0;
+        sb_.trunk_index_count  = 0;
+    }
+
+    if (sb_.align != static_cast<uint32_t>(kIoAlignment)) {
+        log_warn("StrataReader: alignment mismatch in '" + path + "'");
+        return false;
     }
 
     // --- Embedded GGUF metadata blob ---------------------------------------
@@ -101,6 +145,39 @@ bool StrataReader::open(const std::string &path) {
     map_.reserve(index_.size());
     for (size_t i = 0; i < index_.size(); ++i) {
         map_[pack_key(index_[i].layer, index_[i].expert)] = i;
+    }
+
+    // --- v2 trunk index (optional, FEAT-002) -------------------------------
+    // Present only when the file is v2+, the kStrataFlagTrunkIndexed flag is
+    // set, and trunk_index_count>0. A v1 file leaves trunk_index_ empty, so the
+    // engine falls back to a fully-resident trunk (byte-identical to before).
+    if (sb_.version >= 2 && (sb_.flags & kStrataFlagTrunkIndexed) != 0 &&
+        sb_.trunk_index_count > 0) {
+        const uint64_t trunk_index_bytes =
+            sb_.trunk_index_count * sizeof(TrunkIndexEntry);
+        if (sb_.trunk_index_offset + trunk_index_bytes > file_.size()) {
+            log_warn("StrataReader: invalid trunk index region in '" + path +
+                     "'");
+            return false;
+        }
+        trunk_index_.resize(static_cast<size_t>(sb_.trunk_index_count));
+        if (file_.read_at(trunk_index_.data(),
+                          static_cast<size_t>(trunk_index_bytes),
+                          sb_.trunk_index_offset) !=
+            static_cast<int64_t>(trunk_index_bytes)) {
+            log_warn("StrataReader: failed to read trunk index from '" + path +
+                     "'");
+            trunk_index_.clear();
+            return false;
+        }
+        trunk_map_.reserve(trunk_index_.size());
+        for (size_t i = 0; i < trunk_index_.size(); ++i) {
+            // The name is a fixed NUL-padded char array; strnlen bounds the
+            // read so a non-terminated record cannot overrun the field.
+            const TrunkIndexEntry &e = trunk_index_[i];
+            const size_t nlen = ::strnlen(e.name, sizeof(e.name));
+            trunk_map_[std::string(e.name, nlen)] = i;
+        }
     }
 
     open_ = true;
@@ -171,6 +248,33 @@ int64_t StrataReader::read_blob(uint32_t layer, uint32_t expert,
 
 int64_t StrataReader::read_at(void *dst, uint64_t len, uint64_t offset) const {
     return file_.read_at(dst, static_cast<size_t>(len), offset);
+}
+
+bool StrataReader::trunk_slice_range(const std::string &name, uint64_t &offset,
+                                     uint64_t &length) const {
+    auto it = trunk_map_.find(name);
+    if (it == trunk_map_.end()) return false;
+    const TrunkIndexEntry &e = trunk_index_[it->second];
+    // The index stores the trunk-RELATIVE offset; the absolute file offset is
+    // the trunk block start plus that relative offset.
+    offset = sb_.trunk_offset + e.rel_offset;
+    length = e.length;
+    return true;
+}
+
+int64_t StrataReader::read_trunk_tensor(const std::string &name,
+                                        void *dst) const {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    if (!trunk_slice_range(name, offset, length)) return -1;
+    const int64_t n = file_.read_at(dst, static_cast<size_t>(length), offset);
+    // Count successful trunk reads toward the SEPARATE trunk-streaming total
+    // (not streamed_bytes(), which stays expert-only for the bench harness).
+    if (n > 0) {
+        streamed_trunk_bytes_.fetch_add(static_cast<uint64_t>(n),
+                                        std::memory_order_relaxed);
+    }
+    return n;
 }
 
 }  // namespace sf

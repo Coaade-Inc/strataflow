@@ -60,6 +60,60 @@ its `.strata` copy, and (2) streaming speed (SSD read throughput sets tok/s).
 **More memory buys speed, not capability; the output is identical at every
 memory size.**
 
+### Stream the trunk (resident-floor reduction for the edge tensors)
+
+Technique 6.4 from [`../docs/RESEARCH_50B_ON_A_LAPTOP.md`](../docs/RESEARCH_50B_ON_A_LAPTOP.md).
+On top of streaming the experts, StrataFlow now also STREAMS the two LARGE trunk
+tensors that are touched exactly once per token at the input/output edges -
+`token_embd.weight` (input embedding) and `output.weight` (lm_head) - instead of
+holding them resident. The HOT per-layer attention/norm/router trunk tensors stay
+resident (streaming them would slow the hot path). At 50B / real-Mixtral scale
+these vocab x n_embd edge tensors are MULTIPLE GB and dominate the fixed resident
+trunk, so moving them off the resident floor is the dominant FIT lever: a model
+whose resident trunk previously did not fit can now fit, because the embeddings +
+lm_head no longer have to be held in RAM.
+
+The change is LOSSLESS - same bytes, same ops, only byte PROVENANCE differs. The
+`.strata` format is a BACK-COMPATIBLE v2 (an optional per-trunk-tensor index); a
+v1 `.strata` still opens and falls back to the fully-resident trunk, byte-
+identical to before.
+
+- **Sandbox-proven (offline, in CI):** the resident-trunk-bytes reduction and
+  byte-identity on generated fixtures, including K-quant. On the F32 tiny MoE
+  `resident_weight_bytes` drops 103,040 -> 69,248 B (-33,792 B, one edge tensor);
+  on the K-quant MoE 392,448 -> 354,432 B (-38,016 B). The trunk-streaming decode
+  is bit-for-bit identical to the fully-resident decode (`max|delta| = 0.000e+00`,
+  proven on the SAME v2 file via the `STRATAFLOW_ENGINE_NO_TRUNK_STREAM=1` test
+  knob) and to the libllama oracle, on BOTH an F32 and a K-quant fixture; a v1
+  back-compat gate decodes byte-identically to the oracle too. Re-run it on
+  Colab's real hardware with:
+
+  ```bash
+  %%bash
+  cd /content/strataflow
+  python3 tools/testdata/make_tiny_moe_gguf.py /content/moe.gguf
+  # A K-quant fixture (Q4_K / Q6_K); the generator writes the quantized MoE.
+  python3 tools/testdata/make_tiny_quant_moe_gguf.py /content/kquant_moe.gguf
+  cd build/release
+  STRATAFLOW_TEST_MOE_GGUF=/content/moe.gguf \
+  STRATAFLOW_TEST_KQUANT_MOE_GGUF=/content/kquant_moe.gguf \
+    ctest -R test_trunk_stream --output-on-failure
+  ```
+
+  The `test_trunk_stream` log prints, per fixture, the `resident_full` vs
+  `resident_stream` byte numbers and the stream-vs-resident `max|delta|`.
+- **Colab-only (real Mixtral/50B):** the absolute PEAK-RSS reduction and the
+  "previously did not fit, now fits" outcome. The offline sandbox cannot download
+  Mixtral, so re-verify on Colab by running the SAME real-model decode (Cell 8
+  RUN A, `--expert-slots 0`) on **current `main` (before)** and on **this branch
+  (after)** and comparing the `peak RSS = ... MiB` line each prints: the after
+  branch holds the multi-GB embeddings + lm_head off the resident floor, so its
+  peak RSS is lower and a tighter-RAM runtime that OOM'd before can complete the
+  decode. Expected effect: lower peak RSS, identical decoded text (the change is
+  lossless), with the resident-weights line dropping by the embedding + lm_head
+  size. Absolute numbers are hardware-dependent on the free runtime; compare the
+  before/after `peak RSS` and `resident weights` lines on the SAME model.
+
 ### Which real model, and why
 
 The engine runs **llama-architecture** models only. That drives the choice:

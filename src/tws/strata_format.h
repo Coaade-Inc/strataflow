@@ -27,11 +27,20 @@ constexpr uint32_t kStrataSuperblockSize = 128;
 
 // Magic occupies the first 8 bytes of the file. Not NUL-terminated on disk.
 constexpr char     kStrataMagic[8] = {'S', 'T', 'R', 'A', 'T', 'A', '0', '1'};
-constexpr uint32_t kStrataVersion  = 1;
+// v2 (FEAT-002 'stream the trunk') adds an optional per-trunk-tensor index so
+// an individual trunk tensor can be located and streamed without loading the
+// whole trunk block. The change is strictly additive: the trunk block bytes
+// are byte-for-byte identical to v1; v2 only appends a trunk index region and
+// carves two superblock fields out of the previously-reserved pad. A reader
+// that understands v2 falls back to full-resident trunk when the trunk index
+// is absent (trunk_index_count==0), so a v2 file without the index behaves
+// exactly like v1.
+constexpr uint32_t kStrataVersion  = 2;
 
 // Superblock flag bits.
 constexpr uint32_t kStrataFlagExpertsBundled = 1u << 0;  // gate+up+down bundled
 constexpr uint32_t kStrataFlagIndexSorted    = 1u << 1;  // sorted {layer,expert}
+constexpr uint32_t kStrataFlagTrunkIndexed   = 1u << 2;  // per-trunk-tensor index present
 
 // The fixed 128-byte superblock at offset 0. All multi-byte fields are stored
 // little-endian; on the little-endian targets we support (x86-64, arm64) the
@@ -50,11 +59,19 @@ struct StrataSuperblock {
     uint64_t trunk_size;               // bytes
     uint64_t expert_region_offset;     // 4 KiB-aligned start of expert region
     uint64_t expert_region_size;       // bytes
+    // v2 trunk index (FEAT-002). Carved from the former reserved[32] pad, so
+    // sizeof(StrataSuperblock) is unchanged at 128 bytes, and placed here (both
+    // 8-byte aligned, before header_crc32) so the existing CRC backfill covers
+    // them. On a v1 file (or a v2 file without a trunk index) both are 0 and
+    // the engine falls back to a fully-resident trunk.
+    uint64_t trunk_index_offset;       // start of the trunk index region, or 0
+    uint64_t trunk_index_count;        // number of TrunkIndexEntry, or 0
     uint32_t n_layers;                 // convenience (redundant with GGUF)
     uint32_t n_experts;                // convenience (redundant with GGUF)
     uint32_t align;                    // the alignment used (== kIoAlignment)
     uint32_t header_crc32;             // CRC32 of bytes before this field
-    uint8_t  reserved[32];             // pad to 128 bytes
+    uint8_t  reserved[16];             // pad to 128 bytes (was 32; 16 bytes
+                                       // repurposed for the two fields above)
 };
 
 static_assert(sizeof(StrataSuperblock) == kStrataSuperblockSize,
@@ -80,6 +97,31 @@ struct ExpertIndexEntry {
 
 static_assert(sizeof(ExpertIndexEntry) == 48,
               "ExpertIndexEntry must be exactly 48 bytes");
+
+// Max trunk-tensor-name length (including the NUL terminator) stored in a
+// TrunkIndexEntry. llama trunk tensor names are short - the longest is of the
+// form "blk.NN.attn_output.weight" (~25 chars) or "token_embd.weight" - so 64
+// bytes is comfortably large and keeps the record a round 80 bytes. The name
+// is stored as a fixed-size, NUL-terminated (and NUL-padded) char array so the
+// index is a flat array of fixed-size records that round-trips with a single
+// read/write of count*sizeof(TrunkIndexEntry).
+constexpr uint32_t kStrataTrunkNameMax = 64;
+
+// One index record per TRUNK tensor (v2+, when kStrataFlagTrunkIndexed is set).
+// 80 bytes, 8-byte aligned. `rel_offset` is the tensor's byte offset WITHIN the
+// trunk block (so the absolute file offset is superblock().trunk_offset +
+// rel_offset); `length` is ggml_nbytes of the tensor. Trunk tensors are packed
+// verbatim and contiguously in GGUF tensor order, so these records simply name
+// the slot each tensor already occupies - the trunk block bytes are unchanged
+// vs v1.
+struct TrunkIndexEntry {
+    char     name[kStrataTrunkNameMax];  // GGUF tensor name, NUL-padded
+    uint64_t rel_offset;                 // byte offset within the trunk block
+    uint64_t length;                     // ggml_nbytes of the tensor
+};
+
+static_assert(sizeof(TrunkIndexEntry) == kStrataTrunkNameMax + 16,
+              "TrunkIndexEntry must be name + two uint64 (80 bytes)");
 
 // CRC32 (IEEE 802.3, reflected, poly 0xEDB88320) over `len` bytes of `data`.
 // Standalone and header-only so both the packer and the reader share one

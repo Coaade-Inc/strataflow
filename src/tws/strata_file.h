@@ -73,6 +73,40 @@ public:
     // read, or -1 on error.
     int64_t read_at(void *dst, uint64_t len, uint64_t offset) const;
 
+    // --- v2 trunk index (FEAT-002 'stream the trunk') ----------------------
+    // Number of per-trunk-tensor index records parsed from the file. 0 for a
+    // v1 file or a v2 file without the kStrataFlagTrunkIndexed flag, in which
+    // case the engine falls back to a fully-resident trunk.
+    uint64_t trunk_index_count() const { return trunk_index_.size(); }
+
+    // True when this file carries a usable per-trunk-tensor index (v2 + flag +
+    // at least one entry). The engine gates trunk streaming on this.
+    bool has_trunk_index() const { return !trunk_index_.empty(); }
+
+    // Absolute file offset + length of a single trunk tensor's bytes, looked up
+    // by GGUF tensor name. Returns false if the name is not in the trunk index.
+    // offset = superblock().trunk_offset + entry.rel_offset.
+    bool trunk_slice_range(const std::string &name, uint64_t &offset,
+                           uint64_t &length) const;
+
+    // Read exactly one trunk tensor's bytes (by GGUF name) into `dst` (which
+    // must hold at least the tensor's length). Returns bytes read, or -1 if the
+    // name is unknown or the read fails. Const + read-only like read_blob, so
+    // it is safe to call from any thread, but this feature only calls it from
+    // the compute thread (synchronous, before the segment that reads it).
+    //
+    // Trunk bytes are counted separately from streamed_bytes() (which stays
+    // expert-only for the bench harness); see streamed_trunk_bytes().
+    int64_t read_trunk_tensor(const std::string &name, void *dst) const;
+
+    // Total TRUNK bytes streamed via read_trunk_tensor() since open(). Kept
+    // DISTINCT from streamed_bytes() (experts) so the benchmark harness's
+    // per-token expert-streaming number is unchanged; trunk streaming is a
+    // separate, per-edge accounting.
+    uint64_t streamed_trunk_bytes() const {
+        return streamed_trunk_bytes_.load(std::memory_order_relaxed);
+    }
+
     // Total EXPERT bytes streamed from disk via read_blob() since open(). This
     // counts only per-token expert-slice reads; the one-time trunk fill (which
     // goes through read_at) is intentionally excluded so this reflects
@@ -96,11 +130,19 @@ private:
     // byte-counter whose value is read only for benchmark reporting, with no
     // ordering dependency on other memory). The reported total is unchanged.
     mutable std::atomic<uint64_t>   streamed_bytes_{0};
+    // Accumulated TRUNK bytes read via read_trunk_tensor(). Separate counter so
+    // streamed_bytes() keeps its expert-only meaning. mutable+atomic for the
+    // same reasons as streamed_bytes_ (const read path, benchmark reporting).
+    mutable std::atomic<uint64_t>   streamed_trunk_bytes_{0};
     StrataSuperblock                sb_{};
     std::vector<uint8_t>            meta_;
     std::vector<ExpertIndexEntry>   index_;
     // {layer,expert} -> index into index_. Key packs layer<<32 | expert.
     std::unordered_map<uint64_t, size_t> map_;
+    // v2 trunk index: records in file order, plus name -> index into the vector
+    // for O(1) lookup. Empty for a v1 file (full-resident fallback).
+    std::vector<TrunkIndexEntry>    trunk_index_;
+    std::unordered_map<std::string, size_t> trunk_map_;
 };
 
 }  // namespace sf

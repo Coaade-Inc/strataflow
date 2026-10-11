@@ -13,6 +13,13 @@
 #                    only computable when the CLI reports TTFT and max_tokens>1.
 #   - TTFT (ms)    : time-to-first-token, reported by the CLI (FEAT-002).
 #   - resident MiB : resident model weights held in RAM (sf_runtime_stats).
+#                    With "stream the trunk" (technique 6.4) this NO LONGER
+#                    includes the two large edge tensors token_embd.weight and
+#                    output.weight: they stream from the .strata and only a
+#                    bounded working buffer counts here, so resident MiB is lower
+#                    than it was when the whole trunk was held resident. The
+#                    reduction is multi-GB on a real Mixtral/50B model and is the
+#                    dominant FIT lever (see colab/README.md "Stream the trunk").
 #   - peak RSS MiB : peak process RSS during the run.
 #   - on-disk MiB  : size of the packed .strata file.
 #   - streamed MiB : SSD bytes streamed through StrataReader (FEAT-002).

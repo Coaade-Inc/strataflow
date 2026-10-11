@@ -668,13 +668,35 @@ bool pack_gguf_to_strata(const std::string &in_path, const std::string &out_path
         return fail(err, "pad to trunk failed");
     }
     sb.trunk_offset = trunk_start;
+    // v2: record a per-trunk-tensor index entry {name, trunk-relative offset,
+    // length} in the SAME source order the bytes are copied, so a reader can
+    // locate and stream any single trunk tensor without loading the whole
+    // block. The trunk block bytes themselves are byte-for-byte unchanged vs
+    // v1 - the index is written in its own region after the expert region.
+    std::vector<TrunkIndexEntry> trunk_index;
+    trunk_index.reserve(trunk.size());
     for (const TensorInfo &t : trunk) {
+        const uint64_t rel = pos - trunk_start;  // offset before this copy
         if (!copy_range(out, src, t.src_offset, t.size, pos)) {
             std::fclose(out);
             std::fclose(src);
             gguf_free(gc);
             return fail(err, "copy trunk tensor '" + t.name + "' failed");
         }
+        TrunkIndexEntry te{};
+        // Fixed-size NUL-padded name field; refuse a name that would not fit
+        // rather than silently truncate it into an unreadable record.
+        if (t.name.size() >= sizeof(te.name)) {
+            std::fclose(out);
+            std::fclose(src);
+            gguf_free(gc);
+            return fail(err, "trunk tensor name too long for the index: '" +
+                                 t.name + "'");
+        }
+        std::memcpy(te.name, t.name.c_str(), t.name.size());
+        te.rel_offset = rel;
+        te.length = t.size;
+        trunk_index.push_back(te);
     }
     sb.trunk_size = pos - trunk_start;
 
@@ -784,6 +806,32 @@ bool pack_gguf_to_strata(const std::string &in_path, const std::string &out_path
         entry.blob_length = pos - blob_start;
     }
     sb.expert_region_size = pos - region_start;
+
+    // --- 5b. Trunk index region (v2, 4 KiB-aligned start) ------------------
+    // Written after the expert region so the trunk block and expert region
+    // keep their exact v1 byte layout; only this trailing index + the two
+    // superblock fields + the flag are new. A reader uses it to stream single
+    // trunk tensors (technique 6.4); a v1 reader never looks for it.
+    if (!trunk_index.empty()) {
+        const uint64_t trunk_index_start = align_up(pos, kIoAlignment);
+        if (!pad_to(out, trunk_index_start, pos)) {
+            std::fclose(out);
+            std::fclose(src);
+            gguf_free(gc);
+            return fail(err, "pad to trunk index failed");
+        }
+        const uint64_t trunk_index_bytes =
+            trunk_index.size() * sizeof(TrunkIndexEntry);
+        if (!write_bytes(out, trunk_index.data(), trunk_index_bytes, pos)) {
+            std::fclose(out);
+            std::fclose(src);
+            gguf_free(gc);
+            return fail(err, "write trunk index failed");
+        }
+        sb.trunk_index_offset = trunk_index_start;
+        sb.trunk_index_count = trunk_index.size();
+        sb.flags |= kStrataFlagTrunkIndexed;
+    }
 
     // --- 6. Backfill the index with real offsets ---------------------------
     if (std::fseek(out, static_cast<long>(sb.index_offset), SEEK_SET) != 0) {
