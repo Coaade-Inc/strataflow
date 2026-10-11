@@ -73,6 +73,17 @@ Two facts in that table are in tension and define the whole problem:
    entire ~18 GB expert set. **The hot working set does not fit, so the engine
    re-reads most of the model every handful of tokens.**
 
+> **Peak-RSS reconciliation (one-liner).** The ~10.6 GB above is NOT an engine
+> regression from the early runs: early / small and dense models genuinely
+> peaked low (~132 MiB on the generated-MoE demos, 785 MiB and 1177 MiB models
+> both at ~132 MiB, the real TinyLlama Q4_K_M dense run well under a couple of
+> GB). The one-time jump to ~10.6 GB came only with this real large Mixtral at
+> its FULL `n_ctx` 32768, where the F32 KV reserved 8192 MiB (8 GiB) - most of
+> the peak. KV paging (`STRATAFLOW_ENGINE_KV_WINDOW`, Ceiling A below) drops
+> that to ~128 MiB at `W` 512, byte-identically, bringing the real large-model
+> peak back toward a projected ~2.5 GB (Colab-pending, not a sandbox
+> measurement). See `ROADMAP.md` "Peak RSS over time (reconciliation)".
+
 `completed-before-use = 0` is not a bug. With 2 cores the per-layer compute
 window is smaller than the time to read the next layer's experts off the SSD, so
 the background prefetch read never finishes before the authoritative load needs

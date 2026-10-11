@@ -188,7 +188,9 @@ Honest open items:
 - Other MoE architectures (Qwen2-MoE, DeepSeek-MoE) are not yet implemented;
   only llama-arch MoE and dense llama are supported today.
 - GPU backends are structurally reachable but need real GPU hardware to
-  validate.
+  validate. Enterprise GPU acceleration - single-GPU first, then multi-GPU
+  scale-out for high-throughput serving - is planned future work, not a shipped
+  feature; the no-GPU CPU path remains the proven core.
 - No tagged release and no OpenAI-compatible HTTP server front-end yet.
 
 The mechanism is proven on real hardware; settled real large-model throughput is
@@ -198,7 +200,13 @@ being measured.
 
 - Windows, Linux and macOS.
 - CPU today (the no-GPU mission). A GPU, if present, is an optional accelerator
-  for speed - never a requirement. GPU backends are coming.
+  for speed - never a requirement. The proven path today is CPU / no-GPU.
+- Enterprise GPU deployment is planned, not shipped. Single-GPU acceleration
+  (routing hot experts, trunk and KV into VRAM as the fastest tier of the same
+  streaming engine) and multi-GPU scale-out (expert / tensor / pipeline
+  parallelism, topology-aware device placement) are on the roadmap for when GPU
+  hardware is present. This is an additional enterprise tier and does not change
+  the no-GPU mission; GPUs stay an optional accelerator.
 
 ## Try it
 

@@ -214,6 +214,60 @@ families are the remaining quant-coverage gap.
 
 ---
 
+## Peak RSS over time (reconciliation)
+
+A note to set the record straight, because the history is easy to misread. The
+recollection that "early on, when we first ran and tested the engine, peak RSS
+came out to a couple of GB or less" is CORRECT. Peak RSS did not quietly
+regress; it jumped exactly once, when a much larger real model was run at a very
+large context, and the KV-paging work has since brought it back down. Here is
+the honest timeline, grounded only in this repo's own merged measurements (see
+the "Per-layer staging no longer scales with model size" and "Lossless KV
+paging" entries above, `CHANGELOG.md`, and
+[`RESEARCH_50B_ON_A_LAPTOP.md`](./RESEARCH_50B_ON_A_LAPTOP.md) sections 1-2):
+
+- **Early / small and dense models genuinely peaked low.** The generated-MoE
+  demos measured ~132 MiB peak RSS. The bounded-staging fix (#27) recorded a
+  785 MiB model at ~132 MiB and a 1177 MiB model also at ~132 MiB. The real
+  downloaded dense model (TinyLlama-1.1B-Chat Q4_K_M, ~0.67 GB on disk) ran end
+  to end on the free Colab box with coherent output at a low peak well under a
+  couple of GB. So "early tests peaked around a couple GB or less" is accurate.
+  As the staging entry explains, the ~132 MiB figure is largely the FIXED
+  llama/ggml backend + vocab process floor; the quantities that actually move
+  with model and budget are StrataFlow's own resident weights, the resident KV,
+  and the bytes streamed per token.
+
+- **The jump to ~10.6 GB peak RSS came ONLY with the real large Mixtral-8x7B
+  Q3_K_M at its FULL trained context `n_ctx` 32768.** This was not an engine
+  regression and not the trunk or the bounded experts. It was measured
+  byte-for-byte: the KV cache was reserved for the full 32768-token context in
+  F32, which is `n_layer` 32 x 2 (K and V) x `n_ctx` 32768 x `floats_per_col`
+  1024 x 4 B = 8,589,934,592 bytes, i.e. 8192 MiB (8 GiB) resident KV - the
+  overwhelming majority of the ~10.6 GB peak. The trunk stayed small (~939 MiB
+  resident) and the experts stayed bounded. In other words, a far larger model
+  AT A VERY LARGE CONTEXT was run; the resident floor did not creep up on the
+  small models.
+
+- **KV paging (#42) plus the real-scale cold-store fix (#43) address exactly
+  this.** With a bounded KV window (`STRATAFLOW_ENGINE_KV_WINDOW`, e.g. 512) the
+  resident KV drops proportionally (`W/n_ctx`): for Mixtral at `W` 512 that is
+  ~128 MiB instead of 8192 MiB, about 8 GB lower, with decode byte-identical to
+  the full-resident path. That restores the "~2 GB" regime for a real large
+  model: the projected post-fix peak RSS on the real Mixtral run is ~2.5 GB.
+  Keep this HONEST: ~2.5 GB is the EXPECTED / projected number pending the
+  user's Colab re-run (RUN 2 in `colab/README.md`); it is Colab-measured
+  territory, not a sandbox measurement, so it is a projection to confirm, not a
+  confirmed sandbox figure. The in-sandbox proof is the byte-identity and the
+  `W/n_ctx` resident-KV reduction on the fixtures, not the absolute GB on real
+  hardware.
+
+Bottom line: the early couple-of-GB-or-less recollection is right; the one-time
+spike to ~10.6 GB was KV reserved at full 32768 context on a real large model;
+KV paging brings a real large model back toward ~2.5 GB (projected,
+Colab-pending), byte-identical.
+
+---
+
 ## Open (not done)
 
 These are the honest gaps. None are blocked by GPU hardware except where noted;
@@ -324,11 +378,48 @@ most are pure CPU/disk work.
 
 ### Breadth and performance
 
-- [ ] **GPU / multi-backend execution.** CPU + a GPU buffer type via
-  `ggml_backend_sched`. The engine already runs on a swappable ggml backend, so
-  this is structurally reachable, but it cannot be validated on the CPU-only CI
-  or sandbox - it needs real GPU hardware. Optional accelerator, not required for
-  the no-GPU mission.
+- [ ] **Enterprise / multi-GPU execution (future work, nothing implemented
+  yet).** The no-GPU laptop path stays the core mission and the proven
+  differentiator; this is an ADDITIONAL enterprise tier that uses GPUs when they
+  are present. A GPU remains an OPTIONAL accelerator, never a requirement, and
+  none of the items below are built or validated yet. The whole track can only
+  be validated on real GPU hardware - it cannot be tested on the CPU-only CI or
+  sandbox - mirroring the honest caveat the single GPU bullet always carried.
+  It is a large, hardware-dependent track, orthogonal to the current CPU/disk
+  fit-and-speed levers in
+  [`RESEARCH_50B_ON_A_LAPTOP.md`](./RESEARCH_50B_ON_A_LAPTOP.md); sequence it
+  accordingly (after the lossless CPU/disk levers that make a 50B-class model
+  fit and run on the no-GPU box).
+
+  - [ ] **Single-GPU acceleration first.** Route the hot experts, the hot trunk
+    and the KV cache into VRAM via a GPU ggml backend using
+    `ggml_backend_sched` (CPU + a GPU buffer type). This is NOT a separate code
+    path: VRAM is already the TOP tier in the engine's design - the tiered
+    weight store spans VRAM, RAM and SSD (see
+    [`ENGINE_CORE_DESIGN.md`](./ENGINE_CORE_DESIGN.md) sections 2.4 and 3.5, the
+    `ggml_backend_sched` plan and the SSD->RAM / RAM->VRAM transfer nodes, and
+    the strata/flow VRAM-RAM-SSD diagram). So the GPU becomes simply the FASTEST
+    tier of the same streaming engine: the same residency and byte-provenance
+    discipline, just with VRAM as the destination. Structurally reachable
+    because the engine already runs on a swappable ggml backend; still needs
+    real GPU hardware to validate.
+  - [ ] **Multi-GPU parallelism.** Expert / tensor / pipeline parallelism across
+    devices; a device-placement policy deciding which layers and experts live on
+    which GPU; NVLink / PCIe topology-aware placement so transfers follow the
+    fast links; overlapping GPU compute with the SSD->RAM->VRAM prefetch and
+    streaming the engine already does; and multi-GPU KV placement so the paged
+    KV cache can be split across devices. All future work.
+  - [ ] **Enterprise serving concerns (named as goals, not built).** High
+    throughput with batching and concurrent requests; the planned
+    OpenAI-compatible HTTP server front-end as the serving entry point (already
+    an open item below - this track connects to it); observability (metrics for
+    residency, streamed bytes, VRAM/RAM occupancy, per-request latency); and
+    running the largest models (100B-1T) FAST when the hardware is present. None
+    of these exist yet; they define the enterprise target, not current state.
+
+  This track does NOT change the no-GPU mission. It is an additional tier for
+  enterprise deployment on GPU hardware, layered on the same engine, and
+  validated only where real GPUs exist.
 - [ ] **More architectures.** Only llama-arch MoE and dense llama are supported.
   Qwen-MoE (shared expert + per-expert gate), DeepSeek-style (expert groups,
   shared experts, sigmoid gating with group-limited top-k), and others are each
