@@ -334,12 +334,23 @@ int main(int argc, char **argv) {
     }
     const int64_t n_vocab = static_cast<int64_t>(toks.size());
 
-    // Generously sized data contexts (one per output file) for the quantized
-    // bytes + ggml tensor overhead.
+    // Generously sized data contexts (one per output file) for the tensor
+    // bytes + ggml tensor overhead. The budget must cover BOTH the experts
+    // (n_embd * n_ff per kind, 3 kinds, n_expert, n_layer) AND the trunk
+    // (token_embd/output at n_embd * n_vocab, and the per-layer attention
+    // projections at ~n_embd^2 each). The per-element cost is 4 bytes for F32
+    // and smaller for the K-quants, so sizing at the F32 upper bound (4 bytes
+    // per element) covers every qtype. An extra 2x fudge absorbs ggml object
+    // overhead and keeps older callers' pools unchanged (they still clamp to
+    // the 512 MiB floor below).
     size_t mem = 512u * 1024u * 1024u;
-    const size_t need = static_cast<size_t>(n_embd) * static_cast<size_t>(n_ff) *
-                        static_cast<size_t>(n_expert) * static_cast<size_t>(n_layer) *
-                        4u * 4u;
+    const size_t expert_elems = static_cast<size_t>(n_embd) * static_cast<size_t>(n_ff) *
+                                3u * static_cast<size_t>(n_expert) *
+                                static_cast<size_t>(n_layer);
+    const size_t attn_elems = static_cast<size_t>(n_embd) * static_cast<size_t>(n_embd) *
+                              4u * static_cast<size_t>(n_layer);
+    const size_t edge_elems = 2u * static_cast<size_t>(n_embd) * static_cast<size_t>(n_vocab);
+    const size_t need = (expert_elems + attn_elems + edge_elems) * 4u * 2u;
     if (need > mem) mem = need;
     ggml_init_params ip{};
     ip.mem_size = mem;

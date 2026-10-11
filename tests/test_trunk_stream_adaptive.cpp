@@ -30,12 +30,20 @@
 //      and assert it is byte-identical to the NO_TRUNK_STREAM baseline on the
 //      SAME .strata and within tolerance of the oracle. This exercises packer
 //      -> .strata -> load_strata_model -> planner -> engine allocation, not a
-//      synthetic ModelShape.
+//      synthetic ModelShape. This half uses an F32 fixture so the SOFT oracle
+//      bound is a tiny floating-point-noise margin (< 1e-2, measured ~2.5e-3)
+//      rather than the thin < 1e-1 ceiling a random-weight q4_k fixture needed
+//      (it sat at ~9.1e-2); the HARD proof is still the engine-vs-engine 0.0
+//      gate below.
 //
-// Generate + run locally (half A on the tiny F32 MoE, half B on an attention-
-// trunk-dominated fixture whose small trunk the tight budget forces to stream):
+// Generate + run locally. Half A runs on the tiny F32/K-quant MoE fixtures.
+// Half B needs an F32 attention-trunk-dominated fixture whose full trunk the
+// simulated tight budget (kSimRamBudget) forces to stream; n_embd=2048,
+// n_layer=10, head_dim=128 (n_head=16, n_head_kv=1) gives a ~338 MB F32
+// attention trunk that overflows the ~1.27 GiB budget, forcing a bounded hot
+// pool (measured trunk_pool_layers=2 of 10):
 //   build/release/bin/make-legacy-moe-gguf TS.gguf TS.stacked.gguf
-//       4096 256 10 4 q4_k 2048 1 128
+//       2048 256 10 4 f32 2048 1 128
 //   STRATAFLOW_TEST_TRUNK_STREAM_GGUF=TS.gguf
 //   STRATAFLOW_TEST_TRUNK_STREAM_STACKED_GGUF=TS.stacked.gguf
 //       ctest -R test_trunk_stream_adaptive
@@ -283,10 +291,13 @@ static void test_adaptive_trunk_kquant() {
 
 // --- half B: planner budget-driven decision on the real load path ----------
 
-// Simulated tight budget: below the attention-trunk-dominated fixture's full
-// resident trunk + the other mandatory costs, so the planner MUST stream the
-// per-layer attention projections. Documented alongside the fixture geometry at
-// the top of this file.
+// Simulated tight budget: below the attention-trunk-dominated F32 fixture's
+// full resident trunk + the other mandatory costs, so the planner MUST stream
+// the per-layer attention projections. With the documented fixture geometry
+// (n_embd=2048, n_layer=10, F32 => ~338 MB attention trunk) this budget forces
+// a bounded hot pool strictly inside (0, n_layers). Documented alongside the
+// fixture geometry at the top of this file; if a future fixture change stops
+// forcing streaming, the hard CHECK in the test (not a silent skip) trips.
 static constexpr uint64_t kSimRamBudget = 1300ull * 1024 * 1024;  // ~1.27 GiB
 
 static HardwareProfile tight_profile() {
@@ -421,12 +432,15 @@ static void test_adaptive_trunk_budget_driven_real_path() {
     // HARD gate: the plan-driven per-layer trunk streaming is bit-identical to
     // the fully-resident decode on the SAME file (only byte provenance differs).
     CHECK(esd == 0.0);
-    // SOFT oracle bound: libllama (stacked q4_k GGUF) vs OUR engine (.strata
-    // regrouped from the legacy per-expert GGUF). The engine-vs-engine gate
-    // above is the lossless proof; the oracle is a quant-noise bound. The Q4_K
-    // soft baseline elsewhere is 5e-2; a random-weight fixture spikes slightly
-    // above, so allow 1e-1 (a small multiple). F32 would hold < 1e-3.
-    CHECK(osd < 1e-1);
+    // SOFT oracle bound: libllama (the matched STACKED GGUF) vs OUR engine (the
+    // .strata regrouped from the legacy per-expert GGUF). The engine-vs-engine
+    // 0.0 gate above is the lossless proof; the oracle is a numeric-noise bound.
+    // This half runs on an F32 fixture (no quantization), so the only delta is
+    // floating-point reduction-order noise, which holds comfortably below 1e-2
+    // (measured ~2.5e-3) - far more headroom than the <1e-1 bound a random-
+    // weight q4_k fixture needed (it sat at ~9.1e-2, a thin margin that could
+    // flake on a different seed/platform).
+    CHECK(osd < 1e-2);
 
     std::remove(strata_path.c_str());
 }
