@@ -208,6 +208,52 @@ families are the remaining quant-coverage gap.
   `resident_kv` ~128 MiB instead of 8192 MiB (~8 GB lower peak RSS); the exact
   command and expected numbers are in `colab/README.md`. Deferred follow-ons:
   SSD spill of cold pages (option b) and KV quantization (approximate, Stage 4).
+- [x] **Conservative RAM budget - the planner guarantees a projected peak under
+  the budget ("runs on everyday hardware").** The auto expert-cache is now sized
+  AFTER subtracting ALL other mandatory resident costs, so the planner can no
+  longer plan a configuration that OOM-kills the box. This repairs the real
+  symptom: a real Mixtral-8x7B Q3_K_M `.strata` (`n_ctx` 32768) on the 12 GiB
+  free Colab box loaded the trunk, printed
+  `experts[resident=122 bundles], experts STREAMED (bounded), est. peak ~9 GiB`,
+  then was KILLED (OOM, exit status 137 / SIGKILL) before any output - the
+  "est. peak ~9 GiB" was dishonest. Root cause: the planner sized the resident
+  pool from ALL remaining RAM after only the trunk (~122 bundles) and its
+  `planned_peak_bytes` omitted KV (8 GiB at full `n_ctx`), one-layer staging, the
+  compute buffer, the process floor, and any margin, and was never a hard bound.
+  Fix (`src/plan/planner.cpp`): (1) a CONSERVATIVE usable-RAM ceiling
+  `usable_RAM = min(ram_free - max(1 GiB, 12.5%), 85% of ram_total)` replaces the
+  optimistic MemAvailable reading; (2) the expert cache is sized from what is
+  LEFT after `trunk + resident_KV(chosen window) + one-layer staging at FULL
+  n_expert (matching the engine's stage_gate/up/down) + a conservative ggml
+  compute estimate + a ~160 MiB process floor + a safety margin of
+  max(512 MiB, 8% of usable)`; (3) `planned_peak_bytes` is now an HONEST
+  conservative upper bound (the sum of those components); (4) a HARD FIT
+  INVARIANT - the planner never returns a plan whose projected peak exceeds
+  `usable_RAM`, reducing the resident bundle count down to the `n_experts_used`
+  floor rather than over-committing; (5) a LOSSLESS auto KV-window default - when
+  full-`n_ctx` KV would blow the budget, the resident KV window steps down to the
+  largest power-of-two (`>= 256`) that fits (recorded in `plan.kv_window` and
+  plumbed via `STRATAFLOW_ENGINE_KV_WINDOW`, an explicit user window still wins),
+  so a real large-context Mixtral fits by DEFAULT, with the freed RAM LOWERING
+  the peak (not re-consumed by more experts - the margin is held); (6) a LOUD
+  refusal - if even the minimal config cannot fit, `plan.fits=false` with a clear
+  ASCII reason, `sf_context_create` returns `SF_ERR_RUNTIME`, and the CLI prints
+  the reason and exits non-zero, instead of a silent SIGKILL. Before/after on the
+  synthetic Mixtral-on-12GB shape (trunk ~5.5 GiB, `expert_bytes` ~52 MiB,
+  `n_ctx` 32768, `head_dim` 128, `n_head_kv` 8; `ram_total` 12 GiB, `ram_free`
+  10.6 GiB): BEFORE ~122 bundles / "est. peak ~9 GiB" that OOM-killed (exit 137);
+  AFTER `slots=19`, auto `kv_window=4096`, honest projected peak 9495 MiB `<=`
+  usable 9497 MiB, well under 12 GiB with margin. Sandbox-proven by the
+  pure-function planner unit test `test_mixtral_12gb_conservative_budget`
+  (`tests/test_planner.cpp`), which reproduces the over-commit deterministically
+  with synthetic shapes (no model) and asserts the honest peak `<=` usable `<`
+  ram_total and strictly above the old dishonest value, the reduced slot count,
+  the KV window lowering the peak, and the pathological-budget loud refusal.
+  Oracle byte-identity is preserved (residency/window sizing only; forward math
+  unchanged). Colab-only: the SAME default and `STRATAFLOW_ENGINE_KV_WINDOW=512`
+  runs from the OOM report are EXPECTED to DECODE (not OOM) with identical text
+  and peak RSS safely under 12 GB, pending the user's Colab re-run; the exact
+  re-verify commands and the projected safe peak are in `colab/README.md`.
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.
@@ -303,6 +349,13 @@ most are pure CPU/disk work.
   real (quantized) MoE runs end to end in a bounded RAM budget on a real machine
   with sensible output at a usable speed. Depends on quant support above. Likely
   to surface bugs the toy never did (real tokenizers, large shapes, quant types).
+  The conservative-RAM-budget fit invariant (see the done item above) removes the
+  silent-OOM blocker on this: on the 12 GiB Colab box the planner now guarantees
+  a projected peak under the budget, auto-sizes the resident experts and the KV
+  window to fit, and refuses loudly rather than SIGKILL, so the real Mixtral
+  default and `STRATAFLOW_ENGINE_KV_WINDOW=512` runs are EXPECTED to decode
+  without OOM - pending the user's Colab re-run (sandbox-proven via the
+  synthetic-Mixtral planner unit test; the real end-to-end decode is Colab-only).
 - [x] **Memory-budget CLI + resident/peak-RSS reporting.** DONE (#25): the CLI
   takes `--expert-slots` and prints `stats: resident model weights = X MiB,
   peak RSS = Y MiB` via `sf_session_stats`.

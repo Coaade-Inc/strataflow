@@ -21,6 +21,17 @@ struct ModelShape {
     uint64_t    trunk_bytes   = 0;   // always-active weights
     uint64_t    expert_bytes  = 0;   // one expert's weights (per layer)
     uint64_t    total_bytes   = 0;
+
+    // KV-cache sizing inputs (FEAT-002). These let the planner estimate the
+    // engine's REAL resident KV footprint so the expert cache is sized against
+    // a budget that already subtracts the KV cost. They mirror the engine's
+    // EngineHParams (n_ctx_orig / head_dim / n_head_kv). 0 means "unknown": the
+    // planner then falls back to a conservative KV estimate that never
+    // UNDER-counts (see plan_placement). Populated by the model loader on both
+    // the plain-GGUF and .strata paths.
+    uint32_t    n_ctx         = 0;   // trained context length (llama.context_length)
+    uint32_t    head_dim      = 0;   // n_embd / n_head
+    uint32_t    n_head_kv     = 0;   // KV heads (llama.attention.head_count_kv)
 };
 
 struct PlacementPlan {
@@ -41,6 +52,39 @@ struct PlacementPlan {
 
     bool     stream_experts    = false;  // true when experts don't all fit
     uint64_t planned_peak_bytes = 0;
+
+    // FEAT-002 conservative-budget fields.
+    //
+    // kv_window is the CHOSEN resident KV window (ring column count W) the plan
+    // recommends. 0 means "full n_ctx" (the engine default, byte-identical, no
+    // paging). A non-zero value < n_ctx is a LOSSLESS auto window picked when
+    // the full-n_ctx KV would blow the budget: cold positions page to the RAM
+    // cold store and are re-assembled byte-identically. sf_context_create
+    // plumbs this to the engine via STRATAFLOW_ENGINE_KV_WINDOW (an explicit
+    // user value still wins).
+    uint32_t    kv_window = 0;
+
+    // fits is false when even the MINIMAL configuration (one layer's top-k
+    // resident + the smallest safe KV window + the trunk) still projects a peak
+    // over the usable-RAM budget. When false, refusal_reason carries a clear
+    // ASCII message naming the shortfall and the plan is NOT safe to run; the C
+    // ABI turns this into an error (SF_ERR_RUNTIME) and the CLI prints the
+    // reason and exits non-zero, instead of handing back an over-committing
+    // plan that the OS then SIGKILLs.
+    bool        fits = true;
+    std::string refusal_reason;
+
+    // Honest budget breakdown behind planned_peak_bytes, so to_summary() and
+    // the tests can read exactly what the conservative estimate charged. All in
+    // bytes. usable_ram_bytes is the conservative RAM ceiling the fit invariant
+    // holds against (planned_peak_bytes <= usable_ram_bytes for any non-refused
+    // plan).
+    uint64_t    usable_ram_bytes = 0;
+    uint64_t    kv_resident_bytes = 0;
+    uint64_t    staging_bytes    = 0;   // one layer at FULL n_expert
+    uint64_t    compute_bytes    = 0;   // conservative ggml compute estimate
+    uint64_t    process_floor_bytes = 0;
+    uint64_t    safety_margin_bytes = 0;
 
     std::string to_summary() const;
 };
