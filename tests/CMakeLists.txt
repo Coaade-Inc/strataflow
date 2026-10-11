@@ -22,6 +22,15 @@ sf_add_test(test_async_io)
 sf_add_test(test_engine_oracle)
 sf_add_test(test_strata_decode)
 
+# test_trunk_stream is the FEAT-003 "stream the trunk" gate (technique 6.4): it
+# packs a fixture to a v2 trunk-indexed .strata and proves the trunk-streaming
+# decode is byte-identical to the fully-resident decode (same file, toggled via
+# STRATAFLOW_ENGINE_NO_TRUNK_STREAM) and to the libllama oracle, on both an F32
+# and a K-quant fixture; it also asserts resident_weight_bytes drops with
+# streaming and that a v1 .strata still opens with no trunk index. Drives only
+# the library (pack + engine + reader + oracle), so a plain sf_add_test suffices.
+sf_add_test(test_trunk_stream)
+
 # test_mixtral_faithful_pack additionally synthesizes a misnamed-MoE GGUF
 # in-process (the Defect-1 loud-failure negative assertion), so it needs the
 # ggml/gguf writer headers. ggml is linked PRIVATE into StrataFlow and does not

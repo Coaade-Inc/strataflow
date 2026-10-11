@@ -380,7 +380,24 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
     // Trunk streaming is gated on a v2 .strata that carries a per-trunk-tensor
     // index: without it we cannot locate a single trunk tensor, so we fall back
     // to the fully-resident trunk (v1 .strata and plain GGUF are unchanged).
+    //
+    // Test-only escape hatch (STRATAFLOW_ENGINE_NO_TRUNK_STREAM=1), following
+    // the STRATAFLOW_ENGINE_GLOBAL_LRU / STRATAFLOW_ENGINE_ASYNC_PREFETCH knob
+    // pattern: force the fully-resident trunk even on a v2 .strata, so a test
+    // can load the SAME file both ways and prove the trunk-streaming decode is
+    // byte-identical to the fully-resident decode (and that resident bytes
+    // drop). When set, token_embd.weight and output.weight go into wctx (resident)
+    // exactly like a v1 file, and no per-forward trunk fetch is issued.
     im.trunk_streaming = reader->has_trunk_index();
+    {
+        const char *no_stream = std::getenv("STRATAFLOW_ENGINE_NO_TRUNK_STREAM");
+        if (no_stream != nullptr &&
+            (no_stream[0] == '1' || no_stream[0] == 'o' || no_stream[0] == 'O' ||
+             no_stream[0] == 'y' || no_stream[0] == 'Y' || no_stream[0] == 't' ||
+             no_stream[0] == 'T')) {
+            im.trunk_streaming = false;
+        }
+    }
     {
         ggml_init_params ip{};
         ip.mem_size = ggml_tensor_overhead() *
