@@ -275,11 +275,64 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
 
     const uint64_t compute = compute_estimate_bytes(model, chosen_window);
 
+    // FEAT-003 ADAPTIVE PER-LAYER TRUNK STREAMING (technique 6.4). After the KV
+    // window, the dominant resident cost on a tight box is the per-layer
+    // attention trunk (attn_trunk_bytes, the q/k/v/output projections summed
+    // over all layers, part of trunk_in_ram). If the full-resident trunk plus
+    // the minimal expert floor + KV(window) + staging + compute + floor +
+    // margin still overflows the budget, STREAM the per-layer attention
+    // projections and keep only a BOUNDED HOT pool of `trunk_pool_layers`
+    // layers resident, so the resident attention-trunk footprint drops from all
+    // n_layers to the pool. The decision is BUDGET-DRIVEN: a big-RAM box keeps
+    // the whole trunk resident (pool stays 0 = stream nothing); a tight box
+    // streams it hard (pool as low as 1). HONEST TRADEOFF: these weights are
+    // touched every token, so streaming adds per-token SSD traffic and is
+    // slower on a slow box - accepted because the FIRST goal is to FIT small.
+    //
+    // We only stream the part of trunk_in_ram that is the per-layer attention
+    // projections; the rest of the trunk (edge tensors, norms, router) stays as
+    // accounted in trunk_in_ram. per_layer_attn is the hot-pool slot cost.
+    const uint64_t attn_trunk_total =
+        model.n_layers ? std::min(model.attn_trunk_bytes, trunk_in_ram) : 0;
+    const uint64_t per_layer_attn =
+        model.n_layers ? attn_trunk_total / model.n_layers : 0;
+    uint32_t trunk_pool_layers = 0;      // 0 = whole trunk resident (no stream)
+    uint64_t trunk_in_ram_eff = trunk_in_ram;  // trunk RAM after any streaming
+    if (per_layer_attn > 0) {
+        // Fixed resident costs that do NOT depend on the trunk pool, at the
+        // chosen KV window and the minimal expert floor. If even the full
+        // trunk + this minimum overflows, stream the attention trunk.
+        const uint64_t non_attn_trunk =
+            trunk_in_ram > attn_trunk_total ? trunk_in_ram - attn_trunk_total : 0;
+        const uint64_t fixed_wo_attn = non_attn_trunk + kv_resident + staging +
+                                       compute + process_floor + margin +
+                                       lower_experts * per_bundle;
+        if (fixed_wo_attn + attn_trunk_total > usable) {
+            // Largest pool (most layers hot) whose peak still fits; floor 1 so a
+            // tight box still runs (the engine's resident-before-op load is the
+            // correctness backstop). The remaining room after the fixed costs
+            // sets the pool depth.
+            const uint64_t room =
+                usable > fixed_wo_attn ? usable - fixed_wo_attn : 0;
+            uint64_t fit_layers = room / per_layer_attn;  // layers that fit hot
+            if (fit_layers >= model.n_layers) {
+                // Everything fits hot after all: no need to stream.
+                trunk_pool_layers = 0;
+            } else {
+                if (fit_layers < 1) fit_layers = 1;  // keep at least one hot
+                trunk_pool_layers = static_cast<uint32_t>(fit_layers);
+                trunk_in_ram_eff = non_attn_trunk +
+                                   per_layer_attn * trunk_pool_layers;
+            }
+        }
+    }
+
     // Size the expert cache from the REMAINDER after every other mandatory
     // resident cost (the conservative budget). This REPLACES the old
-    // ram_for_experts = vram_left + ram.
+    // ram_for_experts = vram_left + ram. trunk_in_ram_eff reflects any
+    // FEAT-003 trunk streaming (the bounded hot pool instead of the full trunk).
     const uint64_t reserved =
-        trunk_in_ram + kv_resident + staging + compute + process_floor + margin;
+        trunk_in_ram_eff + kv_resident + staging + compute + process_floor + margin;
     uint64_t available_for_experts = usable > reserved ? usable - reserved : 0;
     // VRAM is a separate pool; a VRAM expert cache adds to what RAM affords.
     available_for_experts += vram_left;
@@ -320,10 +373,19 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
     plan.process_floor_bytes = process_floor;
     plan.safety_margin_bytes = margin;
 
-    // HONEST, CONSERVATIVE peak: trunk-in-RAM + resident experts + KV(chosen
-    // window) + one-layer staging at full n_expert + compute + floor + margin.
+    // FEAT-003: surface the trunk-streaming decision and the bounded hot-trunk
+    // working set the peak accounts for (per_layer_attn * pool when streaming,
+    // else the full attention trunk resident).
+    plan.trunk_pool_layers = trunk_pool_layers;
+    plan.trunk_resident_bytes = trunk_pool_layers > 0
+                                    ? per_layer_attn * trunk_pool_layers
+                                    : attn_trunk_total;
+
+    // HONEST, CONSERVATIVE peak: trunk-in-RAM (hot pool if streaming) +
+    // resident experts + KV(chosen window) + one-layer staging at full
+    // n_expert + compute + floor + margin.
     const uint64_t resident_experts = slots * per_bundle;
-    plan.planned_peak_bytes = trunk_in_ram + resident_experts + kv_resident +
+    plan.planned_peak_bytes = trunk_in_ram_eff + resident_experts + kv_resident +
                               staging + compute + process_floor + margin;
 
     // FIT INVARIANT: for a returned non-refused plan, planned_peak_bytes <=
@@ -342,7 +404,7 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
         os << ") projects peak " << (plan.planned_peak_bytes / kMiB)
            << " MiB, which is " << (over / kMiB) << " MiB over the usable RAM "
            << (usable / kMiB) << " MiB. Dominant components: trunk-in-RAM "
-           << (trunk_in_ram / kMiB) << " MiB, experts "
+           << (trunk_in_ram_eff / kMiB) << " MiB, experts "
            << (resident_experts / kMiB) << " MiB, KV " << (kv_resident / kMiB)
            << " MiB, staging " << (staging / kMiB) << " MiB, compute "
            << (compute / kMiB) << " MiB, floor " << (process_floor / kMiB)
@@ -376,6 +438,11 @@ std::string PlacementPlan::to_summary() const {
     // Colab plan line shows the conservative decision.
     if (kv_window > 0) {
         os << ", kv window=" << kv_window;
+    }
+    // FEAT-003: when the per-layer attention trunk streams, surface the bounded
+    // hot-trunk pool depth so the Colab plan line shows the FIT decision.
+    if (trunk_pool_layers > 0) {
+        os << ", trunk stream[hot=" << trunk_pool_layers << " layers]";
     }
     // Report the peak at the largest unit that does not floor to 0, so small
     // fixtures read truthfully instead of showing "~0 GiB".

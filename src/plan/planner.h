@@ -22,6 +22,17 @@ struct ModelShape {
     uint64_t    expert_bytes  = 0;   // one expert's weights (per layer)
     uint64_t    total_bytes   = 0;
 
+    // FEAT-003: total bytes of the STREAMABLE per-layer attention projections
+    // (blk.N.attn_q/k/v/output.weight summed across all layers). This is the
+    // part of trunk_bytes the engine can stream with a bounded hot pool
+    // (technique 6.4); the remaining trunk (token_embd/output edge tensors,
+    // per-layer norms, router) stays resident or is the separately-streamed
+    // edge pair. 0 means "unknown / nothing streamable" and the planner keeps
+    // the whole trunk resident. Populated by the model loader on the .strata
+    // path (summed from the v2 trunk index) and left 0 on paths where the
+    // breakdown is not available (the planner then never streams the trunk).
+    uint64_t    attn_trunk_bytes = 0;
+
     // KV-cache sizing inputs (FEAT-002). These let the planner estimate the
     // engine's REAL resident KV footprint so the expert cache is sized against
     // a budget that already subtracts the KV cost. They mirror the engine's
@@ -63,6 +74,30 @@ struct PlacementPlan {
     // plumbs this to the engine via STRATAFLOW_ENGINE_KV_WINDOW (an explicit
     // user value still wins).
     uint32_t    kv_window = 0;
+
+    // FEAT-003 (technique 6.4, adaptive per-layer trunk streaming). After the
+    // KV window the dominant resident cost on a tight box is the per-layer
+    // attention trunk (q/k/v/output projections across every layer). When the
+    // conservative budget cannot hold the full trunk resident alongside the KV
+    // window + experts + staging + compute + floor + margin, the plan streams
+    // the per-layer attention projections and keeps only a BOUNDED HOT set
+    // resident. trunk_pool_layers is the number of layers' worth of
+    // projections the engine keeps resident at once (the hot-trunk ring depth):
+    //   0  = do NOT stream the per-layer trunk (whole trunk resident; the
+    //        big-RAM / small-model default, byte-identical, no per-token trunk
+    //        SSD traffic).
+    //   >0 = stream the per-layer attention projections with this many layers
+    //        hot (as low as 1 on a very tight box). HONEST TRADEOFF: these
+    //        weights are touched EVERY token, so streaming them adds per-token
+    //        SSD traffic and is slower on a slow box - accepted because the
+    //        FIRST goal is to FIT small. The engine applies it via
+    //        Engine::load's trunk_pool_layers parameter (plumbed through
+    //        GgmlModel), NOT an env side-channel.
+    // trunk_resident_bytes is the bounded hot-trunk working set the peak
+    // accounts for (per_layer_attn_trunk * trunk_pool_layers) when streaming,
+    // else the full attention-trunk bytes.
+    uint32_t    trunk_pool_layers = 0;
+    uint64_t    trunk_resident_bytes = 0;
 
     // fits is false when even the MINIMAL configuration (one layer's top-k
     // resident + the smallest safe KV window + the trunk) still projects a peak
