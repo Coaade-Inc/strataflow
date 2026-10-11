@@ -59,6 +59,14 @@ ggml_tensor *get_weight(ggml_context *wctx, const std::string &name) {
     return t;
 }
 
+// FEAT-002 (technique 6.4): the trunk tensors we STREAM instead of keeping
+// resident. They are the two LARGE, edge-touched vocab x n_embd tensors read
+// exactly once per token (input embedding + output head). Everything else in
+// the trunk (per-layer attention/norms/router) is HOT and stays resident.
+bool is_streaming_trunk_tensor(const std::string &name) {
+    return name == "token_embd.weight" || name == "output.weight";
+}
+
 } // namespace
 
 // Private state: the resident weight context (ggml owns + fills the tensors via
@@ -248,6 +256,38 @@ struct Engine::Impl {
     // differs, which keeps decode byte-identical (same bytes, same ops).
     std::unique_ptr<StrataReader> reader;
     ggml_backend_buffer_t wbuf = nullptr;  // backing for wctx on the .strata path
+
+    // ---- FEAT-002: stream the trunk (technique 6.4) -----------------------
+    // The two LARGE, edge-touched trunk tensors - token_embd.weight (input
+    // embedding) and output.weight (lm_head) - are each vocab x n_embd and
+    // read exactly ONCE per token at the input/output edges. On a v2 .strata
+    // with a trunk index we DO NOT keep them resident in wctx/wbuf; instead
+    // they live in a small dedicated context (tctx) and share ONE owned backing
+    // buffer (trunk_stream_buf) sized to the larger of the two, and their bytes
+    // are fetched synchronously from the .strata trunk block
+    // (reader->read_trunk_tensor) into that stable buffer
+    // IMMEDIATELY BEFORE the segment that reads them, mirroring the expert
+    // path's 'resident before the op is built' discipline. The HOT per-layer
+    // attention/norm/router trunk tensors stay fully resident in wctx, so there
+    // is no hot-path throughput regression. tctx is empty (and streaming off)
+    // for a v1 .strata or a plain GGUF, so those paths are byte-identical to
+    // before. The fetch runs ONLY on the compute thread; the async prefetch
+    // worker and the SlotPool are never involved in trunk streaming.
+    ggml_context *tctx = nullptr;              // streamed trunk tensors (metadata only)
+    bool trunk_streaming = false;              // v2 .strata with a trunk index
+    ggml_tensor *stream_tok_embd = nullptr;    // token_embd.weight, when streaming
+    ggml_tensor *stream_lm_head  = nullptr;    // output.weight, when streaming
+    // ONE shared working buffer for BOTH streamed edge tensors. token_embd and
+    // output.weight are read in DISJOINT segments (the first embedding segment
+    // and the final lm_head segment), never concurrently, so a single buffer
+    // sized to the LARGER of the two is a correct, stable graph-leaf backing
+    // that both tensors' ->data point into. This bounds the streamed-trunk
+    // resident floor to ONE edge tensor's size instead of two - the measurable
+    // FIT win vs holding both resident (and vs a per-tensor buffer that would
+    // not drop on a fixture where the two tensors are equal size). The buffer
+    // is refilled from disk immediately before each segment, so sharing it
+    // across the two segments never races a read against a stale op.
+    std::vector<uint8_t> trunk_stream_buf;     // bounded resident floor for the edge tensors
     // .strata path only: expert tensors live here as METADATA ONLY (no_alloc,
     // never backed by a buffer), so the full expert footprint is NOT resident
     // in RAM - the whole point of streaming. The SlotPool streams each routed
@@ -281,6 +321,8 @@ struct Engine::Impl {
         if (kvctx != nullptr) ggml_free(kvctx);
         if (wbuf != nullptr) ggml_backend_buffer_free(wbuf);
         if (wctx != nullptr) ggml_free(wctx);
+        if (tctx != nullptr) ggml_free(tctx);  // no backend buffer: data points
+                                               // into trunk_stream_buf (owned)
         if (ectx != nullptr) ggml_free(ectx);  // no buffer: metadata only
         if (gc != nullptr) gguf_free(gc);
     }
@@ -325,11 +367,20 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
     // Build a no_alloc context holding every tensor's metadata (name/shape/
     // type) mirrored from the embedded GGUF tensor-info. ggml_new_tensor copies
     // the ne-shape; we set the name so get_weight(name) resolves downstream.
-    // Two contexts: wctx holds the TRUNK tensors (allocated resident); ectx
-    // holds the EXPERT tensors as metadata only (no_alloc, never backed), so
-    // the full expert footprint is NOT resident in RAM. This is the bounded-RAM
-    // guarantee: a huge MoE allocates only trunk + the SlotPool here, and the
-    // experts stream from the .strata file on demand.
+    // Three contexts: wctx holds the RESIDENT trunk tensors (allocated
+    // resident); ectx holds the EXPERT tensors as metadata only (no_alloc,
+    // never backed), so the full expert footprint is NOT resident in RAM; tctx
+    // (FEAT-002) holds the two STREAMED trunk tensors (token_embd.weight +
+    // output.weight) with their own small bounded buffer, so their multi-GB
+    // (at 50B scale) edge cost is NOT held resident in wbuf. This is the
+    // bounded-RAM guarantee: a huge MoE allocates only the HOT resident trunk +
+    // the two streamed edge tensors + the SlotPool here, and the experts (and
+    // now the edge tensors) stream from the .strata file on demand.
+    //
+    // Trunk streaming is gated on a v2 .strata that carries a per-trunk-tensor
+    // index: without it we cannot locate a single trunk tensor, so we fall back
+    // to the fully-resident trunk (v1 .strata and plain GGUF are unchanged).
+    im.trunk_streaming = reader->has_trunk_index();
     {
         ggml_init_params ip{};
         ip.mem_size = ggml_tensor_overhead() *
@@ -339,7 +390,11 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         im.wctx = ggml_init(ip);
         ggml_init_params ep = ip;
         im.ectx = ggml_init(ep);
-        if (im.wctx == nullptr || im.ectx == nullptr) {
+        // A tiny context for just the streamed trunk tensors (<=2 leaves).
+        ggml_init_params tp = ip;
+        tp.mem_size = ggml_tensor_overhead() * 4;
+        im.tctx = ggml_init(tp);
+        if (im.wctx == nullptr || im.ectx == nullptr || im.tctx == nullptr) {
             log_warn("engine: .strata weight context init failed");
             return false;
         }
@@ -354,9 +409,15 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         const int64_t *src_ne = gguf_get_tensor_ne(im.gc, i);
         int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
         for (int d = 0; d < GGML_MAX_DIMS; ++d) ne[d] = src_ne[d];
-        // Expert tensors -> ectx (metadata only); everything else -> wctx.
+        // Expert tensors -> ectx (metadata only). When trunk streaming is on,
+        // the two streamed edge tensors -> tctx (own small backing). Everything
+        // else (the HOT resident trunk) -> wctx.
         const bool is_expert = parse_expert_tensor_name(name).valid;
-        ggml_context *into = is_expert ? im.ectx : im.wctx;
+        const bool is_streamed_trunk =
+            im.trunk_streaming && !is_expert &&
+            is_streaming_trunk_tensor(name);
+        ggml_context *into = is_expert ? im.ectx
+                                       : (is_streamed_trunk ? im.tctx : im.wctx);
         ggml_tensor *t = ggml_new_tensor(into, type, GGML_MAX_DIMS, ne);
         if (t == nullptr) {
             log_warn("engine: .strata tensor create failed for '" +
@@ -366,13 +427,37 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         ggml_set_name(t, name);
     }
 
-    // Allocate ONLY the trunk tensors (wctx) resident. ectx (experts) is left
-    // unbacked on purpose - experts stream from the .strata file.
+    // Allocate the RESIDENT trunk tensors (wctx) resident. ectx (experts) is
+    // left unbacked on purpose - experts stream from the .strata file.
     im.wbuf = ggml_backend_alloc_ctx_tensors_from_buft(
         im.wctx, ggml_backend_cpu_buffer_type());
     if (im.wbuf == nullptr) {
         log_warn("engine: .strata weight buffer alloc failed");
         return false;
+    }
+
+    // FEAT-002: give the two STREAMED trunk tensors real, stable backing. They
+    // are read in DISJOINT segments (embedding vs lm_head), so a SINGLE owned
+    // buffer sized to the larger of the two backs BOTH as stable graph leaves.
+    // This is NOT in wbuf, so resident_weight_bytes drops by their combined
+    // size and gains back only this one shared buffer - a strict net reduction.
+    // Each forward() refetches the relevant tensor's bytes into this buffer
+    // immediately before the segment that reads it (see Engine::forward).
+    if (im.trunk_streaming) {
+        im.stream_tok_embd = ggml_get_tensor(im.tctx, "token_embd.weight");
+        im.stream_lm_head  = ggml_get_tensor(im.tctx, "output.weight");
+        if (im.stream_tok_embd == nullptr || im.stream_lm_head == nullptr) {
+            log_warn("engine: .strata streamed-trunk tensors missing");
+            return false;
+        }
+        const size_t sz_tok = ggml_nbytes(im.stream_tok_embd);
+        const size_t sz_lm  = ggml_nbytes(im.stream_lm_head);
+        im.trunk_stream_buf.resize(sz_tok > sz_lm ? sz_tok : sz_lm);
+        // Both metadata tensors (no_alloc tctx) point their stable ->data at the
+        // shared buffer. The buffer is refilled before each segment, and the
+        // two segments never run concurrently, so this aliasing is safe.
+        im.stream_tok_embd->data = im.trunk_stream_buf.data();
+        im.stream_lm_head->data  = im.trunk_stream_buf.data();
     }
 
     // Fill the TRUNK tensors from the trunk block. The trunk block packs the
@@ -386,6 +471,15 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
         // Expert tensors live in the expert region, not the trunk; skip them
         // here (they stream through the SlotPool from read_blob).
         if (parse_expert_tensor_name(name).valid) {
+            continue;
+        }
+        // FEAT-002: a STREAMED trunk tensor still occupies its contiguous slot
+        // in the trunk block, so we MUST advance trunk_rel by its size to keep
+        // the running-offset accounting of the following resident tensors
+        // correct - we just do not read it into a resident buffer here (it is
+        // fetched per-forward into the shared trunk_stream_buf instead).
+        if (im.trunk_streaming && is_streaming_trunk_tensor(name)) {
+            trunk_rel += sz;
             continue;
         }
         ggml_tensor *t = ggml_get_tensor(im.wctx, name);
@@ -419,11 +513,21 @@ const EngineHParams &Engine::hparams() const { return impl_->hp; }
 const EngineCacheStats &Engine::cache_stats() const { return impl_->cstats; }
 
 uint64_t Engine::resident_weight_bytes() const {
-    // The .strata path backs only the trunk tensors in im.wbuf; experts live in
-    // the unbacked ectx. The plain-GGUF path lets ggml/llama own the mapping,
-    // so there is no single wbuf to measure -> report 0 (not applicable).
+    // The .strata path backs only the resident trunk tensors in im.wbuf;
+    // experts live in the unbacked ectx. The plain-GGUF path lets ggml/llama
+    // own the mapping, so there is no single wbuf to measure -> report 0 (not
+    // applicable).
     if (impl_->wbuf == nullptr) return 0;
-    return static_cast<uint64_t>(ggml_backend_buffer_get_size(impl_->wbuf));
+    uint64_t bytes =
+        static_cast<uint64_t>(ggml_backend_buffer_get_size(impl_->wbuf));
+    // FEAT-002: on the trunk-streaming path the two edge tensors are no longer
+    // in wbuf (so wbuf already dropped by their combined size); add back only
+    // the ONE shared working buffer (sized to the larger edge tensor) that
+    // backs both. This is the resident FLOOR for the edge tensors - a single
+    // copy of the larger tensor, never the full embedding+lm_head resident
+    // cost - so the net stays strictly below the fully-resident-trunk baseline.
+    bytes += static_cast<uint64_t>(impl_->trunk_stream_buf.size());
+    return bytes;
 }
 
 uint64_t Engine::streamed_bytes() const {
@@ -501,8 +605,19 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     hp.freq_base     = key_f32("llama.rope.freq_base", 10000.0f);
     hp.freq_scale    = 1.0f;
 
-    ggml_tensor *tok_embd = get_weight(im.wctx, "token_embd.weight");
-    ggml_tensor *out_w    = get_weight(im.wctx, "output.weight");
+    // Resolve a trunk tensor by name: on the FEAT-002 trunk-streaming path the
+    // two edge tensors live in im.tctx (metadata still carries the ne-shape, so
+    // the n_vocab read below works even though they are fetched per-forward);
+    // every other trunk tensor and the non-streaming paths resolve from wctx.
+    auto trunk_weight = [&](const char *n) -> ggml_tensor * {
+        if (im.tctx != nullptr) {
+            ggml_tensor *t = ggml_get_tensor(im.tctx, n);
+            if (t != nullptr) return t;
+        }
+        return get_weight(im.wctx, n);
+    };
+    ggml_tensor *tok_embd = trunk_weight("token_embd.weight");
+    ggml_tensor *out_w    = trunk_weight("output.weight");
     if (tok_embd == nullptr || out_w == nullptr) {
         return nullptr;
     }
@@ -1606,9 +1721,17 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
 
     ++im.decoded_tokens;
 
-    ggml_tensor *tok_embd = ggml_get_tensor(im.wctx, "token_embd.weight");
+    // FEAT-002: on the trunk-streaming path token_embd.weight / output.weight
+    // live in im.tctx (fetched per-forward); output_norm.weight is HOT and
+    // stays resident in wctx. Resolve the streamed pair from their stored
+    // handles when streaming, else from wctx (v1 .strata / plain GGUF).
+    ggml_tensor *tok_embd = im.trunk_streaming
+                                ? im.stream_tok_embd
+                                : ggml_get_tensor(im.wctx, "token_embd.weight");
     ggml_tensor *out_norm = ggml_get_tensor(im.wctx, "output_norm.weight");
-    ggml_tensor *lm_head  = ggml_get_tensor(im.wctx, "output.weight");
+    ggml_tensor *lm_head  = im.trunk_streaming
+                                ? im.stream_lm_head
+                                : ggml_get_tensor(im.wctx, "output.weight");
     if (tok_embd == nullptr || out_norm == nullptr || lm_head == nullptr) {
         log_error("engine: missing trunk tensor at forward");
         return false;
@@ -1630,6 +1753,20 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
     // input tensor, so compute the embedding here into `hidden`.
     std::vector<float> hidden(embd, 0.0f);
     {
+        // FEAT-002: stream token_embd.weight into its stable buffer IMMEDIATELY
+        // before the embedding segment that reads it (ggml_get_rows below), so
+        // the bytes are resident at tok_embd->data before the op is built -
+        // exactly the expert path's 'resident before the op' discipline. The
+        // fetch is synchronous on this (compute) thread; the async prefetch
+        // worker and the SlotPool are never involved.
+        if (im.trunk_streaming) {
+            const int64_t n = im.reader->read_trunk_tensor("token_embd.weight",
+                                                           tok_embd->data);
+            if (n != static_cast<int64_t>(ggml_nbytes(tok_embd))) {
+                log_error("engine: trunk stream of token_embd.weight failed");
+                return false;
+            }
+        }
         ggml_context *gctx = new_segment_ctx();
         if (gctx == nullptr) { log_error("engine: ggml_init failed"); return false; }
         ggml_tensor *inp_tok = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
@@ -1855,6 +1992,17 @@ bool Engine::forward(int32_t token, int32_t pos, std::vector<float> &out) {
 
     // Final norm + lm_head segment.
     {
+        // FEAT-002: stream output.weight into its stable buffer IMMEDIATELY
+        // before the lm_head segment that reads it (ggml_mul_mat below), same
+        // discipline as the embedding fetch above.
+        if (im.trunk_streaming) {
+            const int64_t n = im.reader->read_trunk_tensor("output.weight",
+                                                           lm_head->data);
+            if (n != static_cast<int64_t>(ggml_nbytes(lm_head))) {
+                log_error("engine: trunk stream of output.weight failed");
+                return false;
+            }
+        }
         ggml_context *gctx = new_segment_ctx();
         if (gctx == nullptr) { log_error("engine: ggml_init failed"); return false; }
         ggml_tensor *inpL = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hp.n_embd, 1);
