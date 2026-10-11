@@ -127,6 +127,35 @@ families are the remaining quant-coverage gap.
   on the real ~19 GB Mixtral (`completed-before-use` stays ~0 on fast sandbox
   CPUs, mirroring 2-core Colab, so the overlap wall-clock win is hardware-
   dependent; exact before/after re-verify commands in `colab/README.md`).
+- [x] **Stream the trunk (lossless edge-tensor streaming, technique 6.4).**
+  Per `RESEARCH_50B_ON_A_LAPTOP.md` section 6.4, the two LARGE trunk tensors
+  touched exactly once per token at the input/output edges - `token_embd.weight`
+  (input embedding) and `output.weight` (lm_head) - now STREAM from the `.strata`
+  like experts instead of sitting fully resident, while the HOT per-layer
+  attention/norm/router trunk tensors stay resident (streaming them would be a
+  hot-path throughput regression). At 50B scale these vocab x n_embd edge tensors
+  dominate the fixed trunk cost, so this is the dominant FIT lever. The change is
+  LOSSLESS (pure residency / byte provenance): the `.strata` format is bumped to
+  a BACK-COMPATIBLE v2 that adds an optional per-trunk-tensor index (name, trunk-
+  relative offset, length); the trunk block bytes are byte-for-byte identical to
+  v1 and a v1 file still opens with no trunk index (full-resident fallback). On a
+  v2 file the two edge tensors are created metadata-only and share ONE stable
+  backing buffer, fetched synchronously on the compute thread immediately before
+  the segment that reads them (same "resident before the op" discipline as the
+  expert path; the async worker and SlotPool are untouched). Sandbox-proven,
+  byte-identical and resident-bytes-lower on generated fixtures: on the F32 tiny
+  MoE `resident_weight_bytes` drops 103,040 -> 69,248 B (-33,792 B, one edge
+  tensor) and on the K-quant MoE 392,448 -> 354,432 B (-38,016 B), with the
+  trunk-streaming decode bit-for-bit identical to the fully-resident decode
+  (`max|delta| = 0.000e+00`, proven on the SAME v2 file via the
+  `STRATAFLOW_ENGINE_NO_TRUNK_STREAM` test knob) and to the libllama oracle, on
+  BOTH an F32 and a K-quant fixture; the v1 back-compat path decodes byte-
+  identically to the oracle too. Colab-only: the absolute peak-RSS reduction on
+  the real Mixtral/50B case (where the multi-GB resident embeddings + lm_head
+  previously blocked the fit) is hardware-only; the exact re-verify command and
+  expected effect are in `colab/README.md`. Deferred follow-ons: streaming the
+  per-layer attention weights, a budget-aware trunk residency policy, and async
+  (prefetched) trunk streaming.
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.

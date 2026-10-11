@@ -11,6 +11,35 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- Stream the trunk: lossless streaming of the large edge tensors (technique 6.4
+  from `docs/RESEARCH_50B_ON_A_LAPTOP.md`). The two biggest trunk tensors, each
+  touched exactly once per token at the input/output edges - `token_embd.weight`
+  (input embedding) and `output.weight` (lm_head) - now STREAM from the `.strata`
+  on demand instead of sitting fully resident in RAM, while the HOT per-layer
+  attention/norm/router trunk tensors stay resident (streaming those would be a
+  hot-path throughput regression). At 50B scale these vocab x n_embd edge tensors
+  dominate the fixed trunk cost, so moving them off the resident floor is the
+  dominant FIT lever. The change is LOSSLESS - same bytes, same ops, only byte
+  PROVENANCE differs. The `.strata` format is bumped to a BACK-COMPATIBLE v2 that
+  adds an optional per-trunk-tensor index (fixed-size records of {tensor name,
+  trunk-relative offset, length}, carved from the superblock's reserved pad so
+  `sizeof(StrataSuperblock)` stays 128); the trunk block bytes are byte-for-byte
+  identical to v1, and a v1 `.strata` still opens with no trunk index and falls
+  back to the fully-resident trunk. On a v2 file the two edge tensors are created
+  metadata-only and share ONE stable backing buffer, fetched synchronously on the
+  compute thread immediately before the segment that reads them (the same
+  "resident before the op is built" discipline as the expert path; the async
+  prefetch worker and the `SlotPool` are not involved). Sandbox-proven on the
+  generated fixtures, byte-identical and resident-bytes-lower: `resident_weight_bytes`
+  drops 103,040 -> 69,248 B (-33,792 B) on the F32 tiny MoE and 392,448 ->
+  354,432 B (-38,016 B) on the K-quant MoE, with the trunk-streaming decode
+  bit-for-bit identical to the fully-resident decode (`max|delta| = 0.000e+00`,
+  proven on the SAME v2 file via the test-only `STRATAFLOW_ENGINE_NO_TRUNK_STREAM`
+  knob) and to the libllama oracle, on BOTH an F32 and a K-quant fixture; a v1
+  back-compat gate proves an old `.strata` (trunk index count 0) still decodes
+  byte-identically to the oracle. The real Mixtral/50B peak-RSS reduction (where
+  the multi-GB resident embeddings + lm_head previously blocked the fit) is
+  hardware-only; see `colab/README.md` for the exact re-verify command.
 - Layer-stratified residency + prefetch gating (fewer SSD bytes streamed per
   token; async prefetch no longer hurts). Two composing levers on the
   bounded-RAM streaming path, both oracle byte-identical and adaptive to model

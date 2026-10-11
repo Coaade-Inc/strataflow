@@ -88,6 +88,15 @@ per second). RAM size does not cap what you can run.
   (`blk.N.ffn_{gate,down,up}.E.weight`), grouping the legacy tensors into the
   stacked `.strata` region with no requant, so a real downloaded Mixtral packs
   and runs.
+- **Streamed edge tensors (stream the trunk).** The two biggest trunk tensors -
+  the input embedding and the output head - are touched only once per token, at
+  the input and output edges. StrataFlow streams them from disk like experts
+  instead of holding them resident, while the small, hot per-layer attention and
+  norm weights stay in memory. On a large model these vocab-sized tensors are
+  several GB, so moving them off the resident floor is the biggest single memory
+  win: a model whose resident trunk did not fit before can fit now. It is
+  lossless - the same bytes read on demand - and the `.strata` format stays
+  back-compatible (older files simply keep the trunk resident).
 - **Predictor-driven prefetch with async overlap.** The router read-back feeds a
   predictor, and a background I/O worker loads the next layer's predicted experts
   while the current layer computes, so disk reads hide behind compute. The
@@ -109,6 +118,13 @@ StrataFlow's correctness and bounded-RAM behavior are measured, not asserted:
   validated against the oracle (identical greedy token sequence) and stream
   through the `.strata` path. The IQ families are the remaining quant-coverage
   gap.
+- **Streaming the trunk is lossless and lowers resident RAM.** With the input
+  embedding and output head streamed instead of resident, the resident weight
+  bytes drop with no change to the output: the streamed decode is bit-for-bit
+  identical to the fully-resident decode and to the reference engine, on both
+  full-precision and K-quant models. On the generated test models resident
+  weights fall measurably (for example 103,040 to 69,248 bytes on the tiny
+  full-precision model); on a real large model the saving is multiple GB.
 - **Both Mixtral expert layouts stream.** Real Mixtral GGUFs use a legacy
   per-expert tensor layout as well as the stacked form; the packer handles both,
   so a real downloaded Mixtral packs into `.strata` and streams, decoding
