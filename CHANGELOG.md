@@ -11,6 +11,41 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- Auto KV window ENGAGES BY DEFAULT on the real `.strata` Mixtral load path
+  (FEAT-002 Part A, technique 6.5 from `docs/RESEARCH_50B_ON_A_LAPTOP.md`). A
+  DEFAULT run (no `STRATAFLOW_ENGINE_KV_WINDOW`, no flags) now reserves a
+  windowed KV when the full-`n_ctx` KV would overflow the conservative budget, so
+  the engine's measured `resident_kv` drops from the full-`n_ctx` figure
+  (8192 MiB on Mixtral) to the windowed size and the plan line gains a
+  `kv window=...` segment - fixing the exact Colab symptom (resident_kv at full
+  `n_ctx`, no window). Two breaks fixed: (1) the real synthesized-metadata path
+  read `context_length`/`head_count`/`head_count_kv` with `gguf_get_val_u32`,
+  which aborts or returns 0 when the source stored them under a different GGUF
+  integer encoding (the `n_ctx_train(0)` warning is the tell), so the planner saw
+  zero geometry and never windowed while the engine reserved the full KV; a new
+  robust type-dispatching read (`src/common/gguf_meta.h` `gguf_read_u32`, which
+  switches on `gguf_get_kv_type` across u8/i8/u16/i16/u32/i32/u64/i64) is now
+  shared by the planner (`src/model/ggml_model.cpp`), the engine
+  (`src/model/engine/engine.cpp`), and the packer (`src/tws/strata_pack.cpp`) so
+  all three see IDENTICAL geometry on every path. (2) the plan's chosen window
+  reached the engine ONLY through the process-global `STRATAFLOW_ENGINE_KV_WINDOW`
+  env side-channel; it is now a DIRECT `kv_window` parameter to
+  `engine::Engine::load` (default 0 = full/auto, preserving every existing
+  caller), plumbed from `PlacementPlan::kv_window` through `GgmlModel`. Engine
+  resolution order: explicit `STRATAFLOW_ENGINE_KV_WINDOW` env (user/test) WINS,
+  else the plan-provided window, else full `n_ctx`. Residency/window sizing only;
+  forward math and graph order unchanged, so decode stays byte-identical.
+  Sandbox-proven on a Mixtral-geometry legacy-per-expert fixture (`n_ctx` 32768,
+  `head_dim` 128, GQA `n_head_kv` 2, 32 layers, full KV 2048 MiB) packed through
+  the REAL `strata-pack` -> `.strata` -> `load_strata_model` -> planner -> engine
+  under a simulated 12 GiB budget with NO env override
+  (`tests/test_kv_window_real_path.cpp`): geometry reaches the planner non-zero,
+  the plan chose `kv_window=16384` (`< n_ctx`), `resident_kv_bytes()` dropped
+  2147483648 -> 1073741824, and the plan-window greedy decode is BIT-IDENTICAL to
+  the full-resident run (`max|delta| = 0.000e+00`) and matches the libllama
+  oracle on the matched stacked fixture. The absolute real-Mixtral peak-RSS drop
+  is Colab-only (the offline sandbox cannot download the model); the re-verify
+  command and expected plan/stats are in `colab/README.md`.
 - Lossless KV paging (technique 6.5 from `docs/RESEARCH_50B_ON_A_LAPTOP.md`, the
   lossless half). The engine-owned per-layer K/V cache no longer reserves the
   full trained `n_ctx` up front: it is bounded to a resident recent WINDOW `W`

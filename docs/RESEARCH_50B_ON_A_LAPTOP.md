@@ -509,10 +509,23 @@ instead of byte-identity.
     rather than silently yielding nothing. A later increment made the window
     choice AUTOMATIC and lossless (FEAT-002, conservative RAM budget): when
     full-`n_ctx` KV would overflow the conservative memory budget (Section 5),
-    the planner steps `W` down to the largest power-of-two (`>= 256`) that fits
-    and plumbs it to the engine via the same `STRATAFLOW_ENGINE_KV_WINDOW` path
-    (an explicit user window still wins), so a real large-context Mixtral fits by
-    DEFAULT. The KV saving LOWERS the projected peak and is NOT re-consumed by
+    the planner steps `W` down to the largest power-of-two (`>= 256`) that fits.
+    FEAT-002 Part A then plumbs that chosen `W` to the engine as a DIRECT
+    `Engine::load` parameter (`PlacementPlan::kv_window`), applied BY DEFAULT -
+    not through the process-global `STRATAFLOW_ENGINE_KV_WINDOW` env it used to
+    rely on. The resolution order inside the engine is: an explicit user/test
+    `STRATAFLOW_ENGINE_KV_WINDOW` env WINS, else the plan-provided window, else
+    full `n_ctx`. This closed two real-path breaks that let the window silently
+    not engage on the real Mixtral `.strata`: (1) the real synthesized-metadata
+    path read `context_length`/`head_count`/`head_count_kv` with
+    `gguf_get_val_u32`, which aborts/returns 0 when the source stored them under
+    a different GGUF integer encoding (the `n_ctx_train(0)` tell), so the planner
+    saw zero geometry and never windowed - fixed by a robust type-dispatching
+    read (`src/common/gguf_meta.h`) shared by planner, engine, and packer so all
+    three see IDENTICAL geometry; and (2) the window reached the engine ONLY via
+    the env side-channel - now it is a load parameter. So a real large-context
+    Mixtral fits by DEFAULT with no env set. The KV saving LOWERS the projected
+    peak and is NOT re-consumed by
     more resident experts - the budget model holds the safety margin fixed (see
     Section 5, "The budget is enforced by construction"). This is what lets the
     SAME default and `STRATAFLOW_ENGINE_KV_WINDOW=512` runs that previously
@@ -550,7 +563,23 @@ instead of byte-identity.
     oracle; `residentKV == fullKV/64` confirms the `W/n_ctx` reservation and
     `coldBytes 12800` (proportional to the 25 evicted positions, far below the
     full-`n_ctx` cold size 2097152 B) confirms the cold store is bounded to used
-    positions, not `n_ctx`.
+    positions, not `n_ctx`. The DEFAULT-ENGAGEMENT real path (FEAT-002 Part A,
+    `tests/test_kv_window_real_path.cpp`) is proven SANDBOX-side on a Mixtral-
+    geometry legacy-per-expert fixture (`n_ctx` 32768, `head_dim` 128, GQA
+    `n_head_kv` 2, 32 layers, full KV 2048 MiB) packed through the REAL
+    `strata-pack` -> `.strata` -> `load_strata_model` -> planner -> engine path
+    under a simulated 12 GiB budget with NO env override: the loaded `ModelShape`
+    reports `n_ctx`/`head_dim`/`n_head_kv` non-zero (geometry reached the
+    planner), the plan chose `kv_window = 16384` (`< n_ctx`), and the engine's
+    `resident_kv_bytes()` dropped to 1073741824 (half of the full 2147483648)
+    with the window applied through the load parameter alone - and the plan-
+    window greedy decode is BIT-IDENTICAL to the full-resident run
+    (`max|delta| = 0.000e+00`) and matches the libllama oracle on the matched
+    stacked fixture. This is the sandbox proof of the exact DEFAULT path the
+    Colab Mixtral run showed broken (resident_kv at full `n_ctx`, no `kv window=`
+    in the plan line). The absolute real-Mixtral peak-RSS number is COLAB-ONLY
+    (the offline sandbox cannot download the multi-GB model); the sandbox proof
+    is the geometry-mirroring fixture through the real load path.
   - KV *quantization* is APPROXIMATE (q8/4-bit K/V changes attention numerics)
     and needs the quality-metric gate; DEFERRED as an opt-in follow-on with
     measured perplexity cost. StreamingLLM/SnapKV-style windowed EVICTION is also
