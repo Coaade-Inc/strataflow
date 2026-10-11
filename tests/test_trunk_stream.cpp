@@ -90,12 +90,26 @@ static std::vector<int32_t> engine_decode(const std::string &model_path,
 struct NoTrunkStreamGuard {
     explicit NoTrunkStreamGuard(bool force_resident) {
         if (force_resident) {
-            setenv("STRATAFLOW_ENGINE_NO_TRUNK_STREAM", "1", 1);
+#if defined(_WIN32)
+            _putenv_s("STRATAFLOW_ENGINE_NO_TRUNK_STREAM", "1");
+#else
+            setenv("STRATAFLOW_ENGINE_NO_TRUNK_STREAM", "1", /*overwrite=*/1);
+#endif
         } else {
+#if defined(_WIN32)
+            _putenv_s("STRATAFLOW_ENGINE_NO_TRUNK_STREAM", "");
+#else
             unsetenv("STRATAFLOW_ENGINE_NO_TRUNK_STREAM");
+#endif
         }
     }
-    ~NoTrunkStreamGuard() { unsetenv("STRATAFLOW_ENGINE_NO_TRUNK_STREAM"); }
+    ~NoTrunkStreamGuard() {
+#if defined(_WIN32)
+        _putenv_s("STRATAFLOW_ENGINE_NO_TRUNK_STREAM", "");
+#else
+        unsetenv("STRATAFLOW_ENGINE_NO_TRUNK_STREAM");
+#endif
+    }
 };
 
 static double max_logit_delta(const std::vector<std::vector<float>> &a,
