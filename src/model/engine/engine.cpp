@@ -19,6 +19,7 @@
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "model/engine/engine.h"
 
+#include "common/gguf_meta.h"
 #include "common/log.h"
 #include "kv/kv_store.h"
 #include "predict/predictor.h"
@@ -687,9 +688,13 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     // Derive hparams from the GGUF metadata keys, then validate against tensor
     // shapes (ne-order) so a mismatch fails loudly instead of silently.
     auto key_u32 = [&](const std::string &k, int fallback) -> int {
+        // Robust to the GGUF integer encoding (u32/i32/other widths) so the
+        // engine reads the SAME geometry the planner does; gguf_get_val_u32
+        // aborts on a non-u32 key, which is how real Mixtral n_ctx read as 0.
         int64_t id = gguf_find_key(im.gc, k.c_str());
         if (id < 0) return fallback;
-        return static_cast<int>(gguf_get_val_u32(im.gc, id));
+        return static_cast<int>(
+            gguf_read_u32(im.gc, id, static_cast<uint32_t>(fallback)));
     };
     auto key_f32 = [&](const std::string &k, float fallback) -> float {
         int64_t id = gguf_find_key(im.gc, k.c_str());

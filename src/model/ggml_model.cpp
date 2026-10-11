@@ -19,6 +19,7 @@
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "model/model.h"
 
+#include "common/gguf_meta.h"
 #include "common/log.h"
 #include "hw/gpu_discovery.h"
 #include "model/engine/engine.h"
@@ -393,11 +394,9 @@ bool read_shape_from_gguf(const std::string &path, ModelShape &s) {
     if (gc == nullptr) return false;
 
     auto get_u32 = [&](const std::string &key, uint32_t fallback) -> uint32_t {
-        int64_t id = gguf_find_key(gc, key.c_str());
-        if (id < 0) return fallback;
-        // GGUF integer metadata is commonly stored as u32; be tolerant of the
-        // signed variant too.
-        return gguf_get_val_u32(gc, id);
+        // Robust to the GGUF integer encoding the source used (u32/i32/other
+        // widths); gguf_get_val_u32 would abort on a non-u32 key.
+        return gguf_read_u32_key(gc, key.c_str(), fallback);
     };
 
     std::string arch;
@@ -664,9 +663,8 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
                     if (a != nullptr) arch = a;
                 }
                 if (!arch.empty()) {
-                    int64_t uid =
-                        gguf_find_key(gc, (arch + ".expert_used_count").c_str());
-                    if (uid >= 0) n_used = gguf_get_val_u32(gc, uid);
+                    n_used = gguf_read_u32_key(
+                        gc, (arch + ".expert_used_count").c_str(), 0);
                 }
                 gguf_free(gc);
             }
@@ -703,8 +701,9 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
                 if (a != nullptr) arch = a;
             }
             auto key_u32 = [&](const std::string &k) -> uint32_t {
-                int64_t id = gguf_find_key(gc, k.c_str());
-                return id >= 0 ? gguf_get_val_u32(gc, id) : 0;
+                // Robust to the GGUF integer encoding real Mixtral stores these
+                // keys in; gguf_get_val_u32 aborts/returns 0 on a non-u32 key.
+                return gguf_read_u32_key(gc, k.c_str(), 0);
             };
             if (!arch.empty()) {
                 if (shape.n_ctx == 0)
