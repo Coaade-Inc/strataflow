@@ -11,6 +11,54 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- Target-RAM capability: one dial for the fit-vs-speed tradeoff, with two modes
+  {auto, max} plus an explicit numeric target. A single target-RAM concept now
+  drives ALL the fit levers together (KV window, expert slots/cache, adaptive
+  per-layer trunk streaming, and the VRAM placement the planner already budgets)
+  from one decision, on BOTH the CLI and the C ABI. CLI: `--target-ram-gb X`
+  (explicit RAM ceiling in GiB), `--ram-mode auto|max`, and `--max-performance`
+  (alias for `--ram-mode max`); the existing `--vram-gb` / `--ram-gb` /
+  `--cache-gb` / `--expert-slots` and `STRATAFLOW_ENGINE_KV_WINDOW` stay as
+  lower-level manual overrides. ABI: two fields appended at the END of
+  `sf_context_params` (append-only, backward-compatible, same discipline as
+  `expert_slots` / `cache_budget` / `async_prefetch`): `uint64_t
+  target_ram_budget` (bytes, 0 = use the mode) and `uint32_t ram_mode` taking a
+  new `typedef enum sf_ram_mode { SF_RAM_MODE_AUTO = 0, SF_RAM_MODE_MAX = 1 }`
+  (default-zero == auto). Precedence, highest wins: explicit low-level manual
+  knobs (`STRATAFLOW_ENGINE_KV_WINDOW` / `--expert-slots` / `--cache-gb`) >
+  `--target-ram-gb` (`target_ram_budget`) > `--ram-mode max` > `--ram-mode auto`
+  (the DEFAULT, `ram_mode == 0`). An explicit target is used directly as the
+  usable budget and drives the KV-window step-down + trunk streaming so the
+  projected peak fits even below the trunk-resident floor; a target below the
+  achievable floor is refused LOUDLY (`plan.fits=false` + a reason naming the
+  floor, surfaced as `SF_ERR_RUNTIME`). Auto is the good-neighbor default: it
+  leaves headroom for other apps by taking only the conservative `usable_ram`
+  share (`free - max(1 GiB, 12.5%)`, capped at 85% of total). Max dedicates the
+  machine: all available RAM (plus the full VRAM budget), full KV window, maximal
+  expert cache, trunk fully resident, minimal streaming. GPU honesty: auto/max
+  MAY read VRAM and the planner BUDGETS VRAM placement
+  (`plan.trunk_layers_in_vram` / `plan.expert_slots_vram` ->
+  `derive_llama_placement` -> `n_gpu_layers`), but that only affects the
+  non-authoritative plain-GGUF libllama sidecar; the authoritative `.strata`
+  engine decode is CPU-only (`n_gpu_layers = 0` everywhere in `engine.cpp`), so
+  GPU PLACEMENT is budgeted while full GPU-accelerated COMPUTE is the enterprise
+  roadmap track, not implemented. Residency/placement only, so decode stays
+  byte-identical across all three modes and to the libllama oracle. This turns
+  the user's real Colab three-knob experiment
+  (`STRATAFLOW_ENGINE_KV_WINDOW=2048 --expert-slots 8 --cache-gb 1`, which
+  brought the real Mixtral-8x7B-Instruct Q3_K_M `.strata` to ~2.4 GiB peak RSS
+  byte-identically) into a single `--target-ram-gb 2`. Sandbox-proven through the
+  REAL load path on a Mixtral-geometry fixture (`n_ctx` 32768, 32 layers, pack ->
+  `.strata` -> `load_model` -> planner -> engine): an explicit ~1.2 GiB target
+  fits at projected peak ~1228 MiB (`kv_window=512`, `trunk_pool_layers=4`,
+  `slots=5`); auto projects peak ~3647 MiB (usable ~9520 MiB) and max ~3756 MiB
+  (usable ~10880 MiB) on the ~12 GiB profile with full KV + trunk resident +
+  `slots=256`; the invariants `max.usable > auto.usable` and
+  `auto.peak < max.peak` hold, and the greedy decode is byte-identical
+  (`max|delta| = 0.000e+00`) across all three modes and within the soft oracle
+  bound. Colab-only: the absolute real-Mixtral per-mode peak RSS is the user's
+  Colab re-run; the exact three-mode commands and expected plan/stats are in
+  `colab/README.md`. `docs/ROADMAP.md` records the capability as done.
 - Adaptive per-layer trunk streaming engages BY DEFAULT on the real `.strata`
   load path (FEAT-003 Part B, technique 6.4 from
   `docs/RESEARCH_50B_ON_A_LAPTOP.md`). After the auto KV window, the dominant

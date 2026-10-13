@@ -386,6 +386,94 @@ So the windowed KV reservation now engages on the DEFAULT path with no env.
   prompt. The absolute real-Mixtral peak-RSS number is Colab-only; the window
   engagement + resident-KV reduction + byte-identity are sandbox-proven above.
 
+### Target-RAM in one dial: `--target-ram-gb`, `--ram-mode auto|max`
+
+The KV window, the adaptive trunk streaming, and the bounded expert cache were
+first proven on the real Colab box by setting three low-level knobs together.
+On the real Mixtral-8x7B-Instruct Q3_K_M `.strata` (32 layers, 8 experts top-2,
+`n_ctx` 32768, ~19 GB on disk), `STRATAFLOW_ENGINE_KV_WINDOW=2048
+--expert-slots 8 --cache-gb 1` brought peak process RSS down to ~2.4 GiB
+(2406.7 MiB), byte-identical to the full-resident decode. StrataFlow now folds
+those three knobs into ONE dial, with two modes plus an explicit numeric target:
+
+- `--target-ram-gb X` (ABI `target_ram_budget`, bytes; 0 = use the mode): an
+  explicit RAM ceiling. The planner drives the KV window + adaptive trunk
+  streaming + expert cache so the projected peak fits X, even below the
+  trunk-resident floor, and REFUSES LOUDLY (naming the achievable floor) if X is
+  too small. Overrides the mode.
+- `--ram-mode auto` (the DEFAULT, no flag needed; ABI `ram_mode ==
+  SF_RAM_MODE_AUTO == 0`): the good-neighbor share. It takes only the
+  conservative `usable_ram` (`free - max(1 GiB, 12.5%)`, capped at 85% of total),
+  leaving headroom so other apps keep running while the model decodes.
+- `--ram-mode max` (or `--max-performance`; ABI `ram_mode == SF_RAM_MODE_MAX ==
+  1`): dedicate the machine. All available RAM (plus the full VRAM budget the
+  planner places), full KV window, maximal expert cache, trunk fully resident,
+  minimal streaming, maximal tok/s.
+
+Precedence (highest wins): the low-level knobs
+(`STRATAFLOW_ENGINE_KV_WINDOW` / `--expert-slots` / `--cache-gb`) >
+`--target-ram-gb` > `--ram-mode max` > `--ram-mode auto` (default). GPU honesty:
+auto/max may read VRAM and the planner budgets VRAM PLACEMENT, but the `.strata`
+engine decode is CPU-only today, so full GPU-accelerated compute is enterprise
+roadmap work, not something these modes turn on. The RAM side is the proven,
+measured mechanism.
+
+- **Sandbox-proven (offline, in CI):** the MECHANISM, the mode differences, and
+  byte-identity through the REAL load path on a Mixtral-geometry fixture
+  (`n_ctx` 32768, 32 layers, pack -> `.strata` -> `load_model` -> planner ->
+  engine): an explicit ~1.2 GiB target fits at projected peak ~1228 MiB with
+  `kv_window=512`, `trunk_pool_layers=4` (trunk streaming engaged), `slots=5`;
+  auto on a ~12 GiB / ~10.6 free profile projects peak ~3647 MiB (usable
+  ~9520 MiB), full KV window, trunk resident, `slots=256`; max projects peak
+  ~3756 MiB (usable ~10880 MiB), full KV, trunk resident, `slots=256`; the
+  invariants `max.usable > auto.usable` and `auto.peak < max.peak` hold and the
+  greedy decode is byte-identical (`max|delta| = 0.000e+00`) across all three
+  modes and within the soft oracle bound.
+- **Colab-only (real Mixtral):** the absolute ~2.4 GiB peak RSS and the
+  equivalence of the one dial to the old three knobs are the Colab re-run to
+  confirm (a projection). The offline sandbox cannot download Mixtral, so
+  re-verify on Colab by running all three modes on the SAME model and prompt and
+  comparing the plan line and the `stats:` line each prints:
+
+  ```bash
+  %%bash
+  cd /content/strataflow/build/release
+  # EXPLICIT target: one dial for the old three-knob ~2.4 GiB experiment.
+  ./bin/strataflow --model /content/mixtral.strata \
+    --target-ram-gb 2 --max-tokens 16 --async-prefetch on --prompt "The city of"
+  # AUTO (default): good-neighbor share, leaves RAM free for other apps.
+  ./bin/strataflow --model /content/mixtral.strata \
+    --max-tokens 16 --async-prefetch on --prompt "The city of"
+  # MAX: dedicate the machine, full resident, highest tok/s.
+  ./bin/strataflow --model /content/mixtral.strata \
+    --ram-mode max --max-tokens 16 --async-prefetch on --prompt "The city of"
+  ```
+
+  Expected per mode (segments appear in the plan line, which prints before the
+  decode; absolute GiB are hardware-dependent on the free runtime, so compare the
+  three on the SAME model and prompt):
+
+  - `--target-ram-gb 2`: an aggressive plan line, e.g. `... experts STREAMED
+    (bounded), kv window=2048, trunk stream[hot=... layers], est. peak ~2 GiB`,
+    with a `stats:` line showing a small windowed `resident_kv`, resident model
+    weights at the bounded hot trunk pool, a non-zero `streamed`, and `peak RSS`
+    near ~2.4 GiB (matching the old `STRATAFLOW_ENGINE_KV_WINDOW=2048
+    --expert-slots 8 --cache-gb 1` run), decoded text byte-identical to the other
+    two modes.
+  - auto (default, no flag): a good-neighbor plan line that leaves RAM free, with
+    a `stats:` line whose `peak RSS` is bounded below the conservative usable
+    share (so other apps keep running) and strictly below the max run, resident
+    weights and `streamed` between the target and max runs.
+  - `--ram-mode max`: a full-resident plan line (full `kv window`, no `trunk
+    stream[hot=...]` segment when the trunk stays resident), with a `stats:` line
+    showing the full `resident_kv`, the whole trunk resident, `streamed` at its
+    lowest, the highest `peak RSS`, and the highest tok/s.
+
+  Keep it honest: the absolute real-Mixtral GiB per mode are the Colab re-run;
+  the sandbox proves the mechanism, the mode differences (max uses more RAM /
+  streams fewer bytes than auto; auto leaves a good-neighbor margin below max),
+  and that the decoded text is byte-identical across all three modes.
+
 ### Which real model, and why
 
 The engine runs **llama-architecture** models only. That drives the choice:

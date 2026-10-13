@@ -322,6 +322,52 @@ families are the remaining quant-coverage gap.
   graph order unchanged, so decode stays byte-identical. Colab-only: the absolute
   real-Mixtral peak-RSS drop is hardware-only; the re-verify command and expected
   plan/stats are in `colab/README.md`.
+- [x] **Target-RAM capability: one dial for fit vs speed (modes {auto, max} +
+  explicit numeric target).** A single target-RAM concept now drives ALL the fit
+  levers together (KV window, expert slots/cache, adaptive per-layer trunk
+  streaming, and the VRAM placement the planner already budgets) from one
+  decision, exposed on BOTH the CLI (`--target-ram-gb X`, `--ram-mode auto|max`,
+  and `--max-performance` as an alias for `--ram-mode max`) and the C ABI (two
+  fields appended at the END of `sf_context_params`: `uint64_t
+  target_ram_budget` in bytes, 0 = use the mode; `uint32_t ram_mode` taking
+  `sf_ram_mode` { `SF_RAM_MODE_AUTO = 0`, `SF_RAM_MODE_MAX = 1` }, default-zero
+  == auto). Precedence, highest wins: explicit low-level manual knobs
+  (`STRATAFLOW_ENGINE_KV_WINDOW` / `--expert-slots` / `--cache-gb`) >
+  `--target-ram-gb` (`target_ram_budget`) > `--ram-mode max` > `--ram-mode auto`
+  (the DEFAULT, `ram_mode == 0`). An explicit target is used directly as the
+  usable budget and drives the KV-window step-down + trunk streaming so the
+  projected peak fits the target even below the trunk-resident floor; if even the
+  minimal configuration cannot fit the target the planner refuses LOUDLY
+  (`plan.fits=false` + a reason naming the achievable floor), surfaced as
+  `SF_ERR_RUNTIME`. **Auto is the good-neighbor default**: it leaves headroom for
+  other apps on a shared laptop by building on the conservative `usable_ram`
+  share (`free - max(1 GiB, 12.5%)`, capped at 85% of total), so the model does
+  not take the whole box. **Max dedicates the machine**: it uses all available
+  RAM (plus the full VRAM budget), full KV window, maximal expert cache, and the
+  trunk fully resident (minimal streaming, maximal tok/s). GPU honesty, stated
+  plainly: auto/max MAY read VRAM from the profiler and the planner BUDGETS VRAM
+  placement (`plan.trunk_layers_in_vram` / `plan.expert_slots_vram`, mapped by
+  `derive_llama_placement` to `n_gpu_layers`), but that only affects the
+  NON-authoritative plain-GGUF libllama sidecar; the authoritative `.strata`
+  engine decode runs CPU-only (every `llama_model_params` in `engine.cpp` sets
+  `n_gpu_layers = 0`), so GPU PLACEMENT is budgeted while full GPU-accelerated
+  COMPUTE is the enterprise roadmap track below, NOT implemented. The RAM side is
+  the proven, measured mechanism. Residency/placement only, so decode stays
+  byte-identical across all three modes and to the libllama oracle (the levers
+  change which bytes are resident, never which bytes compute or the graph order).
+  Sandbox-proven through the REAL load path on a Mixtral-geometry fixture
+  (`n_ctx` 32768, 32 layers, pack -> `.strata` -> `load_model` -> planner ->
+  engine): an explicit `--target-ram-gb` ~1.2 GiB fits with projected peak
+  ~1228 MiB, `kv_window=512`, `trunk_pool_layers=4` (trunk streaming engaged),
+  `slots=5`; auto on a ~12 GiB / ~10.6 free profile projects peak ~3647 MiB
+  (usable ~9520 MiB), full KV window, trunk resident, `slots=256`; max projects
+  peak ~3756 MiB (usable ~10880 MiB), full KV, trunk resident, `slots=256`; the
+  invariants `max.usable > auto.usable`, `auto.peak < max.peak`, and
+  byte-identical decode across all three modes (`|delta| = 0.0`) hold, within the
+  soft oracle bound for the random-weight fixture. Colab-only: the real
+  Mixtral-8x7B-Instruct Q3_K_M run that this dial maps to (next bullet) is the
+  absolute-number re-verify; the sandbox proves the mechanism, the mode
+  differences, and byte-identity.
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.

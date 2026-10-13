@@ -81,6 +81,21 @@ per second). RAM size does not cap what you can run.
   bounded (never below one layer's top-k). A `--cache-gb` budget caps it and
   `--expert-slots` overrides it, with precedence `--expert-slots` > `--cache-gb`
   > auto-from-free-RAM.
+- **One dial for the fit-vs-speed tradeoff.** A single target-RAM setting drives
+  everything that decides what stays in memory - the KV window, the resident
+  expert cache, and the streamed trunk - from one decision, in three modes.
+  **Auto** is the default and the good-neighbor choice: it takes only a
+  conservative share of your RAM (leaving a safe headroom so your other apps keep
+  running while the model decodes) and streams the rest from disk. **A number**
+  (`--target-ram-gb 2`) sets an exact ceiling: StrataFlow fits the model under
+  that budget automatically, or tells you clearly, naming the floor, if the
+  budget is too small - no silent out-of-memory kill. **Max** (`--ram-mode max`)
+  does the opposite: it dedicates the machine to the model, holding the whole
+  working set resident for the fastest decode. More budget buys speed, not a
+  different answer - the output is identical in every mode. If a GPU is present
+  the planner budgets placement into VRAM as the fastest tier; GPU-accelerated
+  compute itself is planned enterprise work, not a shipped feature, so these
+  modes run correctly on CPU and the RAM side is the proven, measured mechanism.
 - **A streaming-friendly model format (`.strata`).** Built from standard GGUF,
   one file holds the always-resident trunk plus aligned per-expert blobs for
   fast per-expert reads. The packer handles both the stacked `_exps` expert
