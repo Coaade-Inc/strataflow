@@ -515,7 +515,8 @@ void enumerate_gpus(std::vector<GpuInfo> &out) {
 sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
                             uint64_t vram_budget, uint64_t ram_budget,
                             std::unique_ptr<Model> &out,
-                            PlacementPlan *out_plan, uint64_t cache_budget) {
+                            PlacementPlan *out_plan, uint64_t cache_budget,
+                            RamMode mode, uint64_t target_ram_budget) {
     StrataReader reader;
     if (!reader.open(path)) {
         log_warn("load_strata_model: cannot open .strata '" + path + "'");
@@ -770,7 +771,8 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
     // Plan ONLY after every shape field the planner reads is populated, so the
     // MoE/streaming branch is reached for a real MoE .strata.
     PlacementPlan plan =
-        plan_placement(hw, shape, vram_budget, ram_budget, cache_budget);
+        plan_placement(hw, shape, vram_budget, ram_budget, cache_budget, mode,
+                       target_ram_budget);
     if (out_plan != nullptr) *out_plan = plan;
 
     log_info("GgmlModel loaded .strata '" + shape.name + "': " +
@@ -790,7 +792,8 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
 sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
                           uint64_t vram_budget, uint64_t ram_budget,
                           std::unique_ptr<Model> &out, PlacementPlan *out_plan,
-                          uint64_t cache_budget) {
+                          uint64_t cache_budget, RamMode mode,
+                          uint64_t target_ram_budget) {
     ensure_backend();
     llama_log_set(sf_llama_log_cb, nullptr);
 
@@ -798,7 +801,8 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
     // NEVER handed to llama_model_load_from_file (the TASK5_BLOCKER root cause).
     if (is_strata_file(path)) {
         return load_strata_model(path, hw, vram_budget, ram_budget, out,
-                                 out_plan, cache_budget);
+                                 out_plan, cache_budget, mode,
+                                 target_ram_budget);
     }
 
     llama_model_params mp = llama_model_default_params();
@@ -819,7 +823,7 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
     std::string expert_pattern;
     if (read_shape_from_gguf(path, pre_shape)) {
         plan = plan_placement(hw, pre_shape, vram_budget, ram_budget,
-                              cache_budget);
+                              cache_budget, mode, target_ram_budget);
         place = derive_llama_placement(plan, pre_shape, hw.gpus);
 
         mp.n_gpu_layers = place.n_gpu_layers;
@@ -927,7 +931,8 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
     // value via the env the engine also reads), so the number the engine USES
     // equals the number the plan REPORTS.
     PlacementPlan final_plan =
-        plan_placement(hw, shape, vram_budget, ram_budget, cache_budget);
+        plan_placement(hw, shape, vram_budget, ram_budget, cache_budget, mode,
+                       target_ram_budget);
     if (out_plan != nullptr) *out_plan = final_plan;
 
     out = std::unique_ptr<Model>(

@@ -334,6 +334,149 @@ static void test_gpu_pins_trunk() {
     CHECK(plan.expert_slots_vram > 0);          // leftover VRAM caches experts
 }
 
+// ---------------------------------------------------------------------------
+// task-target-ram-modes FEAT-001: RamMode {Auto, Max} + explicit target.
+// ---------------------------------------------------------------------------
+
+// A Mixtral-geometry MoE whose per-layer attention projections are a large
+// fraction of the trunk, so the FEAT-003 adaptive trunk streaming (gated on
+// attn_trunk_bytes > 0) can engage once the budget is tight.
+static ModelShape mixtral_streamable() {
+    ModelShape m = mixtral_real();              // real KV geometry + ~18.8 GiB
+    // Most of the 5.5 GiB trunk is streamable per-layer attention projections.
+    m.attn_trunk_bytes = static_cast<uint64_t>(4.0 * static_cast<double>(GiB));
+    return m;
+}
+
+// Auto vs Max on the SAME machine + model: Max dedicates the machine (all RAM,
+// no good-neighbor shave) and must therefore hold MORE resident than Auto -
+// a strictly larger usable budget, >= KV window, >= resident experts, and <=
+// trunk streaming (fewer streamed bytes), with a strictly higher projected
+// peak. Auto's peak must stay within its conservative share.
+static void test_auto_vs_max_same_machine() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 24 * GiB;
+    hw.ram_free_bytes  = 22 * GiB;
+
+    ModelShape m = mixtral_streamable();
+
+    PlacementPlan a = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                     /*cache=*/0, RamMode::Auto);
+    PlacementPlan x = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                     /*cache=*/0, RamMode::Max);
+
+    // Max's usable ceiling is strictly larger (no 85%/free-headroom shave).
+    CHECK(x.usable_ram_bytes > a.usable_ram_bytes);
+    // Auto respects its conservative share; Max uses more and peaks higher.
+    CHECK(a.planned_peak_bytes <= a.usable_ram_bytes);
+    CHECK(x.planned_peak_bytes > a.planned_peak_bytes);
+    // Max holds >= experts resident and >= KV window than Auto.
+    CHECK(x.expert_slots_resident >= a.expert_slots_resident);
+    // KV window: 0 means full n_ctx. Max keeps a window at least as large as
+    // Auto (full if Auto stepped down, equal otherwise).
+    if (a.kv_window != 0) {
+        CHECK(x.kv_window == 0 || x.kv_window >= a.kv_window);
+    }
+    // Max streams the trunk no harder than Auto (fewer or equal hot layers
+    // means fewer streamed bytes; 0 = trunk fully resident).
+    if (x.trunk_pool_layers == 0) {
+        CHECK(x.trunk_pool_layers <= a.trunk_pool_layers);  // 0 <= anything
+    } else {
+        CHECK(a.trunk_pool_layers != 0);
+        CHECK(x.trunk_pool_layers >= a.trunk_pool_layers);  // more hot layers
+    }
+
+    std::printf("[auto vs max: usable %lluMiB<%lluMiB peak %lluMiB<%lluMiB "
+                "slots %u<=%u pool %u<=%u] ",
+                static_cast<unsigned long long>(a.usable_ram_bytes / MiB),
+                static_cast<unsigned long long>(x.usable_ram_bytes / MiB),
+                static_cast<unsigned long long>(a.planned_peak_bytes / MiB),
+                static_cast<unsigned long long>(x.planned_peak_bytes / MiB),
+                a.expert_slots_resident, x.expert_slots_resident,
+                a.trunk_pool_layers, x.trunk_pool_layers);
+}
+
+// An explicit tight target drives ALL levers so the projected peak fits the
+// target, and because the target is BELOW the full trunk-resident floor it
+// ENGAGES trunk streaming (trunk_pool_layers > 0) and a stepped-down KV window.
+static void test_explicit_target_drives_levers() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 24 * GiB;   // plenty of RAM; the TARGET is the ceiling
+    hw.ram_free_bytes  = 22 * GiB;
+
+    ModelShape m = mixtral_streamable();
+    const uint64_t target = 3 * GiB;  // well below the trunk-resident floor
+
+    PlacementPlan plan = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                        /*cache=*/0, RamMode::Auto,
+                                        /*target=*/target);
+
+    // The target is used as the EXACT usable ceiling.
+    CHECK_EQ(plan.usable_ram_bytes, target);
+    CHECK(plan.fits);
+    CHECK(plan.planned_peak_bytes <= target);
+    // Trunk streaming engaged: a bounded hot pool, not the full trunk.
+    CHECK(plan.trunk_pool_layers > 0u);
+    CHECK(plan.trunk_pool_layers < m.n_layers);
+    // KV window stepped down (lossless) into (0, n_ctx).
+    CHECK(plan.kv_window > 0u);
+    CHECK(plan.kv_window < m.n_ctx);
+    // Experts streamed too (cannot hold the full working set in 3 GiB).
+    CHECK(plan.stream_experts);
+    CHECK(plan.expert_slots_resident >= m.n_experts_used);
+
+    std::printf("[explicit target 3GiB: peak=%lluMiB pool=%u kv=%u slots=%u] ",
+                static_cast<unsigned long long>(plan.planned_peak_bytes / MiB),
+                plan.trunk_pool_layers, plan.kv_window,
+                plan.expert_slots_resident);
+}
+
+// A pathologically tiny target - below the achievable floor (minimal KV window
+// + minimal experts + maximal trunk streaming) - must FAIL LOUD: fits==false
+// and a non-empty refusal_reason that names the floor/shortfall.
+static void test_target_below_floor_refuses_loudly() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 24 * GiB;
+    hw.ram_free_bytes  = 22 * GiB;
+
+    ModelShape m = mixtral_streamable();
+    const uint64_t target = 256 * MiB;  // below even the process floor + margin
+
+    PlacementPlan plan = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                        /*cache=*/0, RamMode::Auto,
+                                        /*target=*/target);
+
+    CHECK(!plan.fits);
+    CHECK(!plan.refusal_reason.empty());
+    // The reason must name the achievable floor so the user can raise the
+    // target to a workable value.
+    CHECK(plan.refusal_reason.find("floor") != std::string::npos);
+    CHECK_EQ(plan.usable_ram_bytes, target);  // target still used as the ceiling
+}
+
+// An explicit target OVERRIDES the mode: even with RamMode::Max the usable
+// ceiling is the target, not all-available RAM. Compare to a plain Max run
+// (no target) on the same machine to prove the target won.
+static void test_target_overrides_mode() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 24 * GiB;
+    hw.ram_free_bytes  = 22 * GiB;
+
+    ModelShape m = mixtral_streamable();
+    const uint64_t target = 4 * GiB;
+
+    PlacementPlan with_target = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                               /*cache=*/0, RamMode::Max,
+                                               /*target=*/target);
+    PlacementPlan pure_max = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                            /*cache=*/0, RamMode::Max);
+
+    // The target wins over Max: usable == target, far below all-available RAM.
+    CHECK_EQ(with_target.usable_ram_bytes, target);
+    CHECK(with_target.usable_ram_bytes < pure_max.usable_ram_bytes);
+    CHECK(with_target.planned_peak_bytes <= target);
+}
+
 static void run_all() {
     RUN(test_low_ram_streams);
     RUN(test_small_moe_fully_resident);
@@ -344,6 +487,10 @@ static void run_all() {
     RUN(test_mixtral_12gb_conservative_budget);
     RUN(test_unknown_ram_profile_nonzero_budget);
     RUN(test_gpu_pins_trunk);
+    RUN(test_auto_vs_max_same_machine);
+    RUN(test_explicit_target_drives_levers);
+    RUN(test_target_below_floor_refuses_loudly);
+    RUN(test_target_overrides_mode);
 }
 
 TEST_MAIN()
