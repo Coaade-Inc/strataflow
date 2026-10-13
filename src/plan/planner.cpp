@@ -62,6 +62,33 @@ uint64_t usable_ram(const HardwareProfile &hw) {
     return usable;
 }
 
+// ALL-available RAM for Max mode: dedicate the machine to the model. Unlike
+// usable_ram() this applies NO conservative shave (no free-headroom, no 85%
+// cap) - it hands the planner the full physical/available RAM so it holds the
+// full KV window, the maximal expert cache, and the trunk fully resident when
+// RAM affords it. Prefer the OS-reported free RAM when known (so we do not
+// claim more than is actually available), else total RAM, else the same
+// non-zero unknown-profile fallback usable_ram() uses (so the zero-RAM/dry-run
+// path never collapses the budget to 0).
+uint64_t all_available_ram(const HardwareProfile &hw) {
+    if (hw.ram_free_bytes) return hw.ram_free_bytes;
+    if (hw.ram_total_bytes) return hw.ram_total_bytes;
+    return kUnknownRamFallbackBytes;
+}
+
+// Resolve the usable-RAM ceiling by the documented precedence (see
+// plan_placement in the header): an explicit target wins, then the explicit
+// ram_budget, then Max mode uses all-available RAM, else Auto uses the
+// conservative good-neighbor share. The result is always non-zero (the
+// unknown-profile fallback is carried through every branch).
+uint64_t resolve_usable_ram(const HardwareProfile &hw, uint64_t ram_budget,
+                            RamMode mode, uint64_t target_ram_budget) {
+    if (target_ram_budget) return target_ram_budget;  // explicit exact target
+    if (ram_budget) return ram_budget;                // explicit --ram-gb
+    if (mode == RamMode::Max) return all_available_ram(hw);  // dedicate machine
+    return usable_ram(hw);                            // Auto good-neighbor share
+}
+
 // Conservative resident KV estimate matching Engine::resident_kv_bytes():
 //   n_layer * 2 (K+V) * (head_dim * n_head_kv) * sizeof(float) * W
 // where W is the chosen window (columns). When the shape fields are unknown
@@ -128,16 +155,21 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
                              const ModelShape &model,
                              uint64_t vram_budget,
                              uint64_t ram_budget,
-                             uint64_t cache_budget) {
+                             uint64_t cache_budget,
+                             RamMode mode,
+                             uint64_t target_ram_budget) {
     PlacementPlan plan;
 
     uint64_t vram = vram_budget;
     if (vram == 0 && !hw.gpus.empty()) {
         vram = hw.gpus.front().vram_bytes;
     }
-    // CONSERVATIVE usable RAM ceiling. An explicit ram_budget overrides it (the
-    // caller asked for an exact number); 0 = auto from the profile.
-    const uint64_t usable = ram_budget ? ram_budget : usable_ram(hw);
+    // Usable RAM ceiling resolved by precedence: explicit target > explicit
+    // ram_budget > Max (all available RAM) > Auto (conservative good-neighbor
+    // share). An explicit numeric budget (target or ram_budget) is used as the
+    // EXACT ceiling. The result is always non-zero (unknown-profile fallback).
+    const uint64_t usable =
+        resolve_usable_ram(hw, ram_budget, mode, target_ram_budget);
     plan.usable_ram_bytes = usable;
 
     const uint64_t per_layer_trunk =
@@ -238,8 +270,30 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
     const uint32_t kMinKvWindow = 256;
     const uint64_t lower_experts =
         model.n_experts_used ? model.n_experts_used : 1;
+
+    // Trunk footprint the KV step-down should budget against. The per-layer
+    // attention trunk (attn_trunk_bytes) is STREAMABLE (FEAT-003), so when a
+    // tight budget would otherwise force the trunk into a bounded hot pool, the
+    // KV window must step down against the MINIMAL achievable trunk footprint
+    // (non-attention trunk + a single hot attention layer), not the full
+    // resident trunk. Otherwise the two levers do not co-reduce and a tight
+    // target cannot be met even though streaming the trunk would free the RAM
+    // the smaller KV window needs. When nothing is streamable
+    // (attn_trunk_bytes==0) this equals the full trunk, so the existing
+    // behavior is unchanged. This only ever LOWERS the fixed estimate used to
+    // pick the window; it does not change which bytes compute.
+    const uint64_t kv_attn_trunk =
+        model.n_layers ? std::min(model.attn_trunk_bytes, trunk_in_ram) : 0;
+    const uint64_t kv_non_attn_trunk =
+        trunk_in_ram > kv_attn_trunk ? trunk_in_ram - kv_attn_trunk : 0;
+    const uint64_t kv_per_layer_attn =
+        model.n_layers ? kv_attn_trunk / model.n_layers : 0;
+    const uint64_t trunk_floor_for_kv =
+        kv_per_layer_attn > 0 ? kv_non_attn_trunk + kv_per_layer_attn
+                              : trunk_in_ram;
+
     const uint64_t fixed_wo_kv =
-        trunk_in_ram + staging + process_floor + margin +
+        trunk_floor_for_kv + staging + process_floor + margin +
         compute_estimate_bytes(model, model.n_ctx) + lower_experts * per_bundle;
 
     uint32_t chosen_window = model.n_ctx;  // 0 if n_ctx unknown
@@ -257,7 +311,7 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
                 const uint64_t kvw = kv_bytes_for_window(model, w);
                 const uint64_t compute_w = compute_estimate_bytes(model, w);
                 const uint64_t fixed_w =
-                    trunk_in_ram + staging + process_floor + margin +
+                    trunk_floor_for_kv + staging + process_floor + margin +
                     compute_w + lower_experts * per_bundle;
                 if (fixed_w + kvw <= usable) {
                     best = w;  // first (largest) that fits
@@ -403,7 +457,10 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
             os << ", KV window " << plan.kv_window;
         os << ") projects peak " << (plan.planned_peak_bytes / kMiB)
            << " MiB, which is " << (over / kMiB) << " MiB over the usable RAM "
-           << (usable / kMiB) << " MiB. Dominant components: trunk-in-RAM "
+           << (usable / kMiB) << " MiB. The achievable floor (this minimal "
+           << "projected peak of " << (plan.planned_peak_bytes / kMiB)
+           << " MiB) is the smallest this model fits in; raise the target to "
+           << "at least that. Dominant components: trunk-in-RAM "
            << (trunk_in_ram_eff / kMiB) << " MiB, experts "
            << (resident_experts / kMiB) << " MiB, KV " << (kv_resident / kMiB)
            << " MiB, staging " << (staging / kMiB) << " MiB, compute "

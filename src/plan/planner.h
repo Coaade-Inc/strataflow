@@ -12,6 +12,30 @@ namespace sf {
 
 // Minimal model shape the planner needs. Populated by the model loader; for
 // Phase 1 the dry-run model fills in representative values.
+// Target-RAM mode selector (task-target-ram-modes). This chooses HOW the
+// planner derives its usable-RAM ceiling when the caller does not pass an
+// explicit numeric budget (ram_budget / target_ram_budget both 0):
+//
+//   Auto (the DEFAULT) - good-neighbor conservative share of RAM. The planner
+//     leaves headroom for other apps on a shared/laptop machine: it caps at a
+//     fraction of physical RAM and shaves a free-RAM headroom (see
+//     usable_ram), then pulls resident footprint down (lossless KV window
+//     step-down + adaptive per-layer trunk streaming) when the model would
+//     otherwise dominate RAM. This is the sensible default for a machine that
+//     also runs other work.
+//
+//   Max - dedicate the machine to the model: use ALL available RAM (plus the
+//     full VRAM budget) WITHOUT the conservative free-headroom / fraction
+//     shave, so the plan holds the full KV window (kv_window stays 0 = full
+//     n_ctx when it fits), the maximal resident expert cache, and the trunk
+//     fully resident (trunk_pool_layers 0) whenever all-RAM affords it. This
+//     minimizes streaming and maximizes tok/s at the cost of leaving no
+//     headroom for other apps.
+//
+// An explicit target_ram_budget (bytes, see plan_placement) OVERRIDES the mode:
+// it is used directly as the exact usable ceiling regardless of Auto/Max.
+enum class RamMode { Auto, Max };
+
 struct ModelShape {
     std::string name;
     uint32_t    n_layers      = 0;
@@ -131,11 +155,38 @@ struct PlacementPlan {
 // the RAM-for-experts before the slot count is derived, so a user can force a
 // bounded, smaller resident expert footprint than free RAM would otherwise
 // allow. It never raises the choice above what free RAM / the working set
-// support; it only lowers it. See plan_placement for the exact precedence.
+// support; it only lowers it.
+//
+// `mode` and `target_ram_budget` select the usable-RAM ceiling the plan is
+// sized against. Both are backward-compatible defaulted trailing parameters so
+// existing callers compile unchanged (RamMode::Auto, target 0). The usable-RAM
+// ceiling is resolved by this PRECEDENCE (highest wins):
+//   1. Explicit low-level knobs (STRATAFLOW_ENGINE_KV_WINDOW / --expert-slots /
+//      --cache-gb) - handled ABOVE the planner and via cache_budget; not a
+//      budget-selection concern here.
+//   2. target_ram_budget (> 0) - an EXPLICIT numeric target in bytes. Used
+//      directly as the exact usable ceiling (like an explicit ram_budget), and
+//      it OVERRIDES the mode. The lossless KV-window step-down and the adaptive
+//      per-layer trunk streaming engage automatically when a tight target
+//      lowers usable below the full-resident footprint; a target below the
+//      achievable floor keeps fits=false with the floor named in
+//      refusal_reason.
+//   3. ram_budget (> 0) - the existing explicit numeric RAM budget (--ram-gb).
+//      Unchanged behavior; used directly as the usable ceiling.
+//   4. mode == RamMode::Max - use ALL available RAM (ram_free_bytes when known,
+//      else ram_total_bytes, else the unknown-profile fallback) WITHOUT the
+//      conservative shave, so the plan holds the full KV window + maximal
+//      experts + trunk fully resident when all-RAM affords it.
+//   5. mode == RamMode::Auto (the DEFAULT) - the conservative good-neighbor
+//      usable_ram() share that leaves headroom for other apps.
+// The zero-RAM / unknown-profile path always yields a non-zero usable budget
+// (never collapses to 0), in every mode.
 PlacementPlan plan_placement(const HardwareProfile &hw,
                              const ModelShape &model,
                              uint64_t vram_budget,
                              uint64_t ram_budget,
-                             uint64_t cache_budget = 0);
+                             uint64_t cache_budget = 0,
+                             RamMode mode = RamMode::Auto,
+                             uint64_t target_ram_budget = 0);
 
 } // namespace sf
