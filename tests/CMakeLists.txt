@@ -87,3 +87,17 @@ sf_add_test(test_strata_shape_prepass)
 # Only drives the library (pack + load + plan + engine + oracle), so a plain
 # sf_add_test suffices.
 sf_add_test(test_kv_window_real_path)
+
+# test_target_ram_modes_real_path is the task-target-ram-modes real-load-path
+# gate: it packs the Mixtral-geometry legacy fixture to .strata and loads it
+# through sf::load_model with each of the three target-RAM modes (explicit tight
+# target, auto good-neighbor default, max dedicate-machine), proving the
+# explicit target drives the levers so projected peak <= target WITH adaptive
+# trunk streaming engaged, auto leaves a good-neighbor margin strictly below
+# max, max minimizes streaming, and the greedy decode is BIT-IDENTICAL
+# (max|delta|==0.0) across all three modes and matches the libllama oracle on
+# the matched stacked GGUF within the soft quant bound. Only drives the library
+# (pack + load + plan + engine + oracle), so a plain sf_add_test suffices;
+# fixture env (STRATAFLOW_TEST_MIXTRAL_GEOM_GGUF / _STACKED_GGUF) propagates
+# through ctest the same way as test_kv_window_real_path.
+sf_add_test(test_target_ram_modes_real_path)

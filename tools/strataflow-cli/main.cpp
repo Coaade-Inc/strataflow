@@ -37,7 +37,24 @@ void print_usage(const char *argv0) {
         "  --expert-slots N   bound streamed experts to N bundles (0 = auto;\n"
         "                     a value below the model's expert count forces\n"
         "                     bounded streaming - run a big model in little RAM).\n"
-        "                     Precedence: --expert-slots > --cache-gb > auto.\n"
+        "  --target-ram-gb X  explicit target RAM ceiling in GiB. The planner\n"
+        "                     drives ALL levers (KV window, expert cache,\n"
+        "                     adaptive trunk streaming, VRAM placement) so the\n"
+        "                     projected peak fits within X, or refuses loudly\n"
+        "                     naming the achievable floor. Overrides --ram-mode.\n"
+        "  --ram-mode auto|max\n"
+        "                     auto (default) = good-neighbor conservative share\n"
+        "                     of RAM, leaving headroom for other apps; max =\n"
+        "                     dedicate the machine (all RAM + VRAM placement\n"
+        "                     budget, full KV, maximal experts, trunk resident).\n"
+        "  --max-performance  alias for --ram-mode max.\n"
+        "                     Precedence: --expert-slots / --cache-gb /\n"
+        "                     STRATAFLOW_ENGINE_KV_WINDOW (manual overrides) >\n"
+        "                     --target-ram-gb (explicit target) > --ram-mode max\n"
+        "                     > --ram-mode auto (default). GPU note: the planner\n"
+        "                     budgets VRAM placement when a GPU is present, but\n"
+        "                     the engine runs CPU-only (GPU-accelerated execution\n"
+        "                     is the enterprise roadmap track, not implemented).\n"
         "  --max-tokens N     generation cap (default 64)\n"
         "  --async-prefetch on|off\n"
         "                     overlap the next layer's expert disk reads with\n"
@@ -72,6 +89,8 @@ int main(int argc, char **argv) {
     std::string model_path;
     std::string prompt = "hello from strataflow";
     double vram_gb = 0, ram_gb = 0, cache_gb = 0;
+    double target_ram_gb = 0;    // 0 = use ram_mode (no explicit byte target)
+    uint32_t ram_mode = SF_RAM_MODE_AUTO;  // good-neighbor default (0)
     uint32_t expert_slots = 0;
     int max_tokens = 64;
     bool plan_only = false;
@@ -94,6 +113,20 @@ int main(int argc, char **argv) {
         else if (a == "--ram-gb")       { ram_gb = std::atof(next("--ram-gb")); }
         else if (a == "--cache-gb")     { cache_gb = std::atof(next("--cache-gb")); }
         else if (a == "--expert-slots") { expert_slots = (uint32_t)std::strtoul(next("--expert-slots"), nullptr, 10); }
+        else if (a == "--target-ram-gb"){ target_ram_gb = std::atof(next("--target-ram-gb")); }
+        else if (a == "--ram-mode") {
+            const char *v = next("--ram-mode");
+            if (std::strcmp(v, "auto") == 0) {
+                ram_mode = SF_RAM_MODE_AUTO;
+            } else if (std::strcmp(v, "max") == 0) {
+                ram_mode = SF_RAM_MODE_MAX;
+            } else {
+                std::fprintf(stderr,
+                             "error: --ram-mode expects auto|max (got '%s')\n", v);
+                std::exit(2);
+            }
+        }
+        else if (a == "--max-performance") { ram_mode = SF_RAM_MODE_MAX; }
         else if (a == "--max-tokens")   { max_tokens = std::atoi(next("--max-tokens")); }
         else if (a == "--async-prefetch") {
             const char *v = next("--async-prefetch");
@@ -137,6 +170,8 @@ int main(int argc, char **argv) {
     params.expert_slots = expert_slots;
     params.cache_budget = gib(cache_gb);  // 0 = auto; caps the auto slot choice
     params.async_prefetch = async_prefetch ? 1 : 0;  // FEAT-003 overlap toggle
+    params.target_ram_budget = gib(target_ram_gb);  // 0 = use ram_mode
+    params.ram_mode = ram_mode;  // auto (default) | max
 
     sf_context *ctx = nullptr;
     sf_status st = sf_context_create(&params, &ctx);

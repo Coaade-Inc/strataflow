@@ -83,10 +83,17 @@ public:
 // tensor load. `out_plan`, when non-null, receives the plan the loader applied
 // (for the GGUF path) or an auto plan over the chosen model's shape (dry-run),
 // so the C API can describe exactly what was decided.
+//
+// `mode` and `target_ram_budget` (task-target-ram-modes) select the usable-RAM
+// ceiling the planner sizes against; they are appended as DEFAULTED trailing
+// params (RamMode::Auto, target 0) so existing callers compile unchanged, and
+// forwarded into every plan_placement call below.
 sf_status load_model(const std::string &path, const HardwareProfile &hw,
                      uint64_t vram_budget, uint64_t ram_budget,
                      std::unique_ptr<Model> &out, PlacementPlan *out_plan,
-                     uint64_t cache_budget = 0);
+                     uint64_t cache_budget = 0,
+                     RamMode mode = RamMode::Auto,
+                     uint64_t target_ram_budget = 0);
 
 // Phase 1b/2 llama.cpp backend. Loads a GGUF file via the llama.cpp C API and
 // implements the Model interface with real tokenize/detokenize and a real
@@ -103,6 +110,8 @@ sf_status load_model(const std::string &path, const HardwareProfile &hw,
 sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
                           uint64_t vram_budget, uint64_t ram_budget,
                           std::unique_ptr<Model> &out, PlacementPlan *out_plan,
-                          uint64_t cache_budget = 0);
+                          uint64_t cache_budget = 0,
+                          RamMode mode = RamMode::Auto,
+                          uint64_t target_ram_budget = 0);
 
 } // namespace sf

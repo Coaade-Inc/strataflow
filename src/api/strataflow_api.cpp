@@ -81,6 +81,8 @@ sf_context_params sf_context_default_params(void) {
     p.expert_slots      = 0;   // auto (hold the whole expert working set)
     p.cache_budget      = 0;   // auto (size experts from free RAM)
     p.async_prefetch    = 1;   // async/overlapped expert prefetch ON (default)
+    p.target_ram_budget = 0;   // 0 = use ram_mode (no explicit byte target)
+    p.ram_mode          = SF_RAM_MODE_AUTO;  // good-neighbor default (0)
     return p;
 }
 
@@ -162,13 +164,25 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
     const std::string model_dir = sf::containing_dir(params->model_path);
     ctx->hw = sf::profile_hardware(model_dir, /*quick=*/false);
 
+    // Map the ABI target-RAM mode (sf_ram_mode) to the planner's RamMode. An
+    // explicit target_ram_budget (> 0) OVERRIDES the mode inside the planner
+    // (see plan_placement precedence), so we always forward both; the planner
+    // resolves the precedence. Any unknown ram_mode value degrades to Auto (the
+    // sensible default) rather than failing the load.
+    const sf::RamMode ram_mode = (params->ram_mode == SF_RAM_MODE_MAX)
+                                     ? sf::RamMode::Max
+                                     : sf::RamMode::Auto;
+
     // The planner runs INSIDE load_model now, so the chosen placement actually
     // drives how the GGUF backend loads the model (VRAM layers + expert
-    // offload). An explicit budget of 0 means "auto from the profile".
+    // offload). An explicit budget of 0 means "auto from the profile". The
+    // target/mode select the usable-RAM ceiling the plan is sized against
+    // (precedence: explicit low-level knobs > target_ram_budget > ram_mode).
     sf_status st = sf::load_model(params->model_path, ctx->hw,
                                   params->vram_budget, params->ram_budget,
                                   ctx->model, &ctx->plan,
-                                  params->cache_budget);
+                                  params->cache_budget, ram_mode,
+                                  params->target_ram_budget);
     if (st != SF_OK) return st;
 
     // FEAT-002: REFUSE LOUDLY rather than hand back an over-committing context.

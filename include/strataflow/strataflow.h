@@ -77,6 +77,25 @@ typedef enum sf_backend {
 typedef struct sf_context sf_context;   /* engine instance + loaded model */
 typedef struct sf_session sf_session;   /* one conversation / KV state    */
 
+/* ---- target-RAM mode selector ----------------------------------------- */
+/* How the planner derives its usable-RAM ceiling when no explicit numeric
+ * target is given (sf_context_params::target_ram_budget == 0). Default-zero is
+ * AUTO, the sensible default for a shared/laptop machine. */
+typedef enum sf_ram_mode {
+    /* Good-neighbor conservative share of RAM: leave headroom for other apps
+       on a machine that also runs other work. The planner caps at a fraction
+       of physical RAM, shaves a free-RAM headroom, and pulls resident
+       footprint down (lossless KV window step-down + adaptive per-layer trunk
+       streaming) when the model would otherwise dominate RAM. */
+    SF_RAM_MODE_AUTO = 0,
+    /* Dedicate the machine to the model: use ALL available RAM (plus the full
+       VRAM placement budget) WITHOUT the conservative shave, so the plan holds
+       the full KV window, the maximal resident expert cache, and the trunk
+       fully resident whenever all-RAM affords it. Minimizes streaming and
+       maximizes tok/s at the cost of leaving no headroom for other apps. */
+    SF_RAM_MODE_MAX  = 1,
+} sf_ram_mode;
+
 /* ---- model / context params ------------------------------------------- */
 typedef struct sf_context_params {
     /* Path to a .gguf or .strata model (or a .strata directory). */
@@ -129,6 +148,42 @@ typedef struct sf_context_params {
        or keep the setting uniform across concurrent creations. Appended
        for ABI compatibility; default 1 (enabled). */
     int32_t async_prefetch;
+
+    /* Explicit target RAM ceiling in BYTES (the --target-ram-gb dial). 0 means
+       "use ram_mode" (the default). When > 0 the planner drives ALL the fit
+       levers - the lossless KV window, the resident expert cache, the adaptive
+       per-layer trunk streaming, and the VRAM placement budget - so the
+       projected peak fits WITHIN this target, or REFUSES loudly (the context
+       create fails with SF_ERR_RUNTIME and a logged reason naming the
+       achievable floor) when even the minimal configuration cannot fit. An
+       explicit target OVERRIDES ram_mode. Appended for ABI compatibility;
+       default 0. */
+    uint64_t target_ram_budget;
+
+    /* Target-RAM mode (sf_ram_mode): SF_RAM_MODE_AUTO (0, the default) =
+       good-neighbor conservative share of RAM leaving headroom for other apps;
+       SF_RAM_MODE_MAX (1) = dedicate the machine to the model (all RAM + full
+       VRAM placement budget, full KV window, maximal experts, trunk resident).
+       Used only when target_ram_budget == 0 (an explicit target overrides the
+       mode). Default-zero == SF_RAM_MODE_AUTO.
+
+       PRECEDENCE (highest wins): the explicit low-level manual knobs
+       (STRATAFLOW_ENGINE_KV_WINDOW env / expert_slots / cache_budget) >
+       target_ram_budget (explicit target) > ram_mode == SF_RAM_MODE_MAX >
+       ram_mode == SF_RAM_MODE_AUTO (default). The manual knobs keep exact
+       per-lever control for power users; the target drives all levers to a
+       byte ceiling; the modes are the two convenient ends of the spectrum.
+
+       GPU HONESTY: when a GPU is present the planner BUDGETS VRAM placement
+       (it places trunk layers / sizes a VRAM expert cache), but full
+       GPU-accelerated execution is the enterprise roadmap track and is NOT
+       implemented - the StrataFlow engine runs CPU-only (every llama_model_
+       params the engine builds sets n_gpu_layers = 0). auto/max function
+       correctly on CPU; the RAM side is the proven, measured mechanism, and
+       VRAM is read only to the extent the planner genuinely supports it
+       (placement budgeting, not accelerated compute). Appended for ABI
+       compatibility; default 0 (== SF_RAM_MODE_AUTO). */
+    uint32_t ram_mode;
 } sf_context_params;
 
 /* Returns params filled with safe defaults (auto_plan on, CPU backend). */
