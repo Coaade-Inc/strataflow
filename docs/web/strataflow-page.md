@@ -91,7 +91,10 @@ per second). RAM size does not cap what you can run.
   that budget automatically, or tells you clearly, naming the floor, if the
   budget is too small - no silent out-of-memory kill. **Max** (`--ram-mode max`)
   does the opposite: it dedicates the machine to the model, holding the whole
-  working set resident for the fastest decode. More budget buys speed, not a
+  working set resident for the fastest decode. (Max sizes to the RAM actually
+  free, so on a machine whose free RAM is already low it can resolve near or
+  below the conservative auto share rather than always above it.) More budget
+  buys speed, not a
   different answer - the output is identical in every mode. If a GPU is present
   the planner budgets placement into VRAM as the fastest tier; GPU-accelerated
   compute itself is planned enterprise work, not a shipped feature, so these

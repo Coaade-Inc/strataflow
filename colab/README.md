@@ -408,7 +408,9 @@ those three knobs into ONE dial, with two modes plus an explicit numeric target:
 - `--ram-mode max` (or `--max-performance`; ABI `ram_mode == SF_RAM_MODE_MAX ==
   1`): dedicate the machine. All available RAM (plus the full VRAM budget the
   planner places), full KV window, maximal expert cache, trunk fully resident,
-  minimal streaming, maximal tok/s.
+  minimal streaming, maximal tok/s. (Max sizes to ACTUAL free RAM with no shave,
+  so on a box with little free but large total RAM its ceiling can land near or
+  below the auto share; max >= auto only when free RAM is ample.)
 
 Precedence (highest wins): the low-level knobs
 (`STRATAFLOW_ENGINE_KV_WINDOW` / `--expert-slots` / `--cache-gb`) >
@@ -471,8 +473,12 @@ measured mechanism.
 
   Keep it honest: the absolute real-Mixtral GiB per mode are the Colab re-run;
   the sandbox proves the mechanism, the mode differences (max uses more RAM /
-  streams fewer bytes than auto; auto leaves a good-neighbor margin below max),
-  and that the decoded text is byte-identical across all three modes.
+  streams fewer bytes than auto; auto leaves a good-neighbor margin below max
+  when free RAM is ample), and that the decoded text is byte-identical across
+  all three modes. Honest edge: max sizes to actual free RAM with no shave, so
+  on a machine with little free but large total RAM max's ceiling can land near
+  or below the auto share (which can fall back to avail/2 or the 85%-of-total
+  cap); the max > auto ordering holds only when free RAM is ample.
 
 ### Which real model, and why
 

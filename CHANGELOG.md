@@ -35,7 +35,10 @@ grouped by the pull request that merged them.
   leaves headroom for other apps by taking only the conservative `usable_ram`
   share (`free - max(1 GiB, 12.5%)`, capped at 85% of total). Max dedicates the
   machine: all available RAM (plus the full VRAM budget), full KV window, maximal
-  expert cache, trunk fully resident, minimal streaming. GPU honesty: auto/max
+  expert cache, trunk fully resident, minimal streaming. (Honest edge: max sizes
+  to actual free RAM with no shave, so on a machine with little free but large
+  total RAM its ceiling can land near or below the auto share; max >= auto holds
+  only when free RAM is ample.) GPU honesty: auto/max
   MAY read VRAM and the planner BUDGETS VRAM placement
   (`plan.trunk_layers_in_vram` / `plan.expert_slots_vram` ->
   `derive_llama_placement` -> `n_gpu_layers`), but that only affects the

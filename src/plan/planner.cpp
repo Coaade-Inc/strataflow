@@ -70,6 +70,13 @@ uint64_t usable_ram(const HardwareProfile &hw) {
 // claim more than is actually available), else total RAM, else the same
 // non-zero unknown-profile fallback usable_ram() uses (so the zero-RAM/dry-run
 // path never collapses the budget to 0).
+//
+// EDGE (documented): because this prefers free RAM with no shave while
+// usable_ram() can fall back to avail/2 or the 85%-of-total cap, on a machine
+// whose free RAM is low but whose total RAM is large this ceiling can resolve
+// near or even below the Auto good-neighbor share. That is intentional: Max
+// sizes to what is actually free, so "Max >= Auto" holds only when free RAM is
+// ample. Do not add a shave here to force the ordering.
 uint64_t all_available_ram(const HardwareProfile &hw) {
     if (hw.ram_free_bytes) return hw.ram_free_bytes;
     if (hw.ram_total_bytes) return hw.ram_total_bytes;

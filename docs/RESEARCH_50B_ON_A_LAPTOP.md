@@ -121,7 +121,11 @@ box. For the common case the user does not even pick a number:
   SF_RAM_MODE_MAX == 1`)** is the opposite end: dedicate the machine. It uses all
   available RAM (plus the full VRAM budget the planner places), a full KV window,
   the maximal expert cache, and the trunk fully resident, minimizing streaming
-  and maximizing tok/s.
+  and maximizing tok/s. Honest edge: max sizes to ACTUAL free RAM with no
+  conservative shave, so on a machine whose free RAM is already low while total
+  RAM is large, max's ceiling can land near or below the auto share (which can
+  fall back to avail/2 or the 85%-of-total cap); max holds at least as much as
+  auto only when free RAM is ample.
 
 Precedence (highest wins): the explicit low-level knobs
 (`STRATAFLOW_ENGINE_KV_WINDOW` / `--expert-slots` / `--cache-gb`) still win for

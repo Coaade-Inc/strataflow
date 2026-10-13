@@ -344,7 +344,12 @@ families are the remaining quant-coverage gap.
   share (`free - max(1 GiB, 12.5%)`, capped at 85% of total), so the model does
   not take the whole box. **Max dedicates the machine**: it uses all available
   RAM (plus the full VRAM budget), full KV window, maximal expert cache, and the
-  trunk fully resident (minimal streaming, maximal tok/s). GPU honesty, stated
+  trunk fully resident (minimal streaming, maximal tok/s). Honest edge: max
+  sizes to ACTUAL free RAM (no conservative shave), so on a machine whose free
+  RAM is already low while total RAM is large, max's resolved ceiling can land
+  near or even below the auto good-neighbor share (which can fall back to
+  avail/2 or the 85%-of-total cap); max >= auto holds only when free RAM is
+  ample. GPU honesty, stated
   plainly: auto/max MAY read VRAM from the profiler and the planner BUDGETS VRAM
   placement (`plan.trunk_layers_in_vram` / `plan.expert_slots_vram`, mapped by
   `derive_llama_placement` to `n_gpu_layers`), but that only affects the
