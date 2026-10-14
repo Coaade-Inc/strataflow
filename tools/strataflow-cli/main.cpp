@@ -47,6 +47,13 @@ void print_usage(const char *argv0) {
         "                     of RAM, leaving headroom for other apps; max =\n"
         "                     dedicate the machine (all RAM + VRAM placement\n"
         "                     budget, full KV, maximal experts, trunk resident).\n"
+        "  --device cpu|cuda|metal|vulkan|hip\n"
+        "                     preferred compute backend (default cpu). Selects a\n"
+        "                     GPU ggml backend ONLY on a build compiled with\n"
+        "                     -DSTRATAFLOW_GPU=<cuda|metal|vulkan> AND a GPU\n"
+        "                     present; otherwise the engine falls back to CPU\n"
+        "                     (never fails the load). The active backend is\n"
+        "                     reported in the plan line as 'compute=<name>'.\n"
         "  --max-performance  alias for --ram-mode max.\n"
         "                     Precedence: --expert-slots / --cache-gb /\n"
         "                     STRATAFLOW_ENGINE_KV_WINDOW (manual overrides) >\n"
@@ -95,6 +102,7 @@ int main(int argc, char **argv) {
     int max_tokens = 64;
     bool plan_only = false;
     bool async_prefetch = true;  // FEAT-003: overlap on by default
+    sf_backend device = SF_BACKEND_CPU;  // FEAT-004: preferred compute backend
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -123,6 +131,20 @@ int main(int argc, char **argv) {
             } else {
                 std::fprintf(stderr,
                              "error: --ram-mode expects auto|max (got '%s')\n", v);
+                std::exit(2);
+            }
+        }
+        else if (a == "--device") {
+            const char *v = next("--device");
+            if (std::strcmp(v, "cpu") == 0)         { device = SF_BACKEND_CPU; }
+            else if (std::strcmp(v, "cuda") == 0)   { device = SF_BACKEND_CUDA; }
+            else if (std::strcmp(v, "vulkan") == 0) { device = SF_BACKEND_VULKAN; }
+            else if (std::strcmp(v, "metal") == 0)  { device = SF_BACKEND_METAL; }
+            else if (std::strcmp(v, "hip") == 0)    { device = SF_BACKEND_HIP; }
+            else {
+                std::fprintf(stderr,
+                             "error: --device expects cpu|cuda|metal|vulkan|hip "
+                             "(got '%s')\n", v);
                 std::exit(2);
             }
         }
@@ -172,6 +194,7 @@ int main(int argc, char **argv) {
     params.async_prefetch = async_prefetch ? 1 : 0;  // FEAT-003 overlap toggle
     params.target_ram_budget = gib(target_ram_gb);  // 0 = use ram_mode
     params.ram_mode = ram_mode;  // auto (default) | max
+    params.preferred_backend = device;  // FEAT-004: cpu default; GPU when built+present
 
     sf_context *ctx = nullptr;
     sf_status st = sf_context_create(&params, &ctx);

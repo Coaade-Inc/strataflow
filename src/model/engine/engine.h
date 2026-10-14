@@ -139,12 +139,42 @@ public:
     // Only meaningful on a v2 trunk-indexed .strata; a v1/plain path ignores it
     // and stays fully resident. The explicit STRATAFLOW_ENGINE_NO_TRUNK_STREAM
     // env (user/test) still forces the fully-resident trunk inside load().
+    //
+    // `preferred_backend` is the FEAT-003 compute-backend hint from the PLAN /
+    // C ABI (sf_context_params.preferred_backend), mirroring the public
+    // sf_backend enum: 0 == SF_BACKEND_CPU (the default and always-safe
+    // fallback). On a CPU-only build (STRATAFLOW_GPU_ENABLED==0, the default)
+    // this is IGNORED - no GPU backend is compiled in, so the engine always
+    // selects the CPU backend and decode is byte-identical to today. On a GPU
+    // build a non-CPU value asks the engine to init the selected GPU ggml
+    // backend if a device is present, falling back to CPU if not. The trailing
+    // default (0) keeps every existing caller/test compiling unchanged on the
+    // CPU path.
     static std::unique_ptr<Engine> load(const std::string &path,
                                         uint32_t expert_slots = 0,
                                         uint32_t kv_window = 0,
-                                        uint32_t trunk_pool_layers = 0);
+                                        uint32_t trunk_pool_layers = 0,
+                                        int preferred_backend = 0);
 
     const EngineHParams &hparams() const;
+
+    // FEAT-003: true iff the engine selected a GPU ggml backend for compute,
+    // false for the CPU backend. On a CPU-only build (STRATAFLOW_GPU_ENABLED==0,
+    // the default) this is ALWAYS false - no GPU backend is compiled in, so the
+    // engine selects CPU and decode is byte-identical to the pre-FEAT-003
+    // engine. On a GPU build it reflects whether a GPU device was found and
+    // initialized (the engine falls back to CPU, reporting false, when no GPU is
+    // present). Lets the backend-selection unit test assert CPU is picked on a
+    // CPU-only build/machine.
+    bool is_gpu_backend() const;
+
+    // FEAT-004: canonical name of the ACTIVE compute backend the engine
+    // selected at load, one of "cpu" | "cuda" | "metal" | "vulkan" | "hip" |
+    // "gpu". On a CPU-only build (STRATAFLOW_GPU_ENABLED==0, the default) this
+    // is ALWAYS "cpu". Lets the API/CLI plan surface report, honestly, the
+    // backend that actually ran the forward pass without the api/model layers
+    // including any ggml header above the sf::Model seam.
+    const std::string &active_backend_name() const;
 
     // Bytes of model WEIGHTS held resident in RAM (the trunk-weight backing
     // buffer). On the .strata streaming path this EXCLUDES the expert tensors

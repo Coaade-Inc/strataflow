@@ -722,9 +722,11 @@ most are pure CPU/disk work.
   accordingly (after the lossless CPU/disk levers that make a 50B-class model
   fit and run on the no-GPU box).
 
-  - [ ] **Single-GPU acceleration first.** Route the hot experts, the hot trunk
-    and the KV cache into VRAM via a GPU ggml backend using
-    `ggml_backend_sched` (CPU + a GPU buffer type). This is NOT a separate code
+  - [~] **Single-GPU acceleration first (FOUNDATION LANDED, hardware-validation
+    pending).** Route the hot experts, the hot trunk and the KV cache into VRAM
+    via a GPU ggml backend using `ggml_backend_sched` (CPU + a GPU buffer type).
+    The backend is `metal` on Apple Silicon targets (Mac / Mac mini) and `cuda`
+    or `vulkan` on a discrete-GPU laptop. This is NOT a separate code
     path: VRAM is already the TOP tier in the engine's design - the tiered
     weight store spans VRAM, RAM and SSD (see
     [`ENGINE_CORE_DESIGN.md`](./ENGINE_CORE_DESIGN.md) sections 2.4 and 3.5, the
@@ -757,13 +759,52 @@ most are pure CPU/disk work.
         small-GPU + big-MoE offloads experts, whole-working-set-in-VRAM keeps
         experts resident, dense never offloads, `n_gpu_layers` clamps to the
         layer count) and the planner's VRAM-pressure cases in `test_planner`.
-    HONEST SCOPE: this only drives the NON-authoritative plain-GGUF libllama
-    sidecar today; the authoritative `.strata` engine decode is still CPU-only
-    (`n_gpu_layers = 0` in `engine.cpp`). The remaining, hardware-gated work is
-    the actual GPU-compute step - wiring a GPU buffer type into the engine's
-    `ggml_backend_sched` and the SSD->RAM->VRAM transfer nodes so the resident
-    tier lands in VRAM for the `.strata` path - which cannot be built or
-    validated in the CPU-only sandbox/CI.
+    SELECTABLE-BACKEND SEAM NOW IN PLACE (CPU-validated, not GPU-validated).
+    The engine's ggml compute backend is SELECTABLE: a `STRATAFLOW_GPU=off|cuda|
+    metal|vulkan` CMake option (default `off`) wires the vendored ggml backends
+    from the top-level CMake and defines compile-time guards on the engine TU,
+    and at runtime the engine picks the first available GPU ggml backend via the
+    backend-agnostic ggml-backend DEVICE/REGISTRY API (falling back to CPU when
+    none is compiled in or present). When a GPU is selected the gallocr and
+    every resident buffer (trunk `wbuf`, KV `kvbuf`, expert staging `estbuf`) are
+    allocated from the selected backend's default (device) buffer type, and the
+    per-token expert "fault bytes into the resident region" step becomes a
+    host->device upload (`ggml_backend_tensor_set`) through a single
+    host-or-device `stage_write` primitive. The selected backend is `cuda` or
+    `vulkan` for a discrete GPU and `metal` for Apple Silicon; the active
+    backend is reported in the plan line (`compute=<cpu|cuda|metal|vulkan>`) and
+    is selectable from the CLI (`--device`). The planner VRAM budget and the C
+    ABI `preferred_backend` are plumbed to `Engine::load`. For this first
+    increment, when a GPU is selected the whole resident set runs in VRAM and
+    the streamed trunk is forced resident (streamed-trunk-on-GPU is a follow-on);
+    the per-token EXPERT upload seam is device-correct regardless. The
+    GPU-supported first-increment path is the `.strata` STREAMING path (host
+    `StrataReader` -> host->device `stage_write` upload); a plain-GGUF MoE on a
+    GPU backend serves its experts from the resident `wctx` weight tensors with a
+    host-side read, so for this first increment that one case (GPU backend +
+    plain GGUF + MoE) is forced back to the CPU compute backend with a clear log
+    line. Dense GGUF and every `.strata` load (including `.strata`-on-GPU) are
+    unaffected; plain-GGUF MoE on GPU is a follow-on.
+    DONE (merged to main): the selectable-backend FOUNDATION - the
+    `STRATAFLOW_GPU` build option, the runtime GPU-when-present selector with
+    CPU fallback, the forward graph + resident buffers + expert-streaming upload
+    routed onto the selected backend's buffer type, the planner VRAM budget
+    wired to the engine, the active-backend reporting, and a hardware-gated GPU
+    decode test - is landed and CPU-CI-proven byte-identical.
+    HONEST SCOPE: on the default CPU-only build the whole GPU path compiles out,
+    the engine selects CPU, and decode is byte-identical to before and the
+    oracle (`max|delta| = 0.000e+00`), proven by `test_backend_selection` (CPU
+    selection + byte-identity) under GCC + Clang `-Werror`. GPU-accelerated
+    DECODE is USER-HARDWARE-VALIDATED (a CUDA laptop and an Apple Silicon Metal
+    machine); it is NOT runnable in the CPU-only sandbox/CI, where the
+    hardware-gated GPU test skips cleanly. The hardware-gated gate asserts the
+    GPU decode has the SAME greedy token sequence as the CPU/oracle run and a
+    per-logit delta within a documented tolerance (not bit-identity, because GPU
+    arithmetic differs at the last ULPs). The remaining follow-on work is
+    plain-GGUF-MoE-on-GPU (the `.strata` streaming path is the GPU-supported
+    one today), streamed-trunk-on-GPU, multi-GPU sharding, fine VRAM-vs-RAM
+    tiering, and GPU-resident KV (multi-tier `ggml_backend_sched` splitting),
+    which must be exercised on real GPU hardware.
   - [ ] **Multi-GPU parallelism.** Expert / tensor / pipeline parallelism across
     devices; a device-placement policy deciding which layers and experts live on
     which GPU; NVLink / PCIe topology-aware placement so transfers follow the

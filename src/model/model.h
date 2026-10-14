@@ -69,6 +69,15 @@ public:
     // decode stays byte-identical. 0 when not applicable (dry-run, or no engine
     // loaded yet).
     virtual uint64_t resident_kv_bytes() const { return 0; }
+
+    // FEAT-004: canonical name of the ACTIVE compute backend that ran the
+    // forward pass, one of "cpu" | "cuda" | "metal" | "vulkan" | "hip" | "gpu".
+    // On a CPU-only build (STRATAFLOW_GPU_ENABLED==0, the default) this is
+    // ALWAYS "cpu"; the GgmlModel engine path forwards the engine's selected
+    // backend. The dry-run model and the plain-GGUF/libllama path have no
+    // StrataFlow engine, so they report "cpu" (the default). Surfaced through
+    // the C ABI plan line so the active backend is observable honestly.
+    virtual std::string active_backend_name() const { return "cpu"; }
 };
 
 // Factory: inspects `path` and returns the right implementation.
@@ -88,12 +97,19 @@ public:
 // ceiling the planner sizes against; they are appended as DEFAULTED trailing
 // params (RamMode::Auto, target 0) so existing callers compile unchanged, and
 // forwarded into every plan_placement call below.
+//
+// FEAT-003: `preferred_backend` mirrors the public sf_backend enum (0 ==
+// SF_BACKEND_CPU, the default). It is forwarded to the engine so a GPU build
+// can select a GPU ggml backend; on a CPU-only build (the default) it is
+// ignored and the engine always selects CPU. Appended as a DEFAULTED trailing
+// param so existing callers compile unchanged.
 sf_status load_model(const std::string &path, const HardwareProfile &hw,
                      uint64_t vram_budget, uint64_t ram_budget,
                      std::unique_ptr<Model> &out, PlacementPlan *out_plan,
                      uint64_t cache_budget = 0,
                      RamMode mode = RamMode::Auto,
-                     uint64_t target_ram_budget = 0);
+                     uint64_t target_ram_budget = 0,
+                     int preferred_backend = 0);
 
 // Phase 1b/2 llama.cpp backend. Loads a GGUF file via the llama.cpp C API and
 // implements the Model interface with real tokenize/detokenize and a real
@@ -112,6 +128,7 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
                           std::unique_ptr<Model> &out, PlacementPlan *out_plan,
                           uint64_t cache_budget = 0,
                           RamMode mode = RamMode::Auto,
-                          uint64_t target_ram_budget = 0);
+                          uint64_t target_ram_budget = 0,
+                          int preferred_backend = 0);
 
 } // namespace sf

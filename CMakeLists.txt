@@ -35,7 +35,29 @@ option(STRATAFLOW_BUILD_TOOLS   "Build StrataFlow CLI/server tools" ON)
 option(STRATAFLOW_WARNINGS      "Enable extra warnings"             ON)
 option(STRATAFLOW_WERROR        "Treat warnings as errors"          OFF)
 
-# Backend options (placeholders for Phase 1; wired to ggml in Phase 1b).
+# ---------------------------------------------------------------------------
+# GPU compute backend selection.
+# ---------------------------------------------------------------------------
+# STRATAFLOW_GPU is the single, backend-agnostic knob. It maps to exactly one
+# vendored ggml backend (GGML_CUDA / GGML_METAL / GGML_VULKAN) and defaults to
+# "off", which is BYTE-IDENTICAL to the historical CPU-only build (all GGML_<...>
+# backends forced OFF, zero GPU code compiled or linked). See the force-off
+# block below the llama.cpp knobs for the hard-constraint comment.
+#
+# Precedence (resolved into STRATAFLOW_GPU_RESOLVED below):
+#   1. If STRATAFLOW_GPU is set to a non-"off" value, it wins.
+#   2. Otherwise, the lower-level per-backend booleans STRATAFLOW_CUDA /
+#      STRATAFLOW_VULKAN / STRATAFLOW_METAL (kept for backward compatibility and
+#      used by the existing release-cuda/vulkan/metal presets) select the
+#      backend. At most one may be ON.
+#   3. Otherwise the backend is "off" (CPU-only, the default).
+set(STRATAFLOW_GPU "off" CACHE STRING
+    "GPU compute backend: off|cuda|metal|vulkan (default off = CPU-only)")
+set_property(CACHE STRATAFLOW_GPU PROPERTY STRINGS off cuda metal vulkan)
+
+# Backend options (lower-level per-backend toggles; honored when STRATAFLOW_GPU
+# is "off"). HIP/ROCm is accepted as a CUDA-family alias here but is not yet a
+# first-class STRATAFLOW_GPU value.
 option(STRATAFLOW_CUDA   "Enable CUDA backend (via ggml)"   OFF)
 option(STRATAFLOW_VULKAN "Enable Vulkan backend (via ggml)" OFF)
 option(STRATAFLOW_METAL  "Enable Metal backend (via ggml)"  OFF)
@@ -121,12 +143,105 @@ set(GGML_BUILD_TESTS     OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES  OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE          OFF CACHE BOOL "" FORCE)
 
-# CPU backend only for this phase; GPU backends stay OFF regardless of host
-# (Metal defaults ON on Apple, so force it OFF explicitly).
+# ---------------------------------------------------------------------------
+# Compute backend wiring (HARD CONSTRAINT).
+#
+#   * STRATAFLOW_GPU=off is the DEFAULT and is BYTE-IDENTICAL to the historical
+#     CPU-only build: GGML_CUDA / GGML_VULKAN / GGML_METAL / GGML_HIP are all
+#     forced OFF below (Metal defaults ON on Apple, so forcing it OFF matters),
+#     so ZERO GPU code is compiled or linked on any platform.
+#   * Selecting a backend only toggles the vendored ggml GGML_<...> option from
+#     THIS top-level CMake, BEFORE add_subdirectory. third_party/llama.cpp is
+#     NEVER edited; the GGML_<...> options are the only sanctioned entry point.
+#   * A GPU build requires the matching toolkit (CUDA Toolkit, Vulkan SDK) and
+#     real hardware to validate; the sandbox/CI is CPU-only and cannot run-test
+#     a GPU decode. ggml's own find_package will fail later if the toolkit is
+#     absent; the up-front guards below give a clear message first.
+# ---------------------------------------------------------------------------
+
+# Resolve the single effective backend from STRATAFLOW_GPU + the per-backend
+# booleans (see precedence comment at the options block above).
+string(TOLOWER "${STRATAFLOW_GPU}" STRATAFLOW_GPU_RESOLVED)
+if(NOT STRATAFLOW_GPU_RESOLVED MATCHES "^(off|cuda|metal|vulkan)$")
+    message(FATAL_ERROR
+        "STRATAFLOW_GPU='${STRATAFLOW_GPU}' is not valid. "
+        "Allowed values: off, cuda, metal, vulkan.")
+endif()
+
+if(STRATAFLOW_GPU_RESOLVED STREQUAL "off")
+    # Fall back to the lower-level per-backend booleans (back-compat / presets).
+    set(STRATAFLOW_GPU_COUNT 0)
+    if(STRATAFLOW_CUDA)
+        set(STRATAFLOW_GPU_RESOLVED "cuda")
+        math(EXPR STRATAFLOW_GPU_COUNT "${STRATAFLOW_GPU_COUNT}+1")
+    endif()
+    if(STRATAFLOW_VULKAN)
+        set(STRATAFLOW_GPU_RESOLVED "vulkan")
+        math(EXPR STRATAFLOW_GPU_COUNT "${STRATAFLOW_GPU_COUNT}+1")
+    endif()
+    if(STRATAFLOW_METAL)
+        set(STRATAFLOW_GPU_RESOLVED "metal")
+        math(EXPR STRATAFLOW_GPU_COUNT "${STRATAFLOW_GPU_COUNT}+1")
+    endif()
+    if(STRATAFLOW_HIP)
+        # HIP is a CUDA-family alias for the ggml wiring below.
+        set(STRATAFLOW_GPU_RESOLVED "cuda")
+        math(EXPR STRATAFLOW_GPU_COUNT "${STRATAFLOW_GPU_COUNT}+1")
+    endif()
+    if(STRATAFLOW_GPU_COUNT GREATER 1)
+        message(FATAL_ERROR
+            "More than one of STRATAFLOW_CUDA/VULKAN/METAL/HIP is ON. "
+            "Select exactly one GPU backend (prefer -DSTRATAFLOW_GPU=cuda|metal|vulkan).")
+    endif()
+endif()
+
+# Platform / toolkit guards. The OFF default never emits a fatal error.
+if(STRATAFLOW_GPU_RESOLVED STREQUAL "metal")
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        message(FATAL_ERROR
+            "STRATAFLOW_GPU=metal requires macOS (Apple platform). "
+            "Host system is '${CMAKE_SYSTEM_NAME}'. "
+            "Use STRATAFLOW_GPU=cuda or vulkan on Linux/Windows, or off for CPU-only.")
+    endif()
+elseif(STRATAFLOW_GPU_RESOLVED STREQUAL "cuda")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        message(FATAL_ERROR
+            "STRATAFLOW_GPU=cuda is not available on macOS. "
+            "Use STRATAFLOW_GPU=metal on Apple platforms, or off for CPU-only.")
+    endif()
+    message(STATUS
+        "StrataFlow: CUDA backend selected; requires the CUDA Toolkit (nvcc) and an NVIDIA GPU to run.")
+elseif(STRATAFLOW_GPU_RESOLVED STREQUAL "vulkan")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        message(FATAL_ERROR
+            "STRATAFLOW_GPU=vulkan is not supported on macOS here. "
+            "Use STRATAFLOW_GPU=metal on Apple platforms, or off for CPU-only.")
+    endif()
+    message(STATUS
+        "StrataFlow: Vulkan backend selected; requires the Vulkan SDK (glslc) and a Vulkan-capable GPU to run.")
+endif()
+
+# Toggle the vendored ggml backend options. Default (off): all forced OFF, which
+# is byte-identical to the historical CPU-only build. On a selected backend the
+# matching GGML_<...> is turned ON and the others stay OFF.
 set(GGML_CUDA   OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
 set(GGML_METAL  OFF CACHE BOOL "" FORCE)
 set(GGML_HIP    OFF CACHE BOOL "" FORCE)
+if(STRATAFLOW_GPU_RESOLVED STREQUAL "cuda")
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
+elseif(STRATAFLOW_GPU_RESOLVED STREQUAL "metal")
+    set(GGML_METAL ON CACHE BOOL "" FORCE)
+elseif(STRATAFLOW_GPU_RESOLVED STREQUAL "vulkan")
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+endif()
+
+if(STRATAFLOW_GPU_RESOLVED STREQUAL "off")
+    message(STATUS "StrataFlow compute backend: off (CPU-only; GGML GPU backends forced OFF)")
+else()
+    string(TOUPPER "${STRATAFLOW_GPU_RESOLVED}" STRATAFLOW_GPU_UPPER)
+    message(STATUS "StrataFlow compute backend: ${STRATAFLOW_GPU_RESOLVED} (GGML_${STRATAFLOW_GPU_UPPER} wiring enabled)")
+endif()
 
 add_subdirectory(${STRATAFLOW_LLAMA_DIR} EXCLUDE_FROM_ALL)
 
