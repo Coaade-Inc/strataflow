@@ -1820,8 +1820,10 @@ bool Engine::ensure_layer_experts_resident(int il, const int32_t *ids,
                 // FEAT-002: ONE coalesced read of the whole gate|up|down bundle
                 // (3 reads -> 1) when the layout is the tightly-packed
                 // three-slice form, byte-identical to the three read_blob calls.
-                // read_bundle returns -1 for a fused gate_up layout; fall back
-                // to the per-kind reads then (same bytes).
+                // read_bundle returns -1 only for a VERBATIM (uncompressed)
+                // fused gate_up layout; fall back to the per-kind reads then
+                // (same bytes). A COMPRESSED fused bundle is served by
+                // read_bundle directly (decoded once), so it does not fall back.
                 const int64_t nb = im.reader->read_bundle(
                     static_cast<uint32_t>(il), static_cast<uint32_t>(e), d);
                 if (nb == static_cast<int64_t>(gb + ub + db)) {
@@ -1913,7 +1915,8 @@ void Engine::warm_expert(int il, int expert) {
         uint8_t *d = static_cast<uint8_t *>(dst);
         if (im.reader != nullptr) {
             // FEAT-002: one coalesced bundle read (byte-identical to the three
-            // per-kind reads); fall back to per-kind on a fused layout.
+            // per-kind reads); fall back to per-kind only on a VERBATIM fused
+            // layout (a compressed fused bundle is served by read_bundle).
             const int64_t nb = im.reader->read_bundle(
                 static_cast<uint32_t>(il), static_cast<uint32_t>(e), d);
             if (nb != static_cast<int64_t>(gb + ub + db)) {
@@ -1973,7 +1976,8 @@ bool Engine::pf_read_bundle(int il, int expert, void *dst) const {
 
     if (im.reader != nullptr) {
         // FEAT-002: one coalesced bundle read (byte-identical to the three
-        // per-kind reads); fall back to per-kind on a fused layout.
+        // per-kind reads); fall back to per-kind only on a VERBATIM fused
+        // layout (a compressed fused bundle is served by read_bundle).
         const int64_t nb = im.reader->read_bundle(ul, ue, d);
         if (nb == static_cast<int64_t>(gb + ub + db)) return true;
         const int64_t ng =
