@@ -432,10 +432,14 @@ runtime selector that picks the first available GPU ggml backend and ALWAYS
 falls back to CPU, with resident buffers on the selected backend's buffer type
 and a host-or-device `stage_write` upload for the per-token expert bytes
 (`test_backend_selection` proves CPU is picked and decode stays byte-identical
-to the oracle on a CPU-only build). But on this free Colab box there is no GPU,
-so the `.strata` engine decode runs CPU-only; full GPU-accelerated COMPUTE is
-enterprise roadmap work that needs real GPU hardware to validate, not something
-these modes turn on. The RAM side is the proven, measured mechanism.
+to the oracle on a CPU-only build). The backend is `metal` on Apple Silicon and
+`cuda` or `vulkan` on a discrete GPU; the active backend is reported honestly in
+the plan line (`compute=<name>`) and selectable with `--device` (see Cell 3b).
+This free Colab box is CPU-ONLY, so the `.strata` engine decode runs CPU-only
+here; GPU-accelerated decode is user-hardware-validated (a CUDA laptop and an
+Apple Silicon Metal machine) and needs a GPU Colab runtime or your own CUDA /
+Metal machine to run, not something these modes turn on in the sandbox. The RAM
+side is the proven, measured mechanism.
 
 - **Sandbox-proven (offline, in CI):** the MECHANISM, the mode differences, the
   honest refusal floor, estimate sanity, and byte-identity through the REAL load
@@ -874,6 +878,62 @@ echo "built:"; ls -lh build/release/bin
 ```
 
 This compiles llama.cpp/ggml + StrataFlow. Expect a few minutes the first time.
+
+### Cell 3b (optional) - build with a GPU backend (`STRATAFLOW_GPU`)
+
+The engine's compute backend is SELECTABLE at build time. The default build
+above is CPU-only and byte-identical (`STRATAFLOW_GPU=off`); to compile a GPU
+backend in, pass the option (or use the matching preset). On a GPU Colab runtime
+(Runtime -> Change runtime type -> GPU) build CUDA; on your own Apple Silicon
+machine build Metal:
+
+```bash
+%%bash
+cd /content/strataflow
+# CUDA (a GPU Colab runtime, or a discrete-GPU laptop). Either form works:
+cmake --preset release-cuda
+# equivalently: cmake -S . -B build/release-cuda -G Ninja \
+#     -DCMAKE_BUILD_TYPE=Release -DSTRATAFLOW_GPU=cuda
+cmake --build build/release-cuda -j"$(nproc)"
+
+# Vulkan (discrete GPU without CUDA): -DSTRATAFLOW_GPU=vulkan (preset release-vulkan).
+# Metal (Apple Silicon Mac / Mac mini, run on your OWN machine, not Colab):
+#     cmake -S . -B build/release-metal -G Ninja \
+#         -DCMAKE_BUILD_TYPE=Release -DSTRATAFLOW_GPU=metal
+#     (preset release-metal)
+```
+
+Then run the engine with `--device` to select the backend and watch the plan
+line report the ACTIVE backend as `compute=cuda` (or `metal`/`vulkan`) when a
+GPU is present, falling back to `compute=cpu` when it is not:
+
+```bash
+%%bash
+cd /content/strataflow
+build/release-cuda/bin/strataflow --model /content/colab_moe.strata \
+  --device cuda --plan   # look for "compute=cuda" in the plan line
+```
+
+Run the hardware-gated GPU test (it requires both a GPU backend compiled in AND
+a GPU device present):
+
+```bash
+%%bash
+cd /content/strataflow
+python3 tools/testdata/make_tiny_moe_gguf.py /content/moe.gguf
+STRATAFLOW_TEST_MOE_GGUF=/content/moe.gguf \
+  ctest --test-dir build/release-cuda -R test_backend_selection --output-on-failure
+```
+
+EXPECTED BEHAVIOR: the GPU decode produces the SAME greedy token SEQUENCE as the
+CPU/oracle run and a per-logit delta within a documented tolerance
+(`SF_GPU_LOGIT_TOL = 2e-2`), NOT bit-identity - GPU arithmetic differs at the
+last ULPs, so demanding `max|delta| == 0.0` CPU-vs-GPU would fail on correct
+hardware. IMPORTANT: your current free Colab runtime is CPU-ONLY, so this test
+SKIPS cleanly (prints "skipped: no GPU backend") there; to actually exercise GPU
+execution you need a GPU Colab runtime or your own CUDA / Apple Silicon Metal
+machine. The CPU default path instructions above are unchanged and remain the
+proven, byte-identical mechanism.
 
 ### Cell 4 - run the demo (generate a real-size MoE, pack, stream-decode)
 

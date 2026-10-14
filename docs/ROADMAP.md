@@ -722,9 +722,11 @@ most are pure CPU/disk work.
   accordingly (after the lossless CPU/disk levers that make a 50B-class model
   fit and run on the no-GPU box).
 
-  - [ ] **Single-GPU acceleration first.** Route the hot experts, the hot trunk
-    and the KV cache into VRAM via a GPU ggml backend using
-    `ggml_backend_sched` (CPU + a GPU buffer type). This is NOT a separate code
+  - [~] **Single-GPU acceleration first (FOUNDATION LANDED, hardware-validation
+    pending).** Route the hot experts, the hot trunk and the KV cache into VRAM
+    via a GPU ggml backend using `ggml_backend_sched` (CPU + a GPU buffer type).
+    The backend is `metal` on Apple Silicon targets (Mac / Mac mini) and `cuda`
+    or `vulkan` on a discrete-GPU laptop. This is NOT a separate code
     path: VRAM is already the TOP tier in the engine's design - the tiered
     weight store spans VRAM, RAM and SSD (see
     [`ENGINE_CORE_DESIGN.md`](./ENGINE_CORE_DESIGN.md) sections 2.4 and 3.5, the
@@ -768,18 +770,32 @@ most are pure CPU/disk work.
     allocated from the selected backend's default (device) buffer type, and the
     per-token expert "fault bytes into the resident region" step becomes a
     host->device upload (`ggml_backend_tensor_set`) through a single
-    host-or-device `stage_write` primitive. The planner VRAM budget and the C
+    host-or-device `stage_write` primitive. The selected backend is `cuda` or
+    `vulkan` for a discrete GPU and `metal` for Apple Silicon; the active
+    backend is reported in the plan line (`compute=<cpu|cuda|metal|vulkan>`) and
+    is selectable from the CLI (`--device`). The planner VRAM budget and the C
     ABI `preferred_backend` are plumbed to `Engine::load`. For this first
     increment, when a GPU is selected the whole resident set runs in VRAM and
     the streamed trunk is forced resident (streamed-trunk-on-GPU is a follow-on);
     the per-token EXPERT upload seam is device-correct regardless.
+    DONE (merged to main): the selectable-backend FOUNDATION - the
+    `STRATAFLOW_GPU` build option, the runtime GPU-when-present selector with
+    CPU fallback, the forward graph + resident buffers + expert-streaming upload
+    routed onto the selected backend's buffer type, the planner VRAM budget
+    wired to the engine, the active-backend reporting, and a hardware-gated GPU
+    decode test - is landed and CPU-CI-proven byte-identical.
     HONEST SCOPE: on the default CPU-only build the whole GPU path compiles out,
     the engine selects CPU, and decode is byte-identical to before and the
     oracle (`max|delta| = 0.000e+00`), proven by `test_backend_selection` (CPU
-    selection + byte-identity) under GCC + Clang `-Werror`. The remaining,
-    hardware-gated work is the actual GPU-COMPUTE validation (and
-    streamed-trunk-on-GPU / multi-tier `ggml_backend_sched` splitting), which
-    cannot be built or run-validated in the CPU-only sandbox/CI and must be
+    selection + byte-identity) under GCC + Clang `-Werror`. GPU-accelerated
+    DECODE is USER-HARDWARE-VALIDATED (a CUDA laptop and an Apple Silicon Metal
+    machine); it is NOT runnable in the CPU-only sandbox/CI, where the
+    hardware-gated GPU test skips cleanly. The hardware-gated gate asserts the
+    GPU decode has the SAME greedy token sequence as the CPU/oracle run and a
+    per-logit delta within a documented tolerance (not bit-identity, because GPU
+    arithmetic differs at the last ULPs). The remaining follow-on work is
+    streamed-trunk-on-GPU, multi-GPU sharding, fine VRAM-vs-RAM tiering, and
+    GPU-resident KV (multi-tier `ggml_backend_sched` splitting), which must be
     exercised on real GPU hardware.
   - [ ] **Multi-GPU parallelism.** Expert / tensor / pipeline parallelism across
     devices; a device-placement policy deciding which layers and experts live on

@@ -142,9 +142,10 @@ Precedence (highest wins): the explicit low-level knobs
 power users; then `--target-ram-gb`; then `--ram-mode max`; then auto.
 
 GPU honesty, to be exact: auto/max may read VRAM and the planner budgets VRAM
-PLACEMENT, but the authoritative `.strata` engine decode is CPU-only today, so
-full GPU-accelerated COMPUTE is the enterprise roadmap track, not a claim here.
-The RAM side is the measured mechanism. What IS built and CPU-tested toward the
+PLACEMENT. The CPU/no-GPU `.strata` engine decode is the proven default and is
+CI-proven byte-identical; GPU-accelerated decode runs on the selectable backend
+but is user-hardware-validated, NOT validated in this CPU-only sandbox/CI, so it
+is not a sandbox-measured claim here. The RAM side is the measured mechanism. What IS built and CPU-tested toward the
 GPU track (so the eventual GPU-compute step plugs into an exercised seam, not a
 blank one): GPU discovery into `HardwareProfile::gpus`, the planner's VRAM-first
 trunk/expert placement (`trunk_layers_in_vram` / `expert_slots_vram`), the pure
@@ -157,13 +158,24 @@ over the backend-agnostic ggml-backend DEVICE/REGISTRY API that picks the first
 available GPU and ALWAYS falls back to CPU, resident buffers allocated from the
 selected backend's buffer type, and a single host-or-device `stage_write`
 primitive that turns the per-token expert "fault bytes into the resident region"
-step into a host->device upload on a GPU backend. All of this is unit-tested
-with no GPU (`test_llama_placement`, `test_planner`, and the new
-`test_backend_selection`, which proves the engine selects CPU and decodes
-byte-identically to the oracle on a CPU-only build). The remaining hardware-gated
-work is the actual GPU-COMPUTE validation (and streamed-trunk-on-GPU / full
-`ggml_backend_sched` multi-tier splitting) on real GPU hardware; it cannot be
-built or run-validated in the CPU-only sandbox. See
+step into a host->device upload on a GPU backend. The design intent is simple:
+the GPU is the FASTEST tier of the SAME streaming engine - the same residency
+and byte-provenance discipline, just with VRAM as the destination - not a
+separate code path. `metal` is the backend for Apple Silicon targets (Mac / Mac
+mini) and `cuda` or `vulkan` for the discrete-GPU laptop (a 16 GB machine with a
+small 2 GB GPU). The selectable-backend FOUNDATION now exists: the CPU default
+is unchanged and CI-proven byte-identical, and GPU execution is
+USER-HARDWARE-VALIDATED (a CUDA laptop and an Apple Silicon Metal machine), with
+the active backend reported honestly in the plan line (`compute=<name>`). The
+CPU seam is unit-tested with no GPU (`test_llama_placement`, `test_planner`, and
+the new `test_backend_selection`, which proves the engine selects CPU and
+decodes byte-identically to the oracle on a CPU-only build); a hardware-gated
+GPU decode test asserts the GPU decode has the SAME greedy sequence as the
+CPU/oracle run within a documented logit tolerance and SKIPS cleanly on
+CPU-only. The remaining hardware-gated follow-on work is streamed-trunk-on-GPU,
+full `ggml_backend_sched` multi-tier splitting, multi-GPU, and GPU-resident KV
+on real GPU hardware; none of it is built or run-validated in the CPU-only
+sandbox, and the no-GPU laptop path stays the core, measured mission. See
 [`ROADMAP.md`](./ROADMAP.md) "Enterprise / multi-GPU execution".
 
 The projected peak the planner reports is now a RECALIBRATED, honest estimate.

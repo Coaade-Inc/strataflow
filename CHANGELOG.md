@@ -122,12 +122,25 @@ grouped by the pull request that merged them.
   new threads). FIRST-INCREMENT SCOPE: when a GPU is selected the WHOLE resident
   set runs in VRAM and the streamed trunk is forced resident
   (streamed-trunk-on-GPU is a documented follow-on); the per-token EXPERT
-  upload seam is device-correct regardless, as it is the per-token crux. A new
-  `test_backend_selection` unit test proves the CPU-selection invariant and the
-  byte-identical-to-oracle decode on a CPU-only build. GPU-accelerated decode is
-  NOT built or run-validated in the sandbox (no GPU/toolkit); it is gated behind
-  the compile-time guard for hardware validation. Full ctest 25/25 green under
-  GCC + Clang `-Werror`. No change to `third_party/llama.cpp`.
+  upload seam is device-correct regardless, as it is the per-token crux. The
+  ACTIVE compute backend is reported honestly through the plan surface
+  (`sf_describe_plan` appends `compute=<cpu|cuda|metal|vulkan|hip>`) and is
+  selectable from the CLI (`--device cpu|cuda|metal|vulkan|hip`); on the CPU-only
+  build this is always `compute=cpu` and the determinism/golden-output test
+  (`test_api`) stays green. A `test_backend_selection` unit test proves the
+  CPU-selection invariant and the byte-identical-to-oracle decode on a CPU-only
+  build, and now also carries a HARDWARE-GATED GPU decode gate: when a GPU
+  backend is compiled in AND a device is present it asserts the GPU decode has
+  the SAME greedy token sequence as the CPU/oracle run and a per-logit delta
+  within a documented tolerance (`SF_GPU_LOGIT_TOL = 2e-2`), NOT bit-identity,
+  because GPU arithmetic differs at the last ULPs; on CPU-only / no device / no
+  fixture it SKIPS CLEANLY and returns success so CI stays green. CPU-CI-PROVEN:
+  the CPU default build, the byte-identity (`max|delta| = 0.000e+00`) gates, and
+  CPU backend selection. REAL-GPU-ONLY (user-hardware-validated on a CUDA laptop
+  and an Apple Silicon Metal machine, NOT runnable in the sandbox/CI): the
+  GPU-accelerated decode itself. FOLLOW-ONS: streamed-trunk-on-GPU, multi-GPU
+  sharding, fine VRAM-vs-RAM tiering, and GPU-resident KV. Full ctest 25/25
+  green under GCC + Clang `-Werror`. No change to `third_party/llama.cpp`.
 
 - Optional lossless on-disk expert-blob compression (compress what streams).
   `strata-pack` gains a `--compress <lz|none>` flag (default `none`,
