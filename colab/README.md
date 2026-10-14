@@ -927,13 +927,23 @@ STRATAFLOW_TEST_MOE_GGUF=/content/moe.gguf \
 
 EXPECTED BEHAVIOR: the GPU decode produces the SAME greedy token SEQUENCE as the
 CPU/oracle run and a per-logit delta within a documented tolerance
-(`SF_GPU_LOGIT_TOL = 2e-2`), NOT bit-identity - GPU arithmetic differs at the
-last ULPs, so demanding `max|delta| == 0.0` CPU-vs-GPU would fail on correct
-hardware. IMPORTANT: your current free Colab runtime is CPU-ONLY, so this test
+(`kGpuLogitTol = 2e-2` in `tests/test_backend_selection.cpp`), NOT bit-identity
+- GPU arithmetic differs at the last ULPs, so demanding `max|delta| == 0.0`
+CPU-vs-GPU would fail on correct hardware. IMPORTANT: your current free Colab
+runtime is CPU-ONLY, so this test
 SKIPS cleanly (prints "skipped: no GPU backend") there; to actually exercise GPU
 execution you need a GPU Colab runtime or your own CUDA / Apple Silicon Metal
 machine. The CPU default path instructions above are unchanged and remain the
 proven, byte-identical mechanism.
+
+NOTE on the GPU-supported path: the GPU-supported first-increment path is the
+`.strata` STREAMING path (the `--model ....strata` runs above). A plain-GGUF MoE
+run on a GPU backend serves its experts from the resident weight tensors with a
+host-side read, so for this first increment that one case (GPU backend + plain
+GGUF + MoE) is forced back to the CPU compute backend with a clear log line.
+Dense GGUF and every `.strata` load (including `.strata`-on-GPU) are unaffected;
+plain-GGUF MoE on GPU is a follow-on. Pack a GGUF MoE to `.strata` to run it on
+the GPU.
 
 ### Cell 4 - run the demo (generate a real-size MoE, pack, stream-decode)
 

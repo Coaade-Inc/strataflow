@@ -132,13 +132,18 @@ grouped by the pull request that merged them.
   build, and now also carries a HARDWARE-GATED GPU decode gate: when a GPU
   backend is compiled in AND a device is present it asserts the GPU decode has
   the SAME greedy token sequence as the CPU/oracle run and a per-logit delta
-  within a documented tolerance (`SF_GPU_LOGIT_TOL = 2e-2`), NOT bit-identity,
+  within a documented tolerance (`kGpuLogitTol = 2e-2` in
+  `tests/test_backend_selection.cpp`), NOT bit-identity,
   because GPU arithmetic differs at the last ULPs; on CPU-only / no device / no
   fixture it SKIPS CLEANLY and returns success so CI stays green. CPU-CI-PROVEN:
   the CPU default build, the byte-identity (`max|delta| = 0.000e+00`) gates, and
   CPU backend selection. REAL-GPU-ONLY (user-hardware-validated on a CUDA laptop
   and an Apple Silicon Metal machine, NOT runnable in the sandbox/CI): the
-  GPU-accelerated decode itself. FOLLOW-ONS: streamed-trunk-on-GPU, multi-GPU
+  GPU-accelerated decode itself. The GPU-supported first-increment path is the
+  `.strata` streaming path; a plain-GGUF MoE on a GPU backend is forced back to
+  CPU compute (its experts are read host-side from resident tensors), with a
+  clear log line - dense GGUF and `.strata`-on-GPU are unaffected. FOLLOW-ONS:
+  plain-GGUF-MoE-on-GPU, streamed-trunk-on-GPU, multi-GPU
   sharding, fine VRAM-vs-RAM tiering, and GPU-resident KV. Full ctest 25/25
   green under GCC + Clang `-Werror`. No change to `third_party/llama.cpp`.
 
