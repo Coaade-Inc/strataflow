@@ -641,8 +641,104 @@ static void test_estimate_tracks_real_resident() {
                 static_cast<unsigned long long>(real_components / MiB));
 }
 
+// ---------------------------------------------------------------------------
+// task-auto-retune-and-streaming-limiter FEAT-002: AUTO coherence + fill the
+// comfortable share with experts, and MAX fits its own budget.
+// ---------------------------------------------------------------------------
+
+// FEAT-002 COHERENCE: on a 12 GiB-class box with comfortably large free RAM,
+// AUTO must pick a COHERENT plan - it must NEVER keep the full n_ctx KV
+// resident while hard-streaming the per-layer attention trunk; the two resident
+// levers co-reduce (if the trunk hard-streams, the KV is windowed). Its
+// projected peak must fill a SENSIBLE SHARE of the usable budget (not collapse
+// to a small fraction), and AUTO.peak <= MAX.peak with MAX.fits == true (MAX
+// must fit its OWN budget - the pre-fix MAX projected peak OVER usable here).
+static void test_auto_coherent_share_12gb() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 12 * GiB;
+    hw.ram_free_bytes = static_cast<uint64_t>(11.0 * static_cast<double>(GiB));
+
+    ModelShape m = mixtral_streamable();  // ~18.8 GiB, 8 GiB full KV, 4 GiB attn
+
+    PlacementPlan a = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                     /*cache=*/0, RamMode::Auto);
+    PlacementPlan x = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                     /*cache=*/0, RamMode::Max);
+
+    CHECK(a.fits);
+    CHECK(a.planned_peak_bytes <= a.usable_ram_bytes);
+
+    // COHERENCE INVARIANT: if AUTO hard-streams the trunk (0 < pool < n_layers)
+    // the KV MUST be windowed (0 < kv_window < n_ctx). The pre-fix AUTO kept
+    // full KV (kv_window==0) while streaming the trunk hard - forbidden.
+    if (a.trunk_pool_layers > 0u && a.trunk_pool_layers < m.n_layers) {
+        CHECK(a.kv_window > 0u);
+        CHECK(a.kv_window < m.n_ctx);
+    }
+    // Equivalently: full KV resident (kv_window==0) IMPLIES the trunk is NOT
+    // hard-streaming (pool==0 == whole trunk resident).
+    if (a.kv_window == 0u) {
+        CHECK(a.trunk_pool_layers == 0u);
+    }
+
+    // SENSIBLE SHARE: AUTO fills its comfortable share rather than collapsing
+    // to a small fraction of it. The real-Mixtral bug left AUTO at ~1/9th of
+    // the budget (peak 1353 MiB on a box whose share was ~10 GiB). Assert the
+    // peak uses most of the usable share (>= 70%).
+    CHECK(a.planned_peak_bytes * 10 >= a.usable_ram_bytes * 7);
+
+    // MAX fits its OWN budget and stays >= AUTO (monotonic).
+    CHECK(x.fits);
+    CHECK(x.planned_peak_bytes <= x.usable_ram_bytes);
+    CHECK(a.planned_peak_bytes <= x.planned_peak_bytes);
+    CHECK(x.expert_slots_resident >= a.expert_slots_resident);
+    // MAX coherence too.
+    if (x.trunk_pool_layers > 0u && x.trunk_pool_layers < m.n_layers) {
+        CHECK(x.kv_window > 0u);
+        CHECK(x.kv_window < m.n_ctx);
+    }
+
+    std::printf("[auto coherent 12GiB: usable=%lluMiB peak=%lluMiB kv=%u pool=%u "
+                "slots=%u | max peak=%lluMiB fits=%d slots=%u] ",
+                static_cast<unsigned long long>(a.usable_ram_bytes / MiB),
+                static_cast<unsigned long long>(a.planned_peak_bytes / MiB),
+                a.kv_window, a.trunk_pool_layers, a.expert_slots_resident,
+                static_cast<unsigned long long>(x.planned_peak_bytes / MiB),
+                x.fits ? 1 : 0, x.expert_slots_resident);
+}
+
+// FEAT-002: after the retune AUTO caches materially MORE experts than the old
+// 2 on the Mixtral geometry - at least an order of magnitude more when RAM
+// affords it (the comfortable share is filled with resident experts instead of
+// left mostly unused).
+static void test_auto_caches_more_experts() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 12 * GiB;
+    hw.ram_free_bytes = static_cast<uint64_t>(11.0 * static_cast<double>(GiB));
+
+    ModelShape m = mixtral_streamable();
+    const uint32_t full_slots =
+        static_cast<uint32_t>(uint64_t(m.n_layers) * m.n_experts);  // 256
+
+    PlacementPlan a = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                     /*cache=*/0, RamMode::Auto);
+    CHECK(a.fits);
+    // Materially more than the old 2: strictly greater, and an order of
+    // magnitude more (>= 10) on this 12 GiB-class box.
+    CHECK(a.expert_slots_resident > 2u);
+    CHECK(a.expert_slots_resident >= 10u);
+    // Still bounded by the working set (the ~13 GiB expert set cannot all fit).
+    CHECK(a.expert_slots_resident < full_slots);
+    CHECK(a.stream_experts);
+
+    std::printf("[auto experts 12GiB: slots=%u (old baseline 2)] ",
+                a.expert_slots_resident);
+}
+
 static void run_all() {
     RUN(test_low_ram_streams);
+    RUN(test_auto_coherent_share_12gb);
+    RUN(test_auto_caches_more_experts);
     RUN(test_small_moe_fully_resident);
     RUN(test_small_moe_bounded_under_tiny_budget);
     RUN(test_different_layout_adapts);
