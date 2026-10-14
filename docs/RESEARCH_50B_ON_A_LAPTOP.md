@@ -144,7 +144,17 @@ power users; then `--target-ram-gb`; then `--ram-mode max`; then auto.
 GPU honesty, to be exact: auto/max may read VRAM and the planner budgets VRAM
 PLACEMENT, but the authoritative `.strata` engine decode is CPU-only today, so
 full GPU-accelerated COMPUTE is the enterprise roadmap track, not a claim here.
-The RAM side is the measured mechanism.
+The RAM side is the measured mechanism. What IS built and CPU-tested toward the
+GPU track (so the eventual GPU-compute step plugs into an exercised seam, not a
+blank one): GPU discovery into `HardwareProfile::gpus`, the planner's VRAM-first
+trunk/expert placement (`trunk_layers_in_vram` / `expert_slots_vram`), and the
+pure `derive_llama_placement` translation to `n_gpu_layers` + the routed-expert
+CPU-offload override (whose regex already covers the fused `gate_up_exps`
+tensors), all unit-tested with no GPU (`test_llama_placement`, `test_planner`).
+The remaining hardware-gated work is wiring a GPU buffer type into the engine's
+`ggml_backend_sched` so the resident tier lands in VRAM for the `.strata` path;
+that cannot be built or validated in the CPU-only sandbox. See
+[`ROADMAP.md`](./ROADMAP.md) "Enterprise / multi-GPU execution".
 
 The projected peak the planner reports is now a RECALIBRATED, honest estimate.
 It was previously ~2x the engine's real resident footprint (it printed "~10 GiB"
@@ -885,6 +895,24 @@ instead of byte-identity.
   prior packer output (SHA256-verified). `strata-pack` gains `--compress <lz|none>`
   (default uncompressed); `streamed_bytes` now reflects the compressed bytes
   actually read.
+- **Fused expert layout, read and counted once (review follow-up).** A FUSED
+  gate_up bundle (`gate_rel == up_rel == 0`, the two-slice `gate_up|down` layout
+  of the gpt-oss / granite / gemma / phi3-style arches) is the only layout the
+  compressed per-kind `read_blob` fallback ever serves, and no in-tree fixture
+  exercised it (the fixtures are legacy/non-fused). The first cut counted the
+  compressed size TWICE for a fused expert (the `slice_rel == 0` guard fired for
+  both the gate and the up slice, which share rel 0) and re-decompressed the
+  WHOLE blob three times (once per kind), inflating the very `streamed_bytes()`
+  metric this lever minimizes and tripling decode CPU on fused MoE arches. Both
+  are now fixed: `read_blob` keys the compressed-byte increment on the gate KIND
+  (`kGate`/`kGateUp`), not `slice_rel == 0`, so it counts exactly once across the
+  gate/up/down calls; and `read_bundle` serves a compressed fused bundle with ONE
+  whole-blob decode into the caller's staging (the decompressed blob is the whole
+  tightly-packed bundle, and a fused `gate_up` slice is gate followed by up
+  contiguously, so `[gate_up | down]` is byte-identical to `[gate | up | down]`),
+  instead of forcing the three-decode per-kind fallback. Benchmark-counter /
+  CPU-cost only, NOT a correctness or byte-identity break; a new fused-layout
+  seam subtest in `test_compressed_strata` pins both.
 - **Verdict: SHIPPED, lossless, modest on already-quantized experts.** The
   plumbing (smaller on-disk expert region, fewer `streamed_bytes`, transparent
   decompress, decompress faster than the SSD) is correct and proven; the win is

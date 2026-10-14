@@ -475,7 +475,24 @@ families are the remaining quant-coverage gap.
   prefetch-worker reads. Covered by `test_lz_codec` (round-trip + decompress
   GiB/s) and `test_compressed_strata` (real-path pack->StrataReader->engine
   oracle gate, skips cleanly without the fixture); full ctest 24/24 green under
-  GCC + Clang `-Werror`. FOLLOW-ONS (out of scope here): trunk and KV
+  GCC + Clang `-Werror`. REVIEW FOLLOW-UP (fused + compressed read path): a
+  FUSED gate_up bundle (`gate_rel == up_rel == 0`, a two-slice `gate_up|down`
+  layout - gpt-oss / granite / gemma / phi3-style) is now read and counted ONCE
+  on the compressed path, not 3x/2x. The compressed per-kind `read_blob`
+  fallback used to attribute the compressed size to any slice with
+  `slice_rel == 0` (so a fused bundle, whose gate AND up are both at rel 0,
+  counted it TWICE in `streamed_bytes()`), and `read_bundle` rejected every
+  fused layout so the engine fell back to three per-kind calls that each
+  re-decompressed the WHOLE blob. Fixed by keying the `read_blob` increment on
+  the gate KIND (`kGate`/`kGateUp`) rather than `slice_rel == 0`, and by running
+  `read_bundle`'s compressed branch BEFORE its verbatim fused rejection so a
+  compressed fused bundle decodes once into `dst` (`[gate_up | down]` is
+  byte-identical to `[gate | up | down]`). Benchmark-counter / CPU-cost only, NOT
+  a correctness or byte-identity break; byte-identity, default byte-for-byte
+  identity, v1/v2/v3 back-compat, and per-call-local decode are all preserved. A
+  new fused-layout seam subtest in `test_compressed_strata` pins both fixes (the
+  in-tree fixtures are legacy/non-fused, so this is the first test to exercise
+  fused + compressed). FOLLOW-ONS (out of scope here): trunk and KV
   compression, and a separate opt-in LOSSY re-quant lever (needs a quality gate).
 - [x] **MAX clamps to the largest fitting plan, never refuses (12-13 GiB-class
   regression).** RamMode::Max (and Auto) are MODES, not numeric ceilings: a pure
@@ -717,6 +734,36 @@ most are pure CPU/disk work.
     discipline, just with VRAM as the destination. Structurally reachable
     because the engine already runs on a swappable ggml backend; still needs
     real GPU hardware to validate.
+
+    FOUNDATION ALREADY IN PLACE (CPU-tested, not GPU-validated). The
+    VRAM-placement DECISION this track consumes is built and under test, so the
+    GPU compute step plugs into an existing, exercised seam rather than a blank
+    one:
+      - GPU DISCOVERY: `gpu_discovery` enumerates every ggml
+        `GGML_BACKEND_DEVICE_TYPE_GPU` device (name, `vram_bytes`, backend) into
+        `HardwareProfile::gpus`; a no-op that leaves the list empty on a CPU-only
+        box (so the whole path is a no-op without a GPU).
+      - VRAM-FIRST PLACEMENT: the planner's Rule 1/Rule 2
+        (`src/plan/planner.cpp`) place the always-active trunk, then the routed
+        experts, on the FASTEST device first - VRAM, then RAM - producing
+        `plan.trunk_layers_in_vram` and `plan.expert_slots_vram` (the
+        KTransformers / llama.cpp-offload insight, VRAM as the top tier).
+      - PURE TRANSLATION: `derive_llama_placement`
+        (`src/plan/llama_placement.{h,cpp}`) maps that plan to the concrete
+        knobs (`n_gpu_layers`, and the routed-expert CPU-offload override whose
+        regex already covers the FUSED `gate_up_exps` tensors), as a pure
+        function over plain structs with no ggml/llama calls - unit-testable with
+        no GPU. Covered by `test_llama_placement` (no-GPU is CPU-identical,
+        small-GPU + big-MoE offloads experts, whole-working-set-in-VRAM keeps
+        experts resident, dense never offloads, `n_gpu_layers` clamps to the
+        layer count) and the planner's VRAM-pressure cases in `test_planner`.
+    HONEST SCOPE: this only drives the NON-authoritative plain-GGUF libllama
+    sidecar today; the authoritative `.strata` engine decode is still CPU-only
+    (`n_gpu_layers = 0` in `engine.cpp`). The remaining, hardware-gated work is
+    the actual GPU-compute step - wiring a GPU buffer type into the engine's
+    `ggml_backend_sched` and the SSD->RAM->VRAM transfer nodes so the resident
+    tier lands in VRAM for the `.strata` path - which cannot be built or
+    validated in the CPU-only sandbox/CI.
   - [ ] **Multi-GPU parallelism.** Expert / tensor / pipeline parallelism across
     devices; a device-placement policy deciding which layers and experts live on
     which GPU; NVLink / PCIe topology-aware placement so transfers follow the

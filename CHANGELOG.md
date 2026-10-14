@@ -11,6 +11,40 @@ grouped by the pull request that merged them.
 
 ### Fixes
 
+- Compress-what-streams: a FUSED gate_up expert bundle is now read and counted
+  ONCE on the compressed path, not 3x/2x (`src/tws/strata_file.{h,cpp}`).
+  Review follow-up on the compression lever. A fused layout
+  (`gate_rel == up_rel == 0`, a two-slice `gate_up|down` bundle - the gpt-oss /
+  granite / gemma / phi3-style arches `parse_expert_tensor_name` recognizes) is
+  the only layout the compressed per-kind `read_blob` fallback ever served, and
+  no in-tree fixture exercised it (the fixtures are legacy/non-fused). Two
+  defects, both benchmark-counter / CPU-cost only (NOT a correctness or
+  byte-identity break): (1) `read_blob` attributed the compressed size to any
+  slice whose `slice_rel == 0`, and a fused bundle has gate AND up both at rel 0,
+  so `streamed_bytes()` counted the compressed size TWICE per fused expert;
+  (2) `read_bundle` rejected every fused layout, forcing the engine onto three
+  per-kind `read_blob` calls that each re-read and re-decompressed the WHOLE blob
+  (3x decode work per resident fused expert). THE FIX: `read_blob` now keys the
+  compressed-byte increment on the GATE KIND (`kGate`/`kGateUp`) instead of
+  `slice_rel == 0`, so it counts exactly once across the gate/up/down calls
+  (non-fused is unchanged: `kGate` is the rel-0 slice there too); and
+  `read_bundle` now runs its compressed branch BEFORE the verbatim fused
+  rejection, serving a compressed fused bundle with ONE whole-blob decode into
+  `dst` (the decompressed blob is the whole tightly-packed bundle, and a fused
+  `gate_up` slice is gate followed by up contiguously, so `[gate_up | down]` is
+  byte-identical to `[gate | up | down]`) - read and decoded once, counted once.
+  The verbatim path still rejects fused. Preserves byte-identity (the engine
+  sees the same uncompressed bytes), the default/uncompressed byte-for-byte
+  identity (SHA256 `strata-pack` == `--compress none`), v1/v2/v3 back-compat, and
+  the per-call-local no-shared-state decode (compute thread + async prefetch
+  worker stay race-free). A new fused-layout seam subtest in
+  `test_compressed_strata` (hand-built two-slice `gate_up|down` v3 `.strata`)
+  asserts `read_bundle` serves the compressed fused bundle in ONE read/decode
+  and that the three `read_blob` calls count the compressed size EXACTLY ONCE
+  (would catch the 2x regression). Full ctest 24/24 green under GCC 11.5 + Clang
+  15.0.7 `-Werror` (release + debug); the real-path oracle gate stays
+  `max|delta| = 0.000e+00`. No change to `third_party/llama.cpp`.
+
 - MAX now CLAMPS to the largest fitting plan instead of REFUSING on a 12-13
   GiB-class box (`src/plan/planner.cpp`). RamMode::Max (and Auto) are MODES, not
   numeric ceilings: a pure mode run (`target_ram_budget == 0` AND

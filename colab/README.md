@@ -423,10 +423,13 @@ those three knobs into ONE dial, with two modes plus an explicit numeric target:
 Precedence (highest wins): the low-level knobs
 (`STRATAFLOW_ENGINE_KV_WINDOW` / `--expert-slots` / `--cache-gb`) >
 `--target-ram-gb` > `--ram-mode max` > `--ram-mode auto` (default). GPU honesty:
-auto/max may read VRAM and the planner budgets VRAM PLACEMENT, but the `.strata`
-engine decode is CPU-only today, so full GPU-accelerated compute is enterprise
-roadmap work, not something these modes turn on. The RAM side is the proven,
-measured mechanism.
+auto/max may read VRAM and the planner budgets VRAM PLACEMENT (GPU discovery ->
+VRAM-first trunk/expert placement -> the pure `derive_llama_placement`
+translation to `n_gpu_layers`, all CPU-unit-tested in `test_llama_placement` /
+`test_planner`), but the `.strata` engine decode is CPU-only today, so full
+GPU-accelerated compute is enterprise roadmap work (wiring a GPU buffer type into
+the engine's `ggml_backend_sched`, hardware-gated), not something these modes
+turn on. The RAM side is the proven, measured mechanism.
 
 - **Sandbox-proven (offline, in CI):** the MECHANISM, the mode differences, the
   honest refusal floor, estimate sanity, and byte-identity through the REAL load
@@ -758,6 +761,13 @@ transparent byte-identical decompress, decompress faster than the SSD) is
 sandbox-proven on fixtures (`test_lz_codec`, `test_compressed_strata`); the
 ABSOLUTE streamed-bytes and tok/s change on the real ~19 GB Mixtral is this
 Colab-only re-measurement.
+
+FUSED-ARCH NOTE (review follow-up): a fused `gate_up` expert layout (gpt-oss /
+granite / gemma / phi3-style) now reads and counts each compressed bundle ONCE,
+not 3x/2x - the compressed `read_blob` fallback used to double-count
+`streamed_bytes` and triple-decompress the blob on a fused layout. If you run
+this lever on a fused-MoE model, the reported `streamed` bytes are now the honest
+once-per-expert figure. Mixtral is non-fused, so its numbers are unaffected.
 
 ### Current token speed (and why)
 
