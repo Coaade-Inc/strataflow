@@ -35,12 +35,39 @@ constexpr char     kStrataMagic[8] = {'S', 'T', 'R', 'A', 'T', 'A', '0', '1'};
 // that understands v2 falls back to full-resident trunk when the trunk index
 // is absent (trunk_index_count==0), so a v2 file without the index behaves
 // exactly like v1.
-constexpr uint32_t kStrataVersion  = 2;
+//
+// v3 ('compress what streams') adds OPTIONAL lossless per-expert-blob
+// compression. It follows the EXACT same additive pattern v2 used: it bumps the
+// version, adds a flag bit (kStrataFlagExpertsCompressed), carves two more
+// superblock fields out of the remaining reserved pad (compress_index_offset /
+// compress_index_count), and appends a NEW parallel region after the trunk
+// index: one ExpertBlobCompression record per expert index entry, in index
+// order. When no blob is compressed the packer writes NEITHER the flag NOR the
+// region (both superblock fields 0), so an uncompressed v3 pack is byte-for-byte
+// identical to the pre-v3 (v2) packer output. v1/v2 files carry no compression
+// region (both fields 0) and the reader streams their expert bytes verbatim.
+//
+// ON-DISK SUPERBLOCK TRAILING-FIELD OFFSETS PER VERSION. Everything up to and
+// including expert_region_size (ends at byte 80) is identical across v1/v2/v3.
+// The trailing scalars differ because each version inserts two uint64 before
+// n_layers:
+//   v1: n_layers@80 n_experts@84 align@88 header_crc32@92 reserved[32]@96
+//       (header_crc32 covers [0, 92))
+//   v2: trunk_index_offset@80 trunk_index_count@88
+//       n_layers@96 n_experts@100 align@104 header_crc32@108 reserved[16]@112
+//       (header_crc32 covers [0, 108))
+//   v3: trunk_index_offset@80 trunk_index_count@88
+//       compress_index_offset@96 compress_index_count@104
+//       n_layers@112 n_experts@116 align@120 header_crc32@124 reserved[0]@128
+//       (header_crc32 covers [0, 124); the in-memory struct below IS the v3
+//        layout, so sizeof()==128 and kStrataHeaderCrcOffset==124)
+constexpr uint32_t kStrataVersion  = 3;
 
 // Superblock flag bits.
-constexpr uint32_t kStrataFlagExpertsBundled = 1u << 0;  // gate+up+down bundled
-constexpr uint32_t kStrataFlagIndexSorted    = 1u << 1;  // sorted {layer,expert}
-constexpr uint32_t kStrataFlagTrunkIndexed   = 1u << 2;  // per-trunk-tensor index present
+constexpr uint32_t kStrataFlagExpertsBundled    = 1u << 0;  // gate+up+down bundled
+constexpr uint32_t kStrataFlagIndexSorted       = 1u << 1;  // sorted {layer,expert}
+constexpr uint32_t kStrataFlagTrunkIndexed      = 1u << 2;  // per-trunk-tensor index present
+constexpr uint32_t kStrataFlagExpertsCompressed = 1u << 3;  // per-blob compression index present
 
 // The fixed 128-byte superblock at offset 0. All multi-byte fields are stored
 // little-endian; on the little-endian targets we support (x86-64, arm64) the
@@ -66,12 +93,19 @@ struct StrataSuperblock {
     // the engine falls back to a fully-resident trunk.
     uint64_t trunk_index_offset;       // start of the trunk index region, or 0
     uint64_t trunk_index_count;        // number of TrunkIndexEntry, or 0
+    // v3 compression index (FEAT-002 'compress what streams'). Carved from the
+    // remaining reserved pad (reserved[16] -> reserved[0]), kept here (both
+    // 8-byte aligned, before header_crc32) so the CRC backfill covers them. On
+    // a v1/v2 file (or a v3 file without any compressed blob) both are 0 and the
+    // reader streams every expert blob verbatim.
+    uint64_t compress_index_offset;    // start of the compression index, or 0
+    uint64_t compress_index_count;     // number of ExpertBlobCompression, or 0
     uint32_t n_layers;                 // convenience (redundant with GGUF)
     uint32_t n_experts;                // convenience (redundant with GGUF)
     uint32_t align;                    // the alignment used (== kIoAlignment)
     uint32_t header_crc32;             // CRC32 of bytes before this field
-    uint8_t  reserved[16];             // pad to 128 bytes (was 32; 16 bytes
-                                       // repurposed for the two fields above)
+    // reserved[] is now empty: the two v3 fields above consumed the final 16
+    // reserved bytes. sizeof(StrataSuperblock) stays exactly 128.
 };
 
 static_assert(sizeof(StrataSuperblock) == kStrataSuperblockSize,
@@ -97,6 +131,25 @@ struct ExpertIndexEntry {
 
 static_assert(sizeof(ExpertIndexEntry) == 48,
               "ExpertIndexEntry must be exactly 48 bytes");
+
+// One compression record per expert index entry (v3+, when
+// kStrataFlagExpertsCompressed is set). 24 bytes, 8-byte aligned. The array is
+// stored in the SAME order as the expert index (index position i describes
+// index_[i]'s blob), so the reader looks it up by position with no key. The
+// expert index's blob_length and the gate_rel/up_rel/down_rel slice offsets
+// continue to describe the UNCOMPRESSED bundle layout; only `compressed_length`
+// records how many bytes actually sit on disk at blob_offset. For an
+// uncompressed blob (incompressible, or lz_compress did not help) codec==kNone
+// and compressed_length==uncompressed_length==blob_length (per-blob fallback).
+struct ExpertBlobCompression {
+    uint32_t codec;               // sf::StrataCodec (kNone=0 / kLz=1)
+    uint32_t reserved;            // pad to 8-byte alignment; must be 0
+    uint64_t compressed_length;   // bytes stored on disk at blob_offset
+    uint64_t uncompressed_length; // bytes after decode (== blob_length)
+};
+
+static_assert(sizeof(ExpertBlobCompression) == 24,
+              "ExpertBlobCompression must be exactly 24 bytes");
 
 // Max trunk-tensor-name length (including the NUL terminator) stored in a
 // TrunkIndexEntry. llama trunk tensor names are short - the longest is of the

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/gguf_meta.h"  // gguf_read_u32_key (robust int metadata read)
+#include "common/lz_codec.h"  // StrataCodec, lz_compress*
 #include "tws/async_io.h"  // kIoAlignment, align_up
 #include "tws/strata_format.h"
 #include "tws/stream_buft.h"  // parse_expert_tensor_name, ExpertTensorKind
@@ -51,6 +52,22 @@ bool copy_range(FILE *dst, FILE *src, uint64_t src_off, uint64_t len, uint64_t &
         pos += want;
         left -= want;
     }
+    return true;
+}
+
+// Read `len` bytes from the source file at `src_off` into `buf` (appending at
+// `buf_pos`, which is advanced). Used by the compression path, which needs the
+// whole uncompressed bundle in memory to compress it before writing. Returns
+// false on a short read.
+bool read_range(FILE *src, uint64_t src_off, uint64_t len,
+                std::vector<uint8_t> &buf, size_t &buf_pos) {
+    if (len == 0) return true;
+    if (std::fseek(src, static_cast<long>(src_off), SEEK_SET) != 0) return false;
+    if (std::fread(buf.data() + buf_pos, 1, static_cast<size_t>(len), src) !=
+        static_cast<size_t>(len)) {
+        return false;
+    }
+    buf_pos += static_cast<size_t>(len);
     return true;
 }
 
@@ -232,8 +249,9 @@ bool copy_kv(gguf_context *dst, const gguf_context *src, int64_t kid) {
 }  // namespace
 
 bool pack_gguf_to_strata(const std::string &in_path, const std::string &out_path,
-                         std::string *err) {
+                         std::string *err, StrataCodec codec) {
     if (err != nullptr) err->clear();
+    const bool compress_requested = (codec != StrataCodec::kNone);
 
     // --- 1. Open the source GGUF metadata (no tensor data read) -------------
     gguf_init_params gp{};
@@ -493,7 +511,16 @@ bool pack_gguf_to_strata(const std::string &in_path, const std::string &out_path
     // --- 2. Reserve the superblock (backfilled at the end) ------------------
     StrataSuperblock sb{};
     std::memcpy(sb.magic, kStrataMagic, sizeof(kStrataMagic));
-    sb.version = kStrataVersion;
+    // Default to the v2 on-disk layout (two trailing index fields: trunk only).
+    // The version is promoted to v3 at the END iff a compression region was
+    // actually written, so a pack with no compressed blob is byte-for-byte
+    // identical to the pre-v3 packer output (same version, flags, bytes, CRC).
+    // The in-memory StrataSuperblock IS the v3 layout; the two v3-only fields
+    // (compress_index_offset/count) stay 0 here, which is exactly where the v2
+    // on-disk reader expects n_layers to begin -- but a v2 file never reads
+    // those bytes as index fields, so leaving them 0 and keeping version==2 is
+    // identical to the v2 packer. See the backfill note below.
+    sb.version = 2;
     sb.flags = kStrataFlagExpertsBundled | kStrataFlagIndexSorted;
     sb.align = static_cast<uint32_t>(kIoAlignment);
     sb.n_layers = n_layers;
@@ -710,6 +737,18 @@ bool pack_gguf_to_strata(const std::string &in_path, const std::string &out_path
     }
     sb.expert_region_offset = region_start;
 
+    // v3 compression index: one record per expert index entry, in index order.
+    // Built in lockstep with the loop below. Stays empty when codec==kNone, in
+    // which case no region/flag is written and the output is byte-identical to
+    // the pre-compression (v2) packer.
+    std::vector<ExpertBlobCompression> compress_index;
+    if (compress_requested) compress_index.reserve(index.size());
+    bool any_compressed = false;
+    // Reused across blobs so we do not re-allocate per expert; per-blob local in
+    // spirit (the packer is single-threaded). Only touched on the compress path.
+    std::vector<uint8_t> raw_blob;
+    std::vector<uint8_t> comp_blob;
+
     for (ExpertIndexEntry &entry : index) {
         const uint32_t layer = entry.layer;
         const uint32_t e = entry.expert;
@@ -769,21 +808,27 @@ bool pack_gguf_to_strata(const std::string &in_path, const std::string &out_path
         }
         entry.blob_offset = blob_start;
 
-        uint64_t rel = 0;
-        auto emit = [&](const Slice &s, uint64_t &rel_out) -> bool {
-            rel_out = rel;
-            if (!copy_range(out, src, s.off, s.len, pos)) return false;
-            rel += s.len;
-            return true;
+        // Build the ordered slice list (fused gate_up, else gate|up|down) and
+        // the matching *_rel offsets, which always describe the UNCOMPRESSED
+        // tightly-packed layout - unchanged whether or not we compress the
+        // on-disk bytes. For a fused bundle gate_rel==up_rel (one fused slice);
+        // down_rel follows.
+        struct Emit {
+            const Slice *s;
+            uint64_t *rel_out;
         };
-
-        bool ok = true;
+        std::vector<Emit> emits;
         if (fused.ok) {
-            // Fused gate_up arch: bundle gate_up then down. gate_rel == up_rel
-            // (one fused slice), down_rel follows.
-            ok = ok && emit(fused, entry.gate_rel);
-            entry.up_rel = entry.gate_rel;
-            ok = ok && down.ok && emit(down, entry.down_rel);
+            emits.push_back({&fused, &entry.gate_rel});
+            entry.up_rel = 0;  // set after gate_rel is known (== gate_rel)
+            emits.push_back({&down, &entry.down_rel});
+            if (!down.ok) {
+                std::fclose(out);
+                std::fclose(src);
+                gguf_free(gc);
+                return fail(err, "layer " + std::to_string(layer) +
+                                     " fused bundle is missing a down tensor");
+            }
         } else {
             if (!gate.ok || !up.ok || !down.ok) {
                 std::fclose(out);
@@ -792,18 +837,98 @@ bool pack_gguf_to_strata(const std::string &in_path, const std::string &out_path
                 return fail(err, "layer " + std::to_string(layer) +
                                      " is missing a gate/up/down expert tensor");
             }
-            ok = ok && emit(gate, entry.gate_rel);
-            ok = ok && emit(up, entry.up_rel);
-            ok = ok && emit(down, entry.down_rel);
+            emits.push_back({&gate, &entry.gate_rel});
+            emits.push_back({&up, &entry.up_rel});
+            emits.push_back({&down, &entry.down_rel});
         }
-        if (!ok) {
-            std::fclose(out);
-            std::fclose(src);
-            gguf_free(gc);
-            return fail(err, "copy expert blob (layer " + std::to_string(layer) +
-                                 ", expert " + std::to_string(e) + ") failed");
+
+        // The UNCOMPRESSED blob length is the sum of the slice lengths.
+        uint64_t blob_length = 0;
+        for (const Emit &em : emits) blob_length += em.s->len;
+
+        if (!compress_requested) {
+            // VERBATIM path (identical to the pre-compression packer): stream
+            // each slice straight from the source into the output.
+            uint64_t rel = 0;
+            bool ok = true;
+            for (const Emit &em : emits) {
+                *em.rel_out = rel;
+                ok = ok && copy_range(out, src, em.s->off, em.s->len, pos);
+                rel += em.s->len;
+            }
+            if (fused.ok) entry.up_rel = entry.gate_rel;
+            if (!ok) {
+                std::fclose(out);
+                std::fclose(src);
+                gguf_free(gc);
+                return fail(err, "copy expert blob (layer " +
+                                     std::to_string(layer) + ", expert " +
+                                     std::to_string(e) + ") failed");
+            }
+            entry.blob_length = pos - blob_start;
+        } else {
+            // COMPRESS path: assemble the whole uncompressed bundle in memory
+            // (tightly packed in slice order), set the *_rel offsets, then try
+            // to compress. Store the SMALLER of {compressed, verbatim} and
+            // record the per-blob codec/clen/ulen. blob_length and the *_rel
+            // offsets always describe the UNCOMPRESSED layout.
+            raw_blob.resize(static_cast<size_t>(blob_length));
+            size_t raw_pos = 0;
+            uint64_t rel = 0;
+            bool rok = true;
+            for (const Emit &em : emits) {
+                *em.rel_out = rel;
+                rok = rok && read_range(src, em.s->off, em.s->len, raw_blob,
+                                        raw_pos);
+                rel += em.s->len;
+            }
+            if (fused.ok) entry.up_rel = entry.gate_rel;
+            if (!rok) {
+                std::fclose(out);
+                std::fclose(src);
+                gguf_free(gc);
+                return fail(err, "read expert blob (layer " +
+                                     std::to_string(layer) + ", expert " +
+                                     std::to_string(e) + ") failed");
+            }
+            entry.blob_length = blob_length;
+
+            // Try to compress. lz_compress returns -1 if it does not fit the
+            // worst-case bound; treat that (and any non-shrinking result) as a
+            // per-blob fallback to verbatim storage.
+            comp_blob.resize(lz_compress_bound(static_cast<size_t>(blob_length)));
+            const int64_t clen =
+                blob_length == 0
+                    ? 0
+                    : lz_compress(raw_blob.data(),
+                                  static_cast<size_t>(blob_length),
+                                  comp_blob.data(), comp_blob.size());
+            ExpertBlobCompression ci{};
+            ci.uncompressed_length = blob_length;
+            const uint8_t *write_src = nullptr;
+            uint64_t write_len = 0;
+            if (clen >= 0 && static_cast<uint64_t>(clen) < blob_length) {
+                ci.codec = static_cast<uint32_t>(StrataCodec::kLz);
+                ci.compressed_length = static_cast<uint64_t>(clen);
+                write_src = comp_blob.data();
+                write_len = static_cast<uint64_t>(clen);
+                any_compressed = true;
+            } else {
+                ci.codec = static_cast<uint32_t>(StrataCodec::kNone);
+                ci.compressed_length = blob_length;
+                write_src = raw_blob.data();
+                write_len = blob_length;
+            }
+            compress_index.push_back(ci);
+            if (!write_bytes(out, write_src, write_len, pos)) {
+                std::fclose(out);
+                std::fclose(src);
+                gguf_free(gc);
+                return fail(err, "write expert blob (layer " +
+                                     std::to_string(layer) + ", expert " +
+                                     std::to_string(e) + ") failed");
+            }
         }
-        entry.blob_length = pos - blob_start;
     }
     sb.expert_region_size = pos - region_start;
 
@@ -833,6 +958,34 @@ bool pack_gguf_to_strata(const std::string &in_path, const std::string &out_path
         sb.flags |= kStrataFlagTrunkIndexed;
     }
 
+    // --- 5c. Compression index region (v3, 4 KiB-aligned start) ------------
+    // Written after the trunk index (so trunk/expert regions keep their exact
+    // byte layout) ONLY when at least one blob was actually stored compressed.
+    // When no blob compressed we write NEITHER the region NOR the flag and
+    // leave both superblock fields 0, so the file is byte-identical to a
+    // verbatim pack even if --compress lz was requested on incompressible data.
+    if (any_compressed && !compress_index.empty()) {
+        const uint64_t compress_index_start = align_up(pos, kIoAlignment);
+        if (!pad_to(out, compress_index_start, pos)) {
+            std::fclose(out);
+            std::fclose(src);
+            gguf_free(gc);
+            return fail(err, "pad to compression index failed");
+        }
+        const uint64_t compress_index_bytes =
+            compress_index.size() * sizeof(ExpertBlobCompression);
+        if (!write_bytes(out, compress_index.data(), compress_index_bytes,
+                         pos)) {
+            std::fclose(out);
+            std::fclose(src);
+            gguf_free(gc);
+            return fail(err, "write compression index failed");
+        }
+        sb.compress_index_offset = compress_index_start;
+        sb.compress_index_count = compress_index.size();
+        sb.flags |= kStrataFlagExpertsCompressed;
+    }
+
     // --- 6. Backfill the index with real offsets ---------------------------
     if (std::fseek(out, static_cast<long>(sb.index_offset), SEEK_SET) != 0) {
         std::fclose(out);
@@ -849,14 +1002,50 @@ bool pack_gguf_to_strata(const std::string &in_path, const std::string &out_path
     }
 
     // --- Backfill the superblock with real offsets + CRC --------------------
-    sb.header_crc32 = strata_crc32(&sb, kStrataHeaderCrcOffset);
+    // Serialize version-aware so an UNCOMPRESSED pack is byte-for-byte identical
+    // to the pre-v3 (v2) packer. The in-memory StrataSuperblock is the v3
+    // layout (n_layers at offset 112); a v2 file places n_layers at offset 96
+    // (no compress_index_* fields). We only promote to v3 - and only then write
+    // the two extra fields and shift the trailing scalars down - when a
+    // compression region was actually written. Field offsets per version are
+    // documented in src/tws/strata_format.h.
+    uint8_t sb_bytes[kStrataSuperblockSize];
+    std::memset(sb_bytes, 0, sizeof(sb_bytes));
+    // Common prefix [0, 80): magic..expert_region_size, identical across v1/v2/
+    // v3. Copy it straight from the in-memory struct (same layout there too).
+    std::memcpy(sb_bytes, &sb, 80);
+    // trunk_index_offset@80, trunk_index_count@88: identical in v2 and v3.
+    std::memcpy(sb_bytes + 80, &sb.trunk_index_offset, 8);
+    std::memcpy(sb_bytes + 88, &sb.trunk_index_count, 8);
+    size_t crc_cover;
+    if (sb.compress_index_count > 0) {
+        // v3 on-disk layout: compress fields at 96/104, scalars at 112..124.
+        sb.version = 3;
+        std::memcpy(sb_bytes + 8, &sb.version, 4);        // overwrite version
+        std::memcpy(sb_bytes + 96,  &sb.compress_index_offset, 8);
+        std::memcpy(sb_bytes + 104, &sb.compress_index_count, 8);
+        std::memcpy(sb_bytes + 112, &sb.n_layers, 4);
+        std::memcpy(sb_bytes + 116, &sb.n_experts, 4);
+        std::memcpy(sb_bytes + 120, &sb.align, 4);
+        crc_cover = 124;
+    } else {
+        // v2 on-disk layout: scalars at 96..108; no compress fields. Byte-
+        // identical to the pre-v3 packer (version already 2, flags unchanged).
+        std::memcpy(sb_bytes + 96,  &sb.n_layers, 4);
+        std::memcpy(sb_bytes + 100, &sb.n_experts, 4);
+        std::memcpy(sb_bytes + 104, &sb.align, 4);
+        crc_cover = 108;
+    }
+    const uint32_t sb_crc = strata_crc32(sb_bytes, crc_cover);
+    std::memcpy(sb_bytes + crc_cover, &sb_crc, 4);
     if (std::fseek(out, 0, SEEK_SET) != 0) {
         std::fclose(out);
         std::fclose(src);
         gguf_free(gc);
         return fail(err, "seek to superblock failed");
     }
-    if (std::fwrite(&sb, 1, kStrataSuperblockSize, out) != kStrataSuperblockSize) {
+    if (std::fwrite(sb_bytes, 1, kStrataSuperblockSize, out) !=
+        kStrataSuperblockSize) {
         std::fclose(out);
         std::fclose(src);
         gguf_free(gc);

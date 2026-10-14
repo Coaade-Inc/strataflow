@@ -121,6 +121,14 @@ per second). RAM size does not cap what you can run.
   synchronous load stays the authoritative backstop, so results do not change and
   stay byte-identical to the reference engine even under eviction; compute stays
   single-threaded (only an I/O thread is added) and the overlap is on by default.
+- **Optional compression of the streamed experts (opt-in, lossless).** The
+  packer can compress the on-disk expert blobs so fewer bytes have to be read
+  from the SSD per token; StrataFlow decompresses them transparently as it reads,
+  so the output is byte-for-byte identical - it is a pure transport optimization,
+  not a quality or accuracy change. It is off by default and opt-in at pack time.
+  The win depends on the model's weight entropy: on already-quantized experts the
+  reduction is modest, so we report it honestly rather than quoting a speedup
+  number.
 
 ## Proof points (measured)
 
@@ -214,9 +222,13 @@ Honest open items:
 - Other MoE architectures (Qwen2-MoE, DeepSeek-MoE) are not yet implemented;
   only llama-arch MoE and dense llama are supported today.
 - GPU backends are structurally reachable but need real GPU hardware to
-  validate. Enterprise GPU acceleration - single-GPU first, then multi-GPU
-  scale-out for high-throughput serving - is planned future work, not a shipped
-  feature; the no-GPU CPU path remains the proven core.
+  validate. The VRAM-placement decision an eventual GPU path consumes is already
+  built and CPU-unit-tested (GPU discovery, VRAM-first trunk/expert placement,
+  and the pure plan-to-`n_gpu_layers` translation); what remains, and is
+  hardware-gated, is wiring a GPU buffer type into the engine so the resident
+  tier lands in VRAM. Enterprise GPU acceleration - single-GPU first, then
+  multi-GPU scale-out for high-throughput serving - is planned future work, not a
+  shipped feature; the no-GPU CPU path remains the proven core.
 - No tagged release and no OpenAI-compatible HTTP server front-end yet.
 
 The mechanism is proven on real hardware; settled real large-model throughput is

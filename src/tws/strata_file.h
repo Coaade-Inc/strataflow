@@ -81,10 +81,15 @@ public:
     // sequential read, higher effective bandwidth), never WHICH bytes.
     //
     // Returns the number of bytes read (== blob_length) on success, or -1 on a
-    // lookup/read error OR on a FUSED-gate_up bundle (gate_rel == up_rel),
-    // whose two-slice layout does not match the engine's three-slice slot; the
-    // caller must then fall back to the per-kind read_blob path. streamed_bytes()
-    // counts the bundle's bytes exactly once (identical total to three reads).
+    // lookup/read error OR on a VERBATIM FUSED-gate_up bundle (gate_rel ==
+    // up_rel), whose two-slice on-disk layout does not match the engine's
+    // three-slice slot; the caller must then fall back to the per-kind
+    // read_blob path. A COMPRESSED fused bundle IS served here: the whole blob
+    // is decoded once into dst (its decompressed layout is the same tightly-
+    // packed gate|up|down the three read_blob calls would produce), so a fused
+    // compressed expert is read and decoded exactly once rather than three
+    // times. streamed_bytes() counts the bundle's (compressed, when stored
+    // compressed) bytes exactly once (identical total to three reads).
     int64_t read_bundle(uint32_t layer, uint32_t expert, void *dst) const;
 
     // Count of underlying BlockFile::read_at calls issued by the EXPERT read
@@ -150,6 +155,14 @@ public:
 private:
     uint64_t slice_rel(const ExpertIndexEntry &e, ExpertTensorKind kind) const;
 
+    // The compression record for the index entry at position `index_pos`, or
+    // nullptr when the file carries no compression index (v1/v2, or a v3 file
+    // with no compressed blob) so the blob is stored verbatim.
+    const ExpertBlobCompression *compression_at(size_t index_pos) const {
+        if (index_pos >= compress_.size()) return nullptr;
+        return &compress_[index_pos];
+    }
+
     bool                            open_ = false;
     mutable BlockFile               file_;
     // Accumulated expert-slice bytes read via read_blob(). mutable because
@@ -178,6 +191,13 @@ private:
     // for O(1) lookup. Empty for a v1 file (full-resident fallback).
     std::vector<TrunkIndexEntry>    trunk_index_;
     std::unordered_map<std::string, size_t> trunk_map_;
+    // v3 per-expert-blob compression index (FEAT-002 'compress what streams'),
+    // aligned 1:1 with index_ by POSITION (compress_[i] describes index_[i]'s
+    // on-disk blob). Empty for a v1/v2 file or a v3 file with no compressed
+    // blob, in which case every blob is streamed verbatim (byte-identical to
+    // the uncompressed path). read_blob/read_bundle decompress transparently
+    // when compress_[i].codec != kNone, using PER-CALL-LOCAL scratch only.
+    std::vector<ExpertBlobCompression> compress_;
 };
 
 }  // namespace sf

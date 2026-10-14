@@ -11,6 +11,40 @@ grouped by the pull request that merged them.
 
 ### Fixes
 
+- Compress-what-streams: a FUSED gate_up expert bundle is now read and counted
+  ONCE on the compressed path, not 3x/2x (`src/tws/strata_file.{h,cpp}`).
+  Review follow-up on the compression lever. A fused layout
+  (`gate_rel == up_rel == 0`, a two-slice `gate_up|down` bundle - the gpt-oss /
+  granite / gemma / phi3-style arches `parse_expert_tensor_name` recognizes) is
+  the only layout the compressed per-kind `read_blob` fallback ever served, and
+  no in-tree fixture exercised it (the fixtures are legacy/non-fused). Two
+  defects, both benchmark-counter / CPU-cost only (NOT a correctness or
+  byte-identity break): (1) `read_blob` attributed the compressed size to any
+  slice whose `slice_rel == 0`, and a fused bundle has gate AND up both at rel 0,
+  so `streamed_bytes()` counted the compressed size TWICE per fused expert;
+  (2) `read_bundle` rejected every fused layout, forcing the engine onto three
+  per-kind `read_blob` calls that each re-read and re-decompressed the WHOLE blob
+  (3x decode work per resident fused expert). THE FIX: `read_blob` now keys the
+  compressed-byte increment on the GATE KIND (`kGate`/`kGateUp`) instead of
+  `slice_rel == 0`, so it counts exactly once across the gate/up/down calls
+  (non-fused is unchanged: `kGate` is the rel-0 slice there too); and
+  `read_bundle` now runs its compressed branch BEFORE the verbatim fused
+  rejection, serving a compressed fused bundle with ONE whole-blob decode into
+  `dst` (the decompressed blob is the whole tightly-packed bundle, and a fused
+  `gate_up` slice is gate followed by up contiguously, so `[gate_up | down]` is
+  byte-identical to `[gate | up | down]`) - read and decoded once, counted once.
+  The verbatim path still rejects fused. Preserves byte-identity (the engine
+  sees the same uncompressed bytes), the default/uncompressed byte-for-byte
+  identity (SHA256 `strata-pack` == `--compress none`), v1/v2/v3 back-compat, and
+  the per-call-local no-shared-state decode (compute thread + async prefetch
+  worker stay race-free). A new fused-layout seam subtest in
+  `test_compressed_strata` (hand-built two-slice `gate_up|down` v3 `.strata`)
+  asserts `read_bundle` serves the compressed fused bundle in ONE read/decode
+  and that the three `read_blob` calls count the compressed size EXACTLY ONCE
+  (would catch the 2x regression). Full ctest 24/24 green under GCC 11.5 + Clang
+  15.0.7 `-Werror` (release + debug); the real-path oracle gate stays
+  `max|delta| = 0.000e+00`. No change to `third_party/llama.cpp`.
+
 - MAX now CLAMPS to the largest fitting plan instead of REFUSING on a 12-13
   GiB-class box (`src/plan/planner.cpp`). RamMode::Max (and Auto) are MODES, not
   numeric ceilings: a pure mode run (`target_ram_budget == 0` AND
@@ -56,6 +90,46 @@ grouped by the pull request that merged them.
   to `third_party/llama.cpp`; no new feature.
 
 ### Features
+
+- Optional lossless on-disk expert-blob compression (compress what streams).
+  `strata-pack` gains a `--compress <lz|none>` flag (default `none`,
+  uncompressed): when `lz` is selected, each per-expert blob is compressed at
+  pack time with a new self-contained in-tree LZ codec
+  (`src/common/lz_codec.{h,cpp}`, no new submodule, no third-party dependency),
+  storing the SMALLER of {compressed, verbatim} per blob with a per-blob codec
+  id plus compressed/uncompressed lengths in a new `.strata` region. The reader
+  (`StrataReader::read_bundle` / `read_blob`) decompresses TRANSPARENTLY at the
+  read seam into per-call scratch, so the engine's compute sees byte-identical
+  expert bytes while FEWER (compressed) bytes stream from the SSD;
+  `streamed_bytes` now reflects the compressed bytes actually read (the win).
+  The `.strata` format is bumped to v3, OPTIONAL and BACK-COMPATIBLE: v1 and v2
+  files still load and decode byte-identically, and an uncompressed v3 pack is
+  byte-for-byte identical to the prior packer output (SHA256-verified).
+  `sizeof(StrataSuperblock)` stays 128 and `ExpertIndexEntry` stays 48 bytes
+  (v1/v2 readers depend on both). The codec functions are PURE (per-call scratch
+  only), so the concurrent compute-thread and prefetch-worker decompress reads
+  are race-free; no engine change was needed. ORACLE GATE: the decode on a
+  compressed `.strata` is byte-identical to the uncompressed one (per-step logit
+  `max|delta| = 0.000e+00`) and matches the libllama oracle within the quant
+  tolerance (`~5.2e-2 < 1e-1`) - it is a pure lossless transport optimization,
+  not a lossy requant. DECOMPRESS-VS-SSD TRADEOFF (measured, safe): codec
+  decompress is ~6.9 GiB/s (gcc release; clang ~6.1 GiB/s) on a 32 MiB mixed
+  buffer, well above the ~4 GiB/s SSD per-core bandwidth, so decompress is not
+  the new bottleneck. HONEST RATIO: on the already-K-quantized expert fixture
+  (`q4_k`) the ratio is ~1.0000 - the already-quantized, high-entropy
+  random-weight experts do not shrink and every blob falls back to verbatim; the
+  idea is attributed to AirLLM, whose higher-entropy / differently-quantized
+  models compressed more, so we do NOT claim their ~3x, and the net wall-clock
+  effect scales with whatever ratio the real trained-weight Mixtral achieves
+  (Colab-only to measure). The mechanism is proven end to end on a deliberately
+  compressible blob (16384-byte blob stored as 224 bytes on disk, `read_bundle`
+  returns the full 16384 bytes byte-exact, `streamed_bytes` counts 224). New
+  tests `test_lz_codec` (round-trip on empty / small / compressible /
+  high-entropy / blob-sized inputs, rejects truncated/garbage with no overrun,
+  prints a measured decompress GiB/s) and `test_compressed_strata` (real-path
+  pack->StrataReader->engine oracle gate; skips cleanly without the fixture).
+  Full ctest 24/24 green under GCC 11.5 + Clang 15.0.7 `-Werror` (release +
+  debug). No change to `third_party/llama.cpp`.
 
 - AUTO coherent retune + lossless batched/sequential expert reads +
   reused-expert residency. Fixes the two coupled problems the real-Mixtral Colab
