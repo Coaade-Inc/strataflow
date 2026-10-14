@@ -326,6 +326,11 @@ static void test_target_ram_modes_real_path() {
     CHECK_EQ(st_m, SF_OK);
     CHECK(max_model != nullptr);
     CHECK(max_plan.fits);
+    // FIT INVARIANT on the Max plan after the monotonicity guard's slot re-fit:
+    // the final projected peak must still fit Max's usable budget. Guards the
+    // same construction-only guarantee the pure-function sweep covers, now on
+    // the REAL load path so a re-fit regression would be caught end to end.
+    CHECK(max_plan.planned_peak_bytes <= max_plan.usable_ram_bytes);
 
     std::printf("[auto: peak=%lluMiB usable=%lluMiB kv_window=%u trunk_pool=%u "
                 "slots=%u streamed? %d | max: peak=%lluMiB usable=%lluMiB "

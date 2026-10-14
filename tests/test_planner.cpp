@@ -370,6 +370,12 @@ static void test_auto_vs_max_same_machine() {
     // Auto respects its conservative share; Max uses more and peaks higher.
     CHECK(a.planned_peak_bytes <= a.usable_ram_bytes);
     CHECK(x.planned_peak_bytes > a.planned_peak_bytes);
+    // FIT INVARIANT on the (possibly CLAMPED) Max plan: after the monotonicity
+    // guard re-fits slots against the raised KV/trunk cost, Max's projected peak
+    // must still fit its usable budget. Pins the construction-only guarantee so
+    // a re-fit regression cannot slip past the ordering checks above.
+    CHECK(x.fits);
+    CHECK(x.planned_peak_bytes <= x.usable_ram_bytes);
     // Max holds >= experts resident and >= KV window than Auto.
     CHECK(x.expert_slots_resident >= a.expert_slots_resident);
     // KV window: 0 means full n_ctx. Max keeps a window at least as large as
@@ -520,6 +526,14 @@ static void test_max_uses_total_not_free_monotonic() {
     const uint32_t x_hot = x.trunk_pool_layers ? x.trunk_pool_layers : m.n_layers;
     CHECK(x_hot >= a_hot);
     CHECK(x.expert_slots_resident <= full_slots);
+
+    // FIT INVARIANT on the CLAMPED Max plan: the monotonicity guard re-fits the
+    // slot count after raising KV/trunk toward Auto, so the final projected peak
+    // must still fit Max's usable budget. The guarantee holds by construction,
+    // but a re-fit regression that overflowed usable would otherwise go uncaught
+    // (the ordering checks above would stay green).
+    CHECK(x.fits);
+    CHECK(x.planned_peak_bytes <= x.usable_ram_bytes);
 
     std::printf("[max vs free<<total: auto usable=%lluMiB slots=%u | max "
                 "usable=%lluMiB slots=%u] ",
