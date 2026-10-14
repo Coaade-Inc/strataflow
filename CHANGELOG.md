@@ -57,6 +57,46 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- Optional lossless on-disk expert-blob compression (compress what streams).
+  `strata-pack` gains a `--compress <lz|none>` flag (default `none`,
+  uncompressed): when `lz` is selected, each per-expert blob is compressed at
+  pack time with a new self-contained in-tree LZ codec
+  (`src/common/lz_codec.{h,cpp}`, no new submodule, no third-party dependency),
+  storing the SMALLER of {compressed, verbatim} per blob with a per-blob codec
+  id plus compressed/uncompressed lengths in a new `.strata` region. The reader
+  (`StrataReader::read_bundle` / `read_blob`) decompresses TRANSPARENTLY at the
+  read seam into per-call scratch, so the engine's compute sees byte-identical
+  expert bytes while FEWER (compressed) bytes stream from the SSD;
+  `streamed_bytes` now reflects the compressed bytes actually read (the win).
+  The `.strata` format is bumped to v3, OPTIONAL and BACK-COMPATIBLE: v1 and v2
+  files still load and decode byte-identically, and an uncompressed v3 pack is
+  byte-for-byte identical to the prior packer output (SHA256-verified).
+  `sizeof(StrataSuperblock)` stays 128 and `ExpertIndexEntry` stays 48 bytes
+  (v1/v2 readers depend on both). The codec functions are PURE (per-call scratch
+  only), so the concurrent compute-thread and prefetch-worker decompress reads
+  are race-free; no engine change was needed. ORACLE GATE: the decode on a
+  compressed `.strata` is byte-identical to the uncompressed one (per-step logit
+  `max|delta| = 0.000e+00`) and matches the libllama oracle within the quant
+  tolerance (`~5.2e-2 < 1e-1`) - it is a pure lossless transport optimization,
+  not a lossy requant. DECOMPRESS-VS-SSD TRADEOFF (measured, safe): codec
+  decompress is ~6.9 GiB/s (gcc release; clang ~6.1 GiB/s) on a 32 MiB mixed
+  buffer, well above the ~4 GiB/s SSD per-core bandwidth, so decompress is not
+  the new bottleneck. HONEST RATIO: on the already-K-quantized expert fixture
+  (`q4_k`) the ratio is ~1.0000 - the already-quantized, high-entropy
+  random-weight experts do not shrink and every blob falls back to verbatim; the
+  idea is attributed to AirLLM, whose higher-entropy / differently-quantized
+  models compressed more, so we do NOT claim their ~3x, and the net wall-clock
+  effect scales with whatever ratio the real trained-weight Mixtral achieves
+  (Colab-only to measure). The mechanism is proven end to end on a deliberately
+  compressible blob (16384-byte blob stored as 224 bytes on disk, `read_bundle`
+  returns the full 16384 bytes byte-exact, `streamed_bytes` counts 224). New
+  tests `test_lz_codec` (round-trip on empty / small / compressible /
+  high-entropy / blob-sized inputs, rejects truncated/garbage with no overrun,
+  prints a measured decompress GiB/s) and `test_compressed_strata` (real-path
+  pack->StrataReader->engine oracle gate; skips cleanly without the fixture).
+  Full ctest 24/24 green under GCC 11.5 + Clang 15.0.7 `-Werror` (release +
+  debug). No change to `third_party/llama.cpp`.
+
 - AUTO coherent retune + lossless batched/sequential expert reads +
   reused-expert residency. Fixes the two coupled problems the real-Mixtral Colab
   run exposed, both residency/placement-only so decode stays byte-identical.

@@ -445,6 +445,9 @@ cut the remaining traffic further:
 - **Sequential batched I/O**: same bytes but nearer the ~4 GiB/s sequential
   number instead of the measured low-QD1 effective rate, cutting wall-clock per
   byte.
+- **Compress what streams** (6.7b): fewer bytes on disk per expert, decompressed
+  at the read seam; lossless. Modest-to-none on already-K-quantized experts
+  (~1.0 on the fixture); the real win scales with the trained-model entropy.
 - **Speculative decode**: the expensive expert streaming happens on a fraction
   of steps (verification bursts), cutting *effective* bytes/token across the
   sequence.
@@ -827,6 +830,67 @@ instead of byte-identity.
   geometry, ~9.8x bytes/token reduction on the fixture, 3:1 read-count cut,
   byte-identity).
 
+### 6.7b Compress what streams (lossless on-disk expert-blob compression) [SHIPPED, lossless]
+
+- **Mechanism.** The sibling of 6.7: 6.7 raises the effective bandwidth, this
+  lever cuts the bytes that have to cross the SSD in the first place. At pack
+  time each per-expert blob (the tightly packed gate|up|down bundle) is run
+  through a small in-tree LZ codec; the SMALLER of {compressed, verbatim} is
+  stored on disk, and a per-blob codec id plus compressed/uncompressed lengths
+  are recorded in a new `.strata` region. At the read seam
+  (`StrataReader::read_bundle` / `read_blob`) the compressed bytes are read into
+  a per-call scratch and decompressed into the caller's staging, so the engine's
+  compute sees byte-identical expert bytes while FEWER bytes actually stream from
+  the SSD. It compresses ONLY the expert weight bytes for the disk transfer - not
+  activations, not the KV cache, and it is NOT a lossy requant. This is the
+  AirLLM "compress what you stream" idea applied to the expert path.
+- **50B math.** Directly reduces `bytes_streamed_per_token` by the achieved
+  compression ratio, which on an I/O-bound box is a proportional wall-clock win
+  (fewer bytes / effective_bandwidth). The catch is the decompress-vs-SSD
+  tradeoff: the saving is only real if the decoder runs well above SSD bandwidth,
+  otherwise decompression becomes the new bottleneck and eats the gain. Measured
+  decompress throughput of the shipped codec on a 32 MiB mixed buffer is ~6.9
+  GiB/s (gcc release; clang ~6.1 GiB/s), comfortably above the ~4 GiB/s SSD
+  per-core bandwidth, so on this box decompress is NOT the limiter and the lever
+  does not backfire.
+- **Honest ratio.** On the already-K-quantized expert fixture
+  (`make-legacy-moe-gguf ... q4_k`) the measured ratio is ~1.0000 - i.e. no
+  reduction. The experts are ALREADY q4_k quantized and the random-weight fixture
+  is high-entropy, so the fast byte-level LZ cannot shrink them: every blob falls
+  back to verbatim (`kNone`) and the on-disk expert region is byte-for-byte the
+  same size. This is expected and we state it plainly. AirLLM reported larger
+  wins because their models were higher-entropy / differently quantized; we do
+  NOT claim their ~3x. On already-K-quantized experts the ratio is
+  modest-to-none, and the net wall-clock effect scales with whatever ratio the
+  real trained-weight Mixtral actually achieves, which is a Colab-only
+  measurement (the sandbox cannot download the 19 GB model).
+- **Oracle-safety.** LOSSLESS. The decode on a compressed `.strata` is
+  byte-identical to the uncompressed one: per-step logit `max|delta| =
+  0.000e+00`, and both match the libllama oracle within the quant tolerance
+  (`~5.2e-2 < 1e-1`). It is a pure transport optimization - the same bytes are
+  reconstructed, just fetched smaller. The mechanism is proven end to end even
+  where the fixture does not compress: on a deliberately compressible blob the
+  reader stores a 16384-byte blob as 224 bytes on disk, `read_bundle` returns the
+  full 16384 uncompressed bytes byte-exact, and `streamed_bytes()` counts 224
+  (the compressed size), not 16384 - so the smaller on-disk region, the
+  fewer-bytes-read accounting, and the transparent decompress are all correct and
+  lossless; only the RATIO on already-quantized experts is modest.
+- **Complexity / deps.** Low: a single self-contained LZ codec
+  (`src/common/lz_codec.{h,cpp}`, no new submodule, no third-party dependency),
+  the pack-time compression and the read-seam decompress. The codec functions are
+  pure (per-call scratch only), so they are race-free for the concurrent
+  compute-thread and prefetch-worker reads. The `.strata` format bumped to v3,
+  OPTIONAL and back-compatible: v1 and v2 files still load and decode
+  byte-identically, and an uncompressed v3 pack is byte-for-byte identical to the
+  prior packer output (SHA256-verified). `strata-pack` gains `--compress <lz|none>`
+  (default uncompressed); `streamed_bytes` now reflects the compressed bytes
+  actually read.
+- **Verdict: SHIPPED, lossless, modest on already-quantized experts.** The
+  plumbing (smaller on-disk expert region, fewer `streamed_bytes`, transparent
+  decompress, decompress faster than the SSD) is correct and proven; the win is
+  bounded by the real model's entropy, so it is opt-in and the ratio is reported
+  honestly rather than promised.
+
 ### 6.8 Speculative / draft decoding
 
 - **Mechanism.** A tiny always-resident draft (EAGLE head / MTP head / n-gram /
@@ -905,6 +969,7 @@ the terms.
 | Sub-byte resident (6.3) | DOWN (more experts fit) | - | UP (dequant) | net win only if dequant cheaper than the saved I/O; measure on 2 cores |
 | Sub-expert streaming (6.2) | DOWN (fewer bytes/expert) | - | ~flat | biggest bytes/token cut; approximate |
 | Batched sequential I/O (6.7) | flat | UP toward 4 GiB/s | - | biggest LOSSLESS wall-clock cut on this box |
+| Compress what streams (6.7b) | DOWN by the ratio | - | UP (decompress ~6.9 GiB/s > SSD, so free here) | LOSSLESS; net win scales with the real ratio (~1.0 on already-K-quant fixture) |
 | Speculative decode (6.8) | DOWN by ~acceptance length | - | UP (verify batch) | biggest EFFECTIVE tok/s multiplier; composes with all above |
 
 Direct / unbuffered I/O (already designed in `PLAN.md` 3.3) is assumed
@@ -940,6 +1005,11 @@ first and ship opt-in.
 4. **Batched sequential I/O + co-activation packing (6.7)** - LOSSLESS. Attacks
    the real 2-core bottleneck (effective bandwidth). Needs a packer layout
    change plus coalesced reads.
+4b. **Compress what streams (6.7b)** - LOSSLESS, SHIPPED. Opt-in on-disk
+   expert-blob compression (`strata-pack --compress lz`), decompressed at the
+   read seam; cuts bytes/token by the achieved ratio (modest-to-none on
+   already-K-quantized experts, scales with real-model entropy). Decompress
+   ~6.9 GiB/s stays above SSD bandwidth, so it does not backfire.
 5. **Cross-token reuse pinning + prefill/decode disaggregation (6.9)** - LOSSLESS
    residency/scheduling refinements on top of PR #39; low risk.
 
@@ -1004,6 +1074,7 @@ Prerequisite for Stage 4: a perplexity / KLD regression harness vs the oracle
 | 6.5 | KV paging (lossless RAM tiering) | lossless | SHIPPED (FIT, FEAT-002); SSD spill deferred |
 | 6.6 | Standalone tokenizer / drop libllama | lossless | feasible-with-effort (modest) |
 | 6.7 | Batched sequential I/O + co-activation packing | lossless | feasible-now (SPEED, top lossless) |
+| 6.7b | Compress what streams (on-disk expert-blob LZ) | lossless | SHIPPED (SPEED, opt-in; ~1.0 on already-K-quant, scales with real entropy) |
 | 6.9 | Cross-token pinning / prefill-decode split | lossless | feasible-now (refinement) |
 | 6.8 | Speculative decode (n-gram first) | output-lossless (greedy) | feasible-with-effort (headline SPEED) |
 | 6.5 | KV quantization | approximate | feasible-with-effort (opt-in) |

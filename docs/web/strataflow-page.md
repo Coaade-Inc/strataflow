@@ -121,6 +121,14 @@ per second). RAM size does not cap what you can run.
   synchronous load stays the authoritative backstop, so results do not change and
   stay byte-identical to the reference engine even under eviction; compute stays
   single-threaded (only an I/O thread is added) and the overlap is on by default.
+- **Optional compression of the streamed experts (opt-in, lossless).** The
+  packer can compress the on-disk expert blobs so fewer bytes have to be read
+  from the SSD per token; StrataFlow decompresses them transparently as it reads,
+  so the output is byte-for-byte identical - it is a pure transport optimization,
+  not a quality or accuracy change. It is off by default and opt-in at pack time.
+  The win depends on the model's weight entropy: on already-quantized experts the
+  reduction is modest, so we report it honestly rather than quoting a speedup
+  number.
 
 ## Proof points (measured)
 

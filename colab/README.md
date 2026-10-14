@@ -660,6 +660,105 @@ regression are SANDBOX-PROVEN (the two new regression tests
 `test_max_clamps_not_refuses_12gb` and `test_max_clamps_not_refuses_real_path`,
 plus the gated real-load byte-identity path).
 
+### Compress what streams: `strata-pack --compress lz` (optional, lossless)
+
+StrataFlow can OPTIONALLY compress the per-expert blobs ON DISK so FEWER bytes
+cross the SSD per token (the AirLLM "compress what you stream" idea, applied to
+the expert path). The packer gains a `--compress <lz|none>` flag; `none` (the
+default) is byte-for-byte identical to the old packer output, and `lz`
+compresses each expert blob with a small in-tree LZ codec, storing the SMALLER
+of {compressed, verbatim} per blob. At the read seam `StrataReader` decompresses
+TRANSPARENTLY, so the engine's compute sees byte-identical expert bytes and the
+decode is byte-identical (per-step logit `max|delta| = 0.000e+00`, within the
+quant bound vs the libllama oracle); `streamed_bytes` now reflects the
+COMPRESSED bytes actually read (the win). The `.strata` format is v3, OPTIONAL
+and back-compatible (v1/v2 files still load unchanged).
+
+Be honest about the win: on ALREADY-K-quantized experts (Mixtral is Q3_K_M /
+Q4_K) the byte-level entropy is high, so the fast LZ shrinks them only modestly,
+and on the random-weight sandbox fixture the measured ratio is ~1.0 (no
+reduction - every blob falls back to verbatim). AirLLM reported larger wins on
+higher-entropy / differently-quantized models; we do NOT claim their ~3x. The
+net wall-clock effect scales with whatever ratio the REAL trained-weight Mixtral
+achieves, which is exactly what this Colab re-verify measures. The
+decompress-vs-SSD tradeoff is safe here: the codec decompresses at ~6.9 GiB/s
+(gcc release; clang ~6.1 GiB/s), well above the ~4 GiB/s SSD per-core bandwidth,
+so decompress is not the new bottleneck. On this 2-core box the gain is purely
+FEWER BYTES READ, not prefetch overlap (the async worker self-backs-off at
+`completed-before-use = 0`).
+
+Pack the real Mixtral `.strata` TWICE - once uncompressed, once with
+`--compress lz` - from the SAME downloaded GGUF (point the path at the Mixtral
+GGUF the real-model flow downloaded, e.g. under `/root/.cache/huggingface` or
+wherever `--hf-file` landed it; here `/content/mixtral.gguf`):
+
+```bash
+%%bash
+cd /content/strataflow/build/release
+# Uncompressed (baseline, byte-identical to the old packer).
+./bin/strata-pack /content/mixtral.gguf /content/mixtral.strata
+# Compressed (opt-in lossless on-disk expert-blob compression).
+./bin/strata-pack --compress lz /content/mixtral.gguf /content/mixtral.lz.strata
+# Compare on-disk size: the compressed file is <= the uncompressed one
+# (how much less depends on the real model's entropy; modest on K-quant).
+ls -l /content/mixtral.strata /content/mixtral.lz.strata
+```
+
+Then run the THREE RAM modes on BOTH `.strata` files and compare `streamed`
+(bytes/token) and tok/s against the current ~0.06 tok/s baseline. The decoded
+text must be IDENTICAL across every run (compression is lossless; the modes are
+residency-only):
+
+```bash
+%%bash
+cd /content/strataflow/build/release
+# ---- Uncompressed baseline, three modes ----
+# AUTO (default):
+./bin/strataflow --model /content/mixtral.strata \
+  --max-tokens 16 --async-prefetch on --prompt "The city of"
+# TARGET 3 GiB:
+./bin/strataflow --model /content/mixtral.strata \
+  --target-ram-gb 3 --max-tokens 16 --async-prefetch on --prompt "The city of"
+# MAX:
+./bin/strataflow --model /content/mixtral.strata \
+  --ram-mode max --max-tokens 16 --async-prefetch on --prompt "The city of"
+
+# ---- Compressed, same three modes ----
+# AUTO (default):
+./bin/strataflow --model /content/mixtral.lz.strata \
+  --max-tokens 16 --async-prefetch on --prompt "The city of"
+# TARGET 3 GiB:
+./bin/strataflow --model /content/mixtral.lz.strata \
+  --target-ram-gb 3 --max-tokens 16 --async-prefetch on --prompt "The city of"
+# MAX:
+./bin/strataflow --model /content/mixtral.lz.strata \
+  --ram-mode max --max-tokens 16 --async-prefetch on --prompt "The city of"
+
+# Byte-identity across compressed vs uncompressed (AUTO shown; must match):
+diff <(./bin/strataflow --model /content/mixtral.lz.strata \
+         --max-tokens 16 --prompt "The city of" 2>/dev/null) \
+     <(./bin/strataflow --model /content/mixtral.strata \
+         --max-tokens 16 --prompt "The city of" 2>/dev/null) && echo IDENTICAL
+```
+
+What to compare, per mode, compressed vs uncompressed:
+
+- **`streamed` / bytes-per-token** in the `stats:` line: on the compressed
+  `.strata` this is `<=` the uncompressed run (strictly less by the achieved
+  ratio). This is the lever's whole point - fewer bytes crossing the SSD.
+- **tok/s**: on this I/O-bound box, lower streamed bytes should raise tok/s
+  roughly in proportion to the ratio, measured against the ~0.06 tok/s baseline.
+  Expect a MODEST change on already-K-quantized Mixtral; the point is the
+  direction and that it is lossless, not a promised multiple.
+- **decoded text**: IDENTICAL across all six runs and the `diff` prints
+  `IDENTICAL` (compression is a pure transport optimization).
+
+The MECHANISM (smaller on-disk expert region, fewer `streamed_bytes`,
+transparent byte-identical decompress, decompress faster than the SSD) is
+sandbox-proven on fixtures (`test_lz_codec`, `test_compressed_strata`); the
+ABSOLUTE streamed-bytes and tok/s change on the real ~19 GB Mixtral is this
+Colab-only re-measurement.
+
 ### Current token speed (and why)
 
 What is the current speed of tokens? On the real Colab box

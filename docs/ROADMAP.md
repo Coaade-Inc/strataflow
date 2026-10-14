@@ -443,6 +443,40 @@ families are the remaining quant-coverage gap.
   the co-activation packing LAYOUT (`PLAN.md` 3.10, technique 6.7 second half),
   then speculative / draft decoding (technique 6.8, Phase 5 below) as the biggest
   effective tok/s multiplier.
+- [x] **Compress what streams - optional lossless on-disk expert-blob
+  compression (technique 6.7b).** The AirLLM "compress what you stream" idea
+  applied to the expert path: `strata-pack --compress lz` compresses each
+  per-expert blob at pack time with a small self-contained in-tree LZ codec
+  (`src/common/lz_codec.{h,cpp}`, no new submodule, no third-party dependency),
+  storing the SMALLER of {compressed, verbatim} per blob, and `StrataReader`
+  decompresses transparently at the `read_bundle` / `read_blob` seam into
+  per-call scratch, so the engine's compute sees byte-identical expert bytes
+  while FEWER (compressed) bytes stream from the SSD and `streamed_bytes()`
+  counts the compressed size. The `.strata` format bumped to v3, OPTIONAL and
+  back-compatible: v1 and v2 files still load and decode byte-identically, and an
+  uncompressed v3 pack is byte-for-byte identical to the prior packer output
+  (SHA256-verified); default stays uncompressed. LOSSLESS: the decode on a
+  compressed `.strata` is byte-identical to the uncompressed one (per-step logit
+  `max|delta| = 0.000e+00`) and matches the libllama oracle within the quant
+  tolerance (`~5.2e-2 < 1e-1`). The decompress-vs-SSD tradeoff is measured and
+  safe: codec decompress is ~6.9 GiB/s (gcc release; clang ~6.1 GiB/s) on a
+  32 MiB mixed buffer, well above the ~4 GiB/s SSD per-core bandwidth, so
+  decompress is NOT the new bottleneck and the lever does not backfire. HONEST
+  RATIO: on the already-K-quantized expert fixture (`q4_k`) the ratio is
+  ~1.0000 - the already-quantized, high-entropy random-weight experts do not
+  shrink and every blob falls back to verbatim; AirLLM reported larger wins on
+  higher-entropy / differently-quantized models, so we do NOT claim their ~3x.
+  The net wall-clock effect scales with whatever ratio the real trained-weight
+  Mixtral achieves, a Colab-only measurement. The MECHANISM is proven end to end
+  on a deliberately compressible blob: a 16384-byte blob stored as 224 bytes on
+  disk, `read_bundle` returns the full 16384 bytes byte-exact, and
+  `streamed_bytes()` counts 224 (the compressed size), not 16384. The codec is
+  pure (per-call scratch only), race-free for the concurrent compute-thread and
+  prefetch-worker reads. Covered by `test_lz_codec` (round-trip + decompress
+  GiB/s) and `test_compressed_strata` (real-path pack->StrataReader->engine
+  oracle gate, skips cleanly without the fixture); full ctest 24/24 green under
+  GCC + Clang `-Werror`. FOLLOW-ONS (out of scope here): trunk and KV
+  compression, and a separate opt-in LOSSY re-quant lever (needs a quality gate).
 - [x] **MAX clamps to the largest fitting plan, never refuses (12-13 GiB-class
   regression).** RamMode::Max (and Auto) are MODES, not numeric ceilings: a pure
   mode run (`target_ram_budget == 0` AND `ram_budget == 0`) now ALWAYS converges
