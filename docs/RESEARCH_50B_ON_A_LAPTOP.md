@@ -774,7 +774,18 @@ instead of byte-identity.
   policy note below), which caches MANY more experts than the old 2, directly
   cutting bytes/token: on the Mixtral-geometry (mxg) real fixture the streamed
   bytes/token drop from 29,408,625 B (2-slot baseline) to 3,008,102 B (104-slot
-  AUTO), ~9.8x fewer expert bytes re-streamed per token. Greedy decode stays
+  AUTO), ~9.8x fewer expert bytes re-streamed per token. Within whatever RAM the
+  mode affords, residency is biased toward the experts most REUSED across tokens:
+  `Engine::forward` refines the layer-stratified `SlotPool` every few tokens via
+  `set_layer_weights(ExpertPredictor::layer_activity())`, so a layer's spare
+  slots follow its observed per-layer routing frequency (busier layers keep more
+  of their reused set resident, reducing thrash). This is residency only - the
+  per-layer top-k FLOOR guarantees every routed expert is still staged before the
+  matmul, so decode is byte-identical; it is proven end to end by
+  `test_predictor_driven_residency` in `tests/test_slot_pool.cpp` (observed
+  routing -> `layer_activity()` -> `set_layer_weights` -> the busiest layer wins
+  the scarce spare slot and keeps strictly more of its reused experts resident
+  across a sweep). Greedy decode stays
   BIT-IDENTICAL across AUTO/TARGET/MAX (`|delta| = 0.000e+00`) and within the
   quant bound vs the libllama oracle (`5.179e-02 < 1e-1` on the random-weight
   q4_k fixture). The REMAINING work in this lever is the adjacent-expert

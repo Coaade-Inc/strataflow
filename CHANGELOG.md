@@ -43,7 +43,12 @@ grouped by the pull request that merged them.
   `memcmp` equal to the three per-kind reads concatenated, the slices are tightly
   packed gate|up|down inside the bundle, and `streamed_bytes()` totals are
   unchanged - the same bytes counted once), and a new `read_calls()` atomic
-  counter proves the underlying read-count drops 3:1 per bundle. The three engine
+  counter proves the underlying read-count drops 3:1 per bundle. `read_bundle`
+  counts a coalesced read toward `streamed_bytes()` ALL-OR-NOTHING: only a
+  FULL-length read (`n == blob_length`) is counted, so a short/partial read -
+  which the engine treats as a failure and retries via the three per-kind
+  `read_blob` calls (each counting its own slice) - is not double-counted; the
+  byte total stays accurate on both the success and the fallback path. The three engine
   expert-read sites (`ensure_layer_experts_resident`, `warm_expert`,
   `pf_read_bundle`) route through `read_bundle` with a per-kind fallback and keep
   loading EXACTLY the router-selected top-k experts, so the resident bytes - and
@@ -53,6 +58,14 @@ grouped by the pull request that merged them.
   keeping reused experts resident) directly cuts re-streaming: on the mxg real
   fixture streamed bytes/token drop from 29,408,625 B (2-slot baseline) to
   3,008,102 B (104-slot AUTO), ~9.8x fewer expert bytes re-streamed per token.
+  The predictor-driven residency path is the existing wiring in
+  `Engine::forward` (`SlotPool::set_layer_weights(ExpertPredictor::layer_activity())`
+  every few tokens, so busier layers keep more of their reused experts resident
+  within the mode's budget); it is now proven END TO END by
+  `test_predictor_driven_residency` in `tests/test_slot_pool.cpp` (observed
+  routing -> `layer_activity()` -> `set_layer_weights` -> the busiest layer wins
+  the scarce spare slot and keeps strictly more of its reused experts resident
+  across a sweep), with the top-k floor guaranteeing decode stays byte-identical.
   Greedy decode is BIT-IDENTICAL across AUTO/TARGET/MAX (`max|delta| =
   0.000e+00`) and within the quant bound vs the libllama oracle (`5.179e-02 <
   1e-1` on the random-weight q4_k fixture). Full matrix green: GCC 11.5 + Clang

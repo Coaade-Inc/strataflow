@@ -418,7 +418,14 @@ families are the remaining quant-coverage gap.
   to the three per-kind reads, slices tightly packed gate|up|down,
   `streamed_bytes()` totals unchanged), with a `read_calls()` counter proving the
   3:1 read-count cut, through the REAL `StrataReader` in
-  `tests/test_coalesced_expert_read.cpp`. The larger coherent AUTO cache cuts
+  `tests/test_coalesced_expert_read.cpp` (`read_bundle` counts toward
+  `streamed_bytes()` all-or-nothing - only a full-length read counts - so the
+  per-kind fallback on a short read never double-counts). PREDICTOR-DRIVEN
+  RESIDENCY: within the mode's budget, busier layers keep more of their reused
+  experts resident via `SlotPool::set_layer_weights(ExpertPredictor::layer_activity())`
+  (refined every few tokens in `Engine::forward`), proven end to end by
+  `test_predictor_driven_residency` in `tests/test_slot_pool.cpp`; the top-k
+  floor keeps decode byte-identical. The larger coherent AUTO cache cuts
   bytes/token: on the mxg real fixture streamed bytes/token drop from 29,408,625
   (2-slot baseline) to 3,008,102 (104-slot AUTO), ~9.8x fewer. Greedy decode is
   BIT-IDENTICAL across AUTO/TARGET/MAX (`|delta| = 0.000e+00`) and within the
