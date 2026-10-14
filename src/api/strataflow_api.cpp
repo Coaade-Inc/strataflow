@@ -194,6 +194,13 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
     // prints the reason and exits non-zero. Only enforced for the auto path
     // (no explicit --expert-slots): an explicit override is the user forcing a
     // count, which we honor (and reconcile below).
+    //
+    // task-max-mode-clamp-not-refuse: a pure Auto/Max MODE run (no explicit
+    // target_ram_budget / ram_budget) now CLAMPS to the largest fitting plan
+    // and no longer reaches this refusal while the minimal config fits physical
+    // RAM. plan.fits is false here only for an EXPLICIT numeric target/ram
+    // budget pinned below the achievable floor - the case this error correctly
+    // surfaces as exit 1. The control flow is unchanged.
     if (!ctx->plan.fits && params->expert_slots == 0) {
         sf::log_error("placement plan refused: " + ctx->plan.refusal_reason);
         return SF_ERR_RUNTIME;

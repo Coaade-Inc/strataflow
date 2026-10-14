@@ -591,6 +591,75 @@ compare the three on the SAME model and prompt):
 All three modes decode BYTE-IDENTICAL text (`max|delta| = 0.000e+00` in-sandbox;
 within the quant bound vs the libllama oracle, `5.179e-02 < 1e-1`).
 
+### MAX clamps to the largest fitting plan on a 12 GiB box (no more exit 1)
+
+The real Colab box exposed one more MAX bug: on a 12 GiB-class machine where the
+full-`n_ctx` KV (8 GiB on real Mixtral) + trunk + maximal experts overflow
+physical RAM, `--ram-mode max` REFUSED instead of clamping. MAX kept the FULL KV
+window (the step-down did not engage, because full KV + the minimal expert floor
+fit under MAX's larger all-physical-RAM budget), then the MAX>=AUTO monotonicity
+clamp forced the resident expert count up to AUTO's (AUTO had windowed its KV
+DOWN and bought MORE experts than MAX can hold at full KV), overflowing usable so
+the planner set `fits=false`, the C ABI returned `SF_ERR_RUNTIME`, and the CLI
+printed "context create failed" and exited 1.
+
+MAX (and AUTO) are MODES, not numeric ceilings: a pure mode run now ALWAYS
+CLAMPS to the largest plan that FITS physical RAM and never refuses while the
+minimal config fits. When holding at least AUTO's resident experts does not fit
+at MAX's current (larger) KV window, MAX steps its KV window DOWN to AT LEAST
+AUTO's (bounded by the smallest safe window) and adopts at least AUTO's trunk
+pool, then sizes the expert count from the remainder (never below AUTO's).
+Because AUTO already fits inside its smaller share, adopting at least AUTO's
+levers always lands a fitting MAX plan whenever AUTO fits. The LOUD refusal
+stays ONLY for an EXPLICIT `--target-ram-gb` / `--ram-gb` pinned below the
+achievable floor (unchanged). This is residency/placement/sizing only, so the
+decode stays byte-identical.
+
+Re-verify on Colab (run on the SAME model and prompt; the plan line prints
+before the decode and the `stats:` line after):
+
+```bash
+%%bash
+cd /content/strataflow/build/release
+# MAX on the 12 GiB box: must DECODE now (previously exited 1 with a refusal).
+./bin/strataflow --model /content/mixtral.strata \
+  --ram-mode max --max-tokens 16 --async-prefetch on --prompt "The city of"
+# AUTO (default) for the monotonicity comparison on the SAME box.
+./bin/strataflow --model /content/mixtral.strata \
+  --max-tokens 16 --async-prefetch on --prompt "The city of"
+# Byte-identity: MAX text must equal AUTO text verbatim.
+diff <(./bin/strataflow --model /content/mixtral.strata --ram-mode max \
+         --max-tokens 16 --prompt "The city of" 2>/dev/null) \
+     <(./bin/strataflow --model /content/mixtral.strata \
+         --max-tokens 16 --prompt "The city of" 2>/dev/null) && echo IDENTICAL
+```
+
+Expected corrected MAX output (absolute GiB are hardware-dependent; the SHAPE of
+the result is the point):
+
+- **MAX now DECODES** - no `context create failed`, no exit 1. The plan line
+  shows a CLAMPED-but-maximal plan: a windowed `kv window` segment (stepped down
+  to at least AUTO's window when full KV would not fit alongside >= AUTO's
+  experts) and `experts[resident=...]` at or above AUTO's count, with `est.
+  peak` UNDER physical RAM.
+- **`peak RSS` stays under physical RAM** on the 12 GiB box (no OOM/SIGKILL),
+  with `resident weights`, `resident_kv`, and `streamed` reported in the
+  `stats:` line.
+- **MAX stays `>= AUTO`** on every lever: at least as many experts resident, a
+  KV window at least as large, and `streamed <= auto.streamed` (never inverted).
+- **Byte-identical** to AUTO and TARGET (`diff` prints `IDENTICAL`; in-sandbox
+  `max|delta| = 0.000e+00`, oracle `5.179e-02 < 1e-1`).
+
+Sandbox-proven end-to-end on the synthetic 13 GiB repro (full KV 8 GiB, 32
+layers x 8 experts ~72 MiB, 0.5 GiB trunk): BEFORE MAX refused (natural peak
+14630 MiB vs usable 13312 MiB, floor 2510 MiB) while AUTO fit (peak 10343 MiB,
+57 slots, `kv_window=16384`); AFTER MAX fits (peak 10518 MiB `<=` 13312 MiB, 57
+slots, `kv_window=16384`), monotonic with AUTO. The real ~19 GB Mixtral MAX run
+on the 12 GiB box is the COLAB-ONLY absolute re-verify; the fix and the geometry
+regression are SANDBOX-PROVEN (the two new regression tests
+`test_max_clamps_not_refuses_12gb` and `test_max_clamps_not_refuses_real_path`,
+plus the gated real-load byte-identity path).
+
 ### Current token speed (and why)
 
 What is the current speed of tokens? On the real Colab box
