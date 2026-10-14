@@ -62,25 +62,29 @@ uint64_t usable_ram(const HardwareProfile &hw) {
     return usable;
 }
 
-// ALL-available RAM for Max mode: dedicate the machine to the model. Unlike
-// usable_ram() this applies NO conservative shave (no free-headroom, no 85%
-// cap) - it hands the planner the full physical/available RAM so it holds the
-// full KV window, the maximal expert cache, and the trunk fully resident when
-// RAM affords it. Prefer the OS-reported free RAM when known (so we do not
-// claim more than is actually available), else total RAM, else the same
-// non-zero unknown-profile fallback usable_ram() uses (so the zero-RAM/dry-run
-// path never collapses the budget to 0).
+// ALL-available RAM for Max mode: dedicate the WHOLE MACHINE to the model.
+// Unlike usable_ram() this applies NO conservative shave (no free-headroom, no
+// 85% cap) - it hands the planner the full PHYSICAL RAM so it holds the full KV
+// window, the maximal expert cache, and the trunk fully resident when RAM
+// affords it.
 //
-// EDGE (documented): because this prefers free RAM with no shave while
-// usable_ram() can fall back to avail/2 or the 85%-of-total cap, on a machine
-// whose free RAM is low but whose total RAM is large this ceiling can resolve
-// near or even below the Auto good-neighbor share. That is intentional: Max
-// sizes to what is actually free, so "Max >= Auto" holds only when free RAM is
-// ample. Do not add a shave here to force the ordering.
+// BUG 2 FIX (task-fix-target-and-max-mode-semantics): this used to prefer the
+// INSTANTANEOUS ram_free_bytes. That inverted Max on a box where the model (or
+// anything else) had already consumed RAM: MemAvailable (ram_free_bytes) was
+// small, so Max resolved a TINY ceiling and ended up holding FEWER resident
+// experts and streaming MORE than Auto - the opposite of "dedicate the
+// machine". Auto (usable_ram) is a good-neighbor SHARE sized from TOTAL RAM, so
+// a free-based Max could resolve BELOW Auto. Max must size to ALL PHYSICAL RAM
+// so that "Max >= Auto" holds on the SAME machine: Max dedicating the box can
+// never be smaller than Auto's conservative share of that same box.
+//
+// Prefer ram_total_bytes (dedicate the machine). Fall back to ram_free_bytes
+// only when total is unknown (0), then to the non-zero unknown-profile fallback
+// usable_ram() uses (so the zero-RAM/dry-run path never collapses to 0).
 uint64_t all_available_ram(const HardwareProfile &hw) {
-    if (hw.ram_free_bytes) return hw.ram_free_bytes;
-    if (hw.ram_total_bytes) return hw.ram_total_bytes;
-    return kUnknownRamFallbackBytes;
+    if (hw.ram_total_bytes) return hw.ram_total_bytes;  // all physical RAM
+    if (hw.ram_free_bytes) return hw.ram_free_bytes;    // total unknown
+    return kUnknownRamFallbackBytes;                    // profile unknown
 }
 
 // Resolve the usable-RAM ceiling by the documented precedence (see
@@ -133,7 +137,19 @@ uint64_t full_kv_bytes(const ModelShape &model) {
 // term keeps the estimate honest for both tiny fixtures and real Mixtral.
 uint64_t compute_estimate_bytes(const ModelShape &model, uint64_t kv_window) {
     // A fixed floor that errs high for a single-token greedy decode.
-    uint64_t est = 512 * kMiB;
+    //
+    // BUG 3 CALIBRATION (task-fix-target-and-max-mode-semantics): the engine
+    // grows its ggml compute scratch ON DEMAND (ggml_gallocr, no fixed reserve)
+    // and a single-token greedy decode's scratch is a few hundred MiB, not the
+    // ~0.5 GiB this floor used to charge on TOP of the full staging + margin +
+    // KV stack. Stacking a 512 MiB compute floor with the 512 MiB margin floor
+    // roughly DOUBLED the honest resident footprint (AUTO est ~10 GiB vs 5005
+    // MiB real; MAX est ~11 GiB vs 2212 MiB real), and that over-estimate is
+    // precisely WHAT made an achievable TARGET refuse. Trim the floor to a
+    // still-conservative 256 MiB (err high, never under-count) so the estimate
+    // tracks reality (slightly high, not ~2x) while the fit invariant stays
+    // safe (the per-window term below still grows with a large resident KV).
+    uint64_t est = 256 * kMiB;
     // Grow with the attended window so a very large resident KV also carries a
     // larger scratch estimate (bounded, conservative).
     if (model.head_dim && model.n_head_kv && kv_window) {
@@ -152,8 +168,15 @@ constexpr uint64_t kProcessFloorBytes = 160 * kMiB;
 // Safety margin: a fraction of usable RAM AND a fixed minimum, whichever is
 // larger. This is the headroom the fit invariant preserves; a KV window that
 // frees RAM must not be re-consumed into this margin.
+//
+// BUG 3 CALIBRATION (task-fix-target-and-max-mode-semantics): the old
+// max(512 MiB, 8%) margin stacked with the (old 512 MiB) compute floor on top
+// of a full staging + KV charge, roughly doubling the honest peak and making an
+// achievable TARGET refuse. Trim to max(256 MiB, 6%): still real headroom
+// (never under-counts, the fit invariant holds) but it no longer inflates the
+// estimate to ~2x the engine's real resident footprint.
 uint64_t safety_margin_bytes(uint64_t usable) {
-    return std::max<uint64_t>(512 * kMiB, usable / 100 * 8);  // >=512 MiB or 8%
+    return std::max<uint64_t>(256 * kMiB, usable / 100 * 6);  // >=256 MiB or 6%
 }
 
 } // namespace
@@ -419,24 +442,118 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
     if (slots > full_slots) slots = full_slots;  // never exceed working set
     if (slots < lower)      slots = lower;        // top-k must fit
 
-    plan.expert_slots_resident = static_cast<uint32_t>(slots);
-    plan.expert_slots_ram =
-        per_bundle > 0 ? static_cast<uint32_t>(
-                             (usable > reserved ? usable - reserved : 0) /
-                             per_bundle)
-                       : 0;
-    plan.stream_experts = slots < full_slots;
-
-    plan.kv_window = used_auto_window ? chosen_window : 0;
-    plan.kv_resident_bytes = kv_resident;
+    // Slot-count-INDEPENDENT fields (the Max monotonicity guard below may still
+    // raise slots / KV window / trunk pool, so the slot/window/trunk/peak fields
+    // - including expert_slots_ram, which the guard can change via the clamped
+    // reserved cost - are set AFTER the guard).
     plan.staging_bytes = staging;
-    plan.compute_bytes = compute;
     plan.process_floor_bytes = process_floor;
     plan.safety_margin_bytes = margin;
 
-    // FEAT-003: surface the trunk-streaming decision and the bounded hot-trunk
-    // working set the peak accounts for (per_layer_attn * pool when streaming,
-    // else the full attention trunk resident).
+    // BUG 2 FIX (task-fix-target-and-max-mode-semantics): MAX-vs-AUTO
+    // MONOTONICITY. Max dedicates the machine, so on the SAME model+machine it
+    // must NEVER end up with FEWER residents or MORE streaming than Auto. The
+    // all-physical-RAM ceiling above makes max.usable >= auto.usable, which
+    // makes the KV window and expert sizing monotonic in usable - EXCEPT the
+    // one case the task calls out: when full KV + maximal experts cannot
+    // coexist, a Max plan that spends its larger budget on a LARGER KV window
+    // could be left with a SMALLER expert remainder than Auto (Auto stepped the
+    // window down and bought more experts). Guard against that explicitly:
+    // compute the Auto reference plan on this exact model+machine and clamp Max
+    // UP to at least Auto's resident experts, Auto's KV window, and no more
+    // trunk streaming than Auto. Clamping up is always safe: Auto's residency
+    // fits inside auto.usable <= max.usable, so adopting it keeps max's peak
+    // within max's budget. Only engaged for a PURE Max run (no explicit target
+    // / ram_budget, which override the mode and are not "dedicate the machine").
+    if (mode == RamMode::Max && target_ram_budget == 0 && ram_budget == 0) {
+        const PlacementPlan ref =
+            plan_placement(hw, model, vram_budget, /*ram_budget=*/0, cache_budget,
+                           RamMode::Auto, /*target_ram_budget=*/0);
+        if (ref.fits) {
+            // Experts: hold at least as many resident as Auto (never fewer).
+            if (ref.expert_slots_resident > slots) {
+                slots = ref.expert_slots_resident;
+                if (slots > full_slots) slots = full_slots;
+            }
+            // KV window: keep a window at least as large as Auto's. 0 == full
+            // n_ctx (the largest). If Max stepped down to a SMALLER window than
+            // Auto, raise it to Auto's (recomputing the resident KV charge).
+            const uint32_t max_eff_win = used_auto_window ? chosen_window : model.n_ctx;
+            const uint32_t ref_eff_win = ref.kv_window ? ref.kv_window : model.n_ctx;
+            if (ref_eff_win > max_eff_win && model.n_ctx > 0) {
+                if (ref.kv_window == 0) {
+                    used_auto_window = false;  // full n_ctx
+                    kv_resident = full_kv_bytes(model);
+                } else {
+                    used_auto_window = true;
+                    chosen_window = ref.kv_window;
+                    kv_resident = kv_bytes_for_window(model, ref.kv_window);
+                }
+            }
+            // Trunk: stream no harder than Auto (a hot pool at least as deep as
+            // Auto's; 0 == whole trunk resident == the least streaming).
+            const uint32_t max_hot =
+                trunk_pool_layers ? trunk_pool_layers : model.n_layers;
+            const uint32_t ref_hot =
+                ref.trunk_pool_layers ? ref.trunk_pool_layers : model.n_layers;
+            if (ref_hot > max_hot) {
+                if (ref.trunk_pool_layers == 0) {
+                    trunk_pool_layers = 0;
+                    trunk_in_ram_eff = trunk_in_ram;  // whole trunk resident
+                } else {
+                    trunk_pool_layers = ref.trunk_pool_layers;
+                    const uint64_t non_attn_trunk =
+                        trunk_in_ram > attn_trunk_total
+                            ? trunk_in_ram - attn_trunk_total
+                            : 0;
+                    trunk_in_ram_eff =
+                        non_attn_trunk + per_layer_attn * trunk_pool_layers;
+                }
+            }
+            // Re-fit the slot count to the (possibly raised) KV window + trunk
+            // so Max never overflows its own budget after the clamp: size slots
+            // from the remainder at the final reserved cost, but keep at least
+            // Auto's resident count (which is guaranteed to fit because Auto's
+            // whole config fits auto.usable <= max.usable). This preserves BOTH
+            // the fit invariant AND max.slots >= auto.slots.
+            const uint64_t compute_clamped = compute_estimate_bytes(
+                model, used_auto_window ? chosen_window : model.n_ctx);
+            const uint64_t reserved_clamped = trunk_in_ram_eff + kv_resident +
+                                              staging + compute_clamped +
+                                              process_floor + margin;
+            uint64_t room_clamped =
+                usable > reserved_clamped ? usable - reserved_clamped : 0;
+            room_clamped += vram_left;
+            uint64_t affordable_clamped =
+                per_bundle > 0 ? room_clamped / per_bundle : slots;
+            if (affordable_clamped > full_slots) affordable_clamped = full_slots;
+            if (slots > affordable_clamped) slots = affordable_clamped;
+            if (slots < ref.expert_slots_resident)
+                slots = ref.expert_slots_resident;
+            if (slots > full_slots) slots = full_slots;
+        }
+    }
+
+    plan.expert_slots_resident = static_cast<uint32_t>(slots);
+    plan.stream_experts = slots < full_slots;
+    plan.kv_window = used_auto_window ? chosen_window : 0;
+    plan.kv_resident_bytes = kv_resident;
+    const uint64_t compute_final = compute_estimate_bytes(
+        model, used_auto_window ? chosen_window : model.n_ctx);
+    plan.compute_bytes = compute_final;
+
+    // Diagnostic: how many expert bundles the RAM remainder affords after the
+    // non-expert reserved cost. Computed from the FINAL (post-guard) reserved
+    // terms so a clamped Max plan reports a figure consistent with its final
+    // resident experts / KV window, not the pre-clamp remainder.
+    const uint64_t reserved_final = trunk_in_ram_eff + kv_resident + staging +
+                                    compute_final + process_floor + margin;
+    plan.expert_slots_ram =
+        per_bundle > 0 ? static_cast<uint32_t>(
+                             (usable > reserved_final ? usable - reserved_final
+                                                      : 0) /
+                             per_bundle)
+                       : 0;
     plan.trunk_pool_layers = trunk_pool_layers;
     plan.trunk_resident_bytes = trunk_pool_layers > 0
                                     ? per_layer_attn * trunk_pool_layers
@@ -447,7 +564,7 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
     // n_expert + compute + floor + margin.
     const uint64_t resident_experts = slots * per_bundle;
     plan.planned_peak_bytes = trunk_in_ram_eff + resident_experts + kv_resident +
-                              staging + compute + process_floor + margin;
+                              staging + compute_final + process_floor + margin;
 
     // FIT INVARIANT: for a returned non-refused plan, planned_peak_bytes <=
     // usable. We sized slots from the remainder, so this holds by construction
@@ -456,22 +573,93 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
     // STILL overflows, refuse LOUDLY rather than hand back an OOM plan.
     if (plan.planned_peak_bytes > usable) {
         plan.fits = false;
-        const uint64_t over = plan.planned_peak_bytes - usable;
+
+        // BUG 1 FIX (task-fix-target-and-max-mode-semantics): report an HONEST
+        // minimal-config floor. The KV step-down above keeps chosen_window ==
+        // n_ctx when EVEN the smallest window does not fit, so the refusal used
+        // to name FULL n_ctx KV (8192 MiB for Mixtral) as the "minimal config"
+        // -> a dishonest ~10 GiB floor, though the user proved ~2.4 GiB works at
+        // a 2048 window. Recompute the TRUE minimal configuration the engine can
+        // actually run: the SMALLEST SAFE KV window (kMinKvWindow), MAXIMAL
+        // per-layer trunk streaming (hot pool = 1 layer), and the n_experts_used
+        // expert floor. The reported floor/KV figures are then the smallest this
+        // model fits in, so the user can raise the target to an achievable value
+        // (an achievable target >= this floor FITS via the step-down + streaming
+        // paths above). When geometry is unknown we fall back to the chosen
+        // window / current trunk so a synthetic/dry-run shape still reports
+        // something coherent.
+        //
+        // IMPORTANT: this ONLY recomputes figures for the honest refusal_reason
+        // message. It does NOT clobber plan.expert_slots_resident /
+        // planned_peak_bytes / kv_window etc. with the minimal floor, because
+        // those are the natural plan the caller still inspects (e.g. the VRAM
+        // -resident-experts case where the RAM-peak accounting is pessimistic
+        // but the slot choice is legitimately full). The API/CLI refuse the
+        // load on plan.fits == false and surface this reason; the floor it names
+        // is the TRUE smallest-window minimal config.
+        uint32_t floor_window = plan.kv_window ? plan.kv_window : chosen_window;
+        uint64_t floor_kv = kv_resident;
+        if (model.n_ctx > 0 && model.head_dim && model.n_head_kv) {
+            floor_window = kMinKvWindow <= model.n_ctx
+                               ? kMinKvWindow
+                               : static_cast<uint32_t>(model.n_ctx);
+            floor_kv = kv_bytes_for_window(model, floor_window);
+        }
+        const uint64_t floor_compute = compute_estimate_bytes(model, floor_window);
+        // Maximal trunk streaming: keep a single attention layer hot (the
+        // engine's floor), so the resident trunk is the non-attention trunk plus
+        // one hot layer. When nothing is streamable this equals the full trunk.
+        uint32_t floor_pool = 0;
+        uint64_t floor_trunk = trunk_in_ram;
+        if (per_layer_attn > 0) {
+            const uint64_t non_attn_trunk =
+                trunk_in_ram > attn_trunk_total ? trunk_in_ram - attn_trunk_total
+                                                : 0;
+            floor_trunk = non_attn_trunk + per_layer_attn;  // 1 hot layer
+            floor_pool = 1;
+        }
+        const uint64_t floor_experts = lower_experts * per_bundle;
+        const uint64_t floor_peak = floor_trunk + floor_experts + floor_kv +
+                                    staging + floor_compute + process_floor +
+                                    margin;
+        const bool floor_windowed =
+            floor_window && model.n_ctx && floor_window < model.n_ctx;
+
         std::ostringstream os;
         os << "cannot fit model '" << model.name << "' in budget: minimal "
-           << "configuration (" << slots << " expert bundles";
-        if (plan.kv_window)
-            os << ", KV window " << plan.kv_window;
-        os << ") projects peak " << (plan.planned_peak_bytes / kMiB)
-           << " MiB, which is " << (over / kMiB) << " MiB over the usable RAM "
-           << (usable / kMiB) << " MiB. The achievable floor (this minimal "
-           << "projected peak of " << (plan.planned_peak_bytes / kMiB)
-           << " MiB) is the smallest this model fits in; raise the target to "
-           << "at least that. Dominant components: trunk-in-RAM "
-           << (trunk_in_ram_eff / kMiB) << " MiB, experts "
-           << (resident_experts / kMiB) << " MiB, KV " << (kv_resident / kMiB)
+           << "configuration (" << lower_experts << " expert bundles";
+        if (floor_windowed)
+            os << ", KV window " << floor_window;
+        if (floor_pool)
+            os << ", trunk stream[hot=" << floor_pool << " layers]";
+        os << ") projects peak " << (floor_peak / kMiB) << " MiB";
+        if (floor_peak > usable) {
+            // The minimal floor itself exceeds the budget: name the overage so
+            // the user knows how much more RAM/budget the floor needs.
+            os << ", which is " << ((floor_peak - usable) / kMiB)
+               << " MiB over the usable RAM " << (usable / kMiB)
+               << " MiB. The achievable floor (this minimal projected peak of "
+               << (floor_peak / kMiB) << " MiB) is the smallest this model fits "
+               << "in; raise the target to at least that.";
+        } else {
+            // The minimal floor would fit under usable, but the natural plan's
+            // peak still refuses (the pessimistic VRAM-resident-experts RAM
+            // accounting the comment above describes). Do NOT claim a "0 MiB
+            // over" overage - that would imply the load fits while it is
+            // refused. Frame the floor as the achievable target to aim at and
+            // make clear the refusal is driven by the natural plan's peak.
+            os << " against the usable RAM " << (usable / kMiB)
+               << " MiB. This minimal projected peak is the achievable floor "
+               << "(the smallest this model fits in); the load is refused "
+               << "because the natural plan's projected peak "
+               << (plan.planned_peak_bytes / kMiB)
+               << " MiB exceeds usable, so target this floor instead.";
+        }
+        os << " Dominant components: trunk-in-RAM "
+           << (floor_trunk / kMiB) << " MiB, experts "
+           << (floor_experts / kMiB) << " MiB, KV " << (floor_kv / kMiB)
            << " MiB, staging " << (staging / kMiB) << " MiB, compute "
-           << (compute / kMiB) << " MiB, floor " << (process_floor / kMiB)
+           << (floor_compute / kMiB) << " MiB, floor " << (process_floor / kMiB)
            << " MiB, margin " << (margin / kMiB) << " MiB.";
         plan.refusal_reason = os.str();
     }

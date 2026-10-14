@@ -338,18 +338,25 @@ families are the remaining quant-coverage gap.
   usable budget and drives the KV-window step-down + trunk streaming so the
   projected peak fits the target even below the trunk-resident floor; if even the
   minimal configuration cannot fit the target the planner refuses LOUDLY
-  (`plan.fits=false` + a reason naming the achievable floor), surfaced as
+  (`plan.fits=false` + a reason naming the achievable floor), where the floor is
+  now the HONEST minimal-KV config (the smallest safe window + maximal trunk
+  streaming + the top-k experts, ~2.x GiB on real Mixtral), NOT the dishonest
+  full-`n_ctx` ~10 GiB figure the pre-fix refusal reported, surfaced as
   `SF_ERR_RUNTIME`. **Auto is the good-neighbor default**: it leaves headroom for
   other apps on a shared laptop by building on the conservative `usable_ram`
   share (`free - max(1 GiB, 12.5%)`, capped at 85% of total), so the model does
-  not take the whole box. **Max dedicates the machine**: it uses all available
-  RAM (plus the full VRAM budget), full KV window, maximal expert cache, and the
-  trunk fully resident (minimal streaming, maximal tok/s). Honest edge: max
-  sizes to ACTUAL free RAM (no conservative shave), so on a machine whose free
-  RAM is already low while total RAM is large, max's resolved ceiling can land
-  near or even below the auto good-neighbor share (which can fall back to
-  avail/2 or the 85%-of-total cap); max >= auto holds only when free RAM is
-  ample. GPU honesty, stated
+  not take the whole box. **Max dedicates the machine**: it sizes its usable
+  ceiling from ALL PHYSICAL RAM (`ram_total_bytes`), NOT the instantaneous free
+  RAM, then holds the MAXIMUM experts resident with a full KV window and the
+  trunk fully resident (minimal streaming, maximal tok/s). Sizing from total
+  physical RAM makes Max MONOTONIC against Auto on the same machine:
+  `max.expert_slots_resident >= auto.expert_slots_resident`, Max's KV window is
+  at least Auto's, and Max streams the trunk no harder than Auto
+  (`max.streamed <= auto.streamed`) - Max is never inverted (never fewer
+  residents / more streaming than Auto). This fixes the earlier inversion where
+  Max sized from the instantaneous free RAM: on a box whose big model had already
+  consumed RAM, free was small, so Max resolved a tiny ceiling and held FEWER
+  experts + streamed MORE than Auto. GPU honesty, stated
   plainly: auto/max MAY read VRAM from the profiler and the planner BUDGETS VRAM
   placement (`plan.trunk_layers_in_vram` / `plan.expert_slots_vram`, mapped by
   `derive_llama_placement` to `n_gpu_layers`), but that only affects the
@@ -360,19 +367,29 @@ families are the remaining quant-coverage gap.
   the proven, measured mechanism. Residency/placement only, so decode stays
   byte-identical across all three modes and to the libllama oracle (the levers
   change which bytes are resident, never which bytes compute or the graph order).
-  Sandbox-proven through the REAL load path on a Mixtral-geometry fixture
-  (`n_ctx` 32768, 32 layers, pack -> `.strata` -> `load_model` -> planner ->
-  engine): an explicit `--target-ram-gb` ~1.2 GiB fits with projected peak
-  ~1228 MiB, `kv_window=512`, `trunk_pool_layers=4` (trunk streaming engaged),
-  `slots=5`; auto on a ~12 GiB / ~10.6 free profile projects peak ~3647 MiB
-  (usable ~9520 MiB), full KV window, trunk resident, `slots=256`; max projects
-  peak ~3756 MiB (usable ~10880 MiB), full KV, trunk resident, `slots=256`; the
-  invariants `max.usable > auto.usable`, `auto.peak < max.peak`, and
-  byte-identical decode across all three modes (`|delta| = 0.0`) hold, within the
-  soft oracle bound for the random-weight fixture. Colab-only: the real
+  The projected peak is a RECALIBRATED, honest estimate: it previously ran ~2x
+  the engine's real resident footprint (printing "~10 GiB" for an auto run that
+  really peaked ~5 GiB and "~11 GiB" for a max run that really peaked ~2.2 GiB,
+  because conservative staging + compute + margin stacked on top of a full-KV
+  charge), which is WHAT made the explicit-target path refuse achievable targets;
+  it now tracks the engine's windowed resident footprint (slightly high so the
+  fit invariant stays safe, no longer ~2x). Sandbox-proven through the REAL load
+  path on a Mixtral-geometry fixture (`n_ctx` 32768, 32 layers, pack ->
+  `.strata` -> `load_model` -> planner -> engine) on a tight 3 GiB-total /
+  2.25 GiB-free profile (free << total, so auto and max DIVERGE): an explicit
+  `--target-ram-gb` ~1.2 GiB fits with `kv_window` in `(0, n_ctx)`,
+  `trunk_pool_layers > 0` (trunk streaming engaged); AUTO resolves usable
+  1280 MiB, steps the KV window down to 8192 (`< n_ctx`), holds `slots=104`, and
+  streams some experts; MAX resolves usable 3072 MiB (= all physical RAM, the
+  fix), keeps a FULL KV window (`kv_window=0`), holds `slots=256`, and streams
+  nothing; the monotonicity invariants hold (`max.expert_slots_resident
+  (256) >= auto (104)`, Max's window >= Auto's, `max.streamed <= auto.streamed`),
+  a genuinely-too-small target refuses with a floor from the SMALLEST safe window
+  (not full KV), and the decode is byte-identical across all three modes
+  (`|delta| = 0.0`) within the soft oracle bound. Colab-only: the real
   Mixtral-8x7B-Instruct Q3_K_M run that this dial maps to (next bullet) is the
   absolute-number re-verify; the sandbox proves the mechanism, the mode
-  differences, and byte-identity.
+  differences, the honest refusal floor, estimate sanity, and byte-identity.
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.

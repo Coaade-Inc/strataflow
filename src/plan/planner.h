@@ -24,13 +24,24 @@ namespace sf {
 //     otherwise dominate RAM. This is the sensible default for a machine that
 //     also runs other work.
 //
-//   Max - dedicate the machine to the model: use ALL available RAM (plus the
-//     full VRAM budget) WITHOUT the conservative free-headroom / fraction
+//   Max - dedicate the machine to the model: size the usable ceiling from ALL
+//     PHYSICAL RAM (ram_total_bytes, falling back to ram_free_bytes only when
+//     total is unknown) WITHOUT the conservative free-headroom / fraction
 //     shave, so the plan holds the full KV window (kv_window stays 0 = full
 //     n_ctx when it fits), the maximal resident expert cache, and the trunk
 //     fully resident (trunk_pool_layers 0) whenever all-RAM affords it. This
 //     minimizes streaming and maximizes tok/s at the cost of leaving no
 //     headroom for other apps.
+//
+//     Max sizes to TOTAL (not the instantaneous free RAM) deliberately: on a
+//     box where the model (or other work) has already consumed RAM, the free
+//     RAM is small, and a free-based Max would resolve a ceiling BELOW Auto's
+//     total-derived good-neighbor share - inverting the modes (fewer residents,
+//     MORE streaming than Auto). Because the planner is MONOTONIC in Max, on the
+//     SAME model+machine Max NEVER ends up with fewer resident experts, a
+//     smaller KV window, or more trunk streaming than Auto (plan_placement
+//     clamps Max up to at least Auto's residency when full KV + maximal experts
+//     cannot otherwise coexist).
 //
 // An explicit target_ram_budget (bytes, see plan_placement) OVERRIDES the mode:
 // it is used directly as the exact usable ceiling regardless of Auto/Max.
@@ -173,10 +184,11 @@ struct PlacementPlan {
 //      refusal_reason.
 //   3. ram_budget (> 0) - the existing explicit numeric RAM budget (--ram-gb).
 //      Unchanged behavior; used directly as the usable ceiling.
-//   4. mode == RamMode::Max - use ALL available RAM (ram_free_bytes when known,
-//      else ram_total_bytes, else the unknown-profile fallback) WITHOUT the
+//   4. mode == RamMode::Max - use ALL PHYSICAL RAM (ram_total_bytes when known,
+//      else ram_free_bytes, else the unknown-profile fallback) WITHOUT the
 //      conservative shave, so the plan holds the full KV window + maximal
-//      experts + trunk fully resident when all-RAM affords it.
+//      experts + trunk fully resident when all-RAM affords it. Monotonic vs
+//      Auto on the same machine (never fewer residents / more streaming).
 //   5. mode == RamMode::Auto (the DEFAULT) - the conservative good-neighbor
 //      usable_ram() share that leaves headroom for other apps.
 // The zero-RAM / unknown-profile path always yields a non-zero usable budget

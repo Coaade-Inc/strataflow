@@ -370,6 +370,12 @@ static void test_auto_vs_max_same_machine() {
     // Auto respects its conservative share; Max uses more and peaks higher.
     CHECK(a.planned_peak_bytes <= a.usable_ram_bytes);
     CHECK(x.planned_peak_bytes > a.planned_peak_bytes);
+    // FIT INVARIANT on the (possibly CLAMPED) Max plan: after the monotonicity
+    // guard re-fits slots against the raised KV/trunk cost, Max's projected peak
+    // must still fit its usable budget. Pins the construction-only guarantee so
+    // a re-fit regression cannot slip past the ordering checks above.
+    CHECK(x.fits);
+    CHECK(x.planned_peak_bytes <= x.usable_ram_bytes);
     // Max holds >= experts resident and >= KV window than Auto.
     CHECK(x.expert_slots_resident >= a.expert_slots_resident);
     // KV window: 0 means full n_ctx. Max keeps a window at least as large as
@@ -477,6 +483,164 @@ static void test_target_overrides_mode() {
     CHECK(with_target.planned_peak_bytes <= target);
 }
 
+// ---------------------------------------------------------------------------
+// task-fix-target-and-max-mode-semantics FEAT-002: the three bugs the real
+// Colab run surfaced. These assert REAL mode semantics (not fixture-blind).
+// ---------------------------------------------------------------------------
+
+// BUG 2: Max must size its usable ceiling from ALL PHYSICAL RAM (ram_total),
+// NOT the instantaneous free RAM. On a box where free << total (the model, or
+// anything else, already consumed RAM) the pre-fix free-based Max resolved a
+// TINY ceiling and ended up with FEWER residents + MORE streaming than Auto
+// (inverted). Assert Max.usable derives from TOTAL (approximately ram_total),
+// Max.usable > Auto.usable, Max holds >= experts resident, >= KV window, and
+// streams the trunk no harder than Auto (monotonic).
+static void test_max_uses_total_not_free_monotonic() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 12 * GiB;
+    hw.ram_free_bytes = 3 * GiB;   // free << total: the inversion trigger
+
+    ModelShape m = mixtral_streamable();  // ~18.8 GiB, full KV ~2 GiB geometry
+    const uint32_t full_slots =
+        static_cast<uint32_t>(uint64_t(m.n_layers) * m.n_experts);
+
+    PlacementPlan a = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                     /*cache=*/0, RamMode::Auto);
+    PlacementPlan x = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                     /*cache=*/0, RamMode::Max);
+
+    // Max's ceiling comes from TOTAL (all physical RAM), not the 3 GiB free.
+    // Auto's good-neighbor share is derived from the low free RAM, so it is far
+    // below Max. (Pre-fix, Max == 3 GiB free, i.e. BELOW or near Auto.)
+    CHECK_EQ(x.usable_ram_bytes, hw.ram_total_bytes);
+    CHECK(x.usable_ram_bytes > a.usable_ram_bytes);
+    CHECK(x.usable_ram_bytes > hw.ram_free_bytes);  // not the free RAM
+
+    // Monotonicity: Max never holds fewer experts than Auto, never a smaller KV
+    // window, never streams the trunk harder.
+    CHECK(x.expert_slots_resident >= a.expert_slots_resident);
+    const uint32_t a_win = a.kv_window ? a.kv_window : m.n_ctx;
+    const uint32_t x_win = x.kv_window ? x.kv_window : m.n_ctx;
+    CHECK(x_win >= a_win);
+    const uint32_t a_hot = a.trunk_pool_layers ? a.trunk_pool_layers : m.n_layers;
+    const uint32_t x_hot = x.trunk_pool_layers ? x.trunk_pool_layers : m.n_layers;
+    CHECK(x_hot >= a_hot);
+    CHECK(x.expert_slots_resident <= full_slots);
+
+    // FIT INVARIANT on the CLAMPED Max plan: the monotonicity guard re-fits the
+    // slot count after raising KV/trunk toward Auto, so the final projected peak
+    // must still fit Max's usable budget. The guarantee holds by construction,
+    // but a re-fit regression that overflowed usable would otherwise go uncaught
+    // (the ordering checks above would stay green).
+    CHECK(x.fits);
+    CHECK(x.planned_peak_bytes <= x.usable_ram_bytes);
+
+    std::printf("[max vs free<<total: auto usable=%lluMiB slots=%u | max "
+                "usable=%lluMiB slots=%u] ",
+                static_cast<unsigned long long>(a.usable_ram_bytes / MiB),
+                a.expert_slots_resident,
+                static_cast<unsigned long long>(x.usable_ram_bytes / MiB),
+                x.expert_slots_resident);
+}
+
+// BUG 1: a target below the TRUE floor refuses with a refusal_reason whose KV
+// figure reflects the SMALLEST window (kMinKvWindow), NOT full n_ctx. The
+// pre-fix refusal reported FULL KV (the dishonest ~8-10 GiB "minimal config").
+static void test_honest_refusal_floor_smallest_kv() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 24 * GiB;
+    hw.ram_free_bytes = 22 * GiB;
+
+    ModelShape m = mixtral_streamable();
+    // Full n_ctx KV for this geometry = 32*2*1024*4*32768 = 8 GiB = 8192 MiB.
+    const uint64_t full_kv =
+        uint64_t(m.n_layers) * 2 * uint64_t(m.head_dim) * m.n_head_kv *
+        sizeof(float) * m.n_ctx;
+    CHECK_EQ(full_kv, 8ull * GiB);
+
+    // A target below even the smallest-window minimal config: refuse honestly.
+    const uint64_t target = 512 * MiB;
+    PlacementPlan plan = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                        /*cache=*/0, RamMode::Auto,
+                                        /*target=*/target);
+    CHECK(!plan.fits);
+    CHECK(!plan.refusal_reason.empty());
+    CHECK(plan.refusal_reason.find("floor") != std::string::npos);
+    // The honest refusal names the SMALLEST KV window (256), NOT the 8192 MiB
+    // full-KV figure.
+    CHECK(plan.refusal_reason.find("KV window 256") != std::string::npos);
+    CHECK(plan.refusal_reason.find(" KV 8192 MiB") == std::string::npos);
+
+    std::printf("[honest refusal: %s] ", plan.refusal_reason.c_str());
+}
+
+// BUG 1: an achievable small target - at/just above the TRUE minimal floor -
+// FITS by shrinking the KV window into (0, n_ctx) and engaging trunk streaming,
+// instead of the dishonest full-KV refusal.
+static void test_achievable_small_target_fits() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 24 * GiB;
+    hw.ram_free_bytes = 22 * GiB;
+
+    ModelShape m = mixtral_streamable();
+    // 3 GiB is comfortably above the true minimal-KV floor yet well below the
+    // full trunk-resident + full-KV footprint, so the levers must engage.
+    const uint64_t target = 3 * GiB;
+    PlacementPlan plan = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                        /*cache=*/0, RamMode::Auto,
+                                        /*target=*/target);
+    CHECK(plan.fits);
+    CHECK(plan.planned_peak_bytes <= target);
+    CHECK(plan.kv_window > 0u);
+    CHECK(plan.kv_window < m.n_ctx);
+    CHECK(plan.trunk_pool_layers > 0u);     // trunk streaming engaged
+    CHECK(plan.stream_experts);
+    CHECK(plan.expert_slots_resident >= m.n_experts_used);
+}
+
+// BUG 3: estimate calibration. A windowed plan's planned_peak is strictly below
+// the SAME shape's full-n_ctx-KV planned peak, AND within a sane factor
+// (< 1.5x) of the engine's real resident components (resident KV + resident
+// experts + staging + resident trunk + floor) on the real Mixtral geometry
+// where the multi-GiB KV dominates. The pre-fix estimate stacked to ~2x.
+static void test_estimate_tracks_real_resident() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 12 * GiB;
+    hw.ram_free_bytes = static_cast<uint64_t>(10.6 * static_cast<double>(GiB));
+
+    ModelShape m = mixtral_real();   // 5.5 GiB trunk, 8 GiB full KV, 52 MiB/exp
+    PlacementPlan plan = plan_placement(hw, m, /*vram=*/0, /*ram=*/0);
+    CHECK(plan.fits);
+
+    // Windowed KV charge is strictly below the full-n_ctx reservation.
+    const uint64_t full_kv =
+        uint64_t(m.n_layers) * 2 * uint64_t(m.head_dim) * m.n_head_kv *
+        sizeof(float) * m.n_ctx;
+    CHECK(plan.kv_window > 0u);
+    CHECK(plan.kv_resident_bytes < full_kv);
+
+    // Same plan sized with full-n_ctx KV would project a strictly higher peak
+    // (the only changed term is the KV charge).
+    const uint64_t full_kv_peak =
+        plan.planned_peak_bytes - plan.kv_resident_bytes + full_kv;
+    CHECK(plan.planned_peak_bytes < full_kv_peak);
+
+    // Estimate padding (compute scratch + safety margin) is a MINORITY of the
+    // real resident components, so planned_peak < 1.5x reality (not the ~2x the
+    // pre-fix conservative stacking produced). At Mixtral scale the multi-GiB
+    // resident KV dwarfs the fixed floors.
+    const uint64_t padding = plan.compute_bytes + plan.safety_margin_bytes;
+    const uint64_t real_components = plan.planned_peak_bytes - padding;
+    CHECK(padding < real_components / 2);  // planned_peak < 1.5x real
+
+    std::printf("[estimate: peak=%lluMiB kv=%lluMiB padding=%lluMiB "
+                "real=%lluMiB] ",
+                static_cast<unsigned long long>(plan.planned_peak_bytes / MiB),
+                static_cast<unsigned long long>(plan.kv_resident_bytes / MiB),
+                static_cast<unsigned long long>(padding / MiB),
+                static_cast<unsigned long long>(real_components / MiB));
+}
+
 static void run_all() {
     RUN(test_low_ram_streams);
     RUN(test_small_moe_fully_resident);
@@ -491,6 +655,10 @@ static void run_all() {
     RUN(test_explicit_target_drives_levers);
     RUN(test_target_below_floor_refuses_loudly);
     RUN(test_target_overrides_mode);
+    RUN(test_max_uses_total_not_free_monotonic);
+    RUN(test_honest_refusal_floor_smallest_kv);
+    RUN(test_achievable_small_target_fits);
+    RUN(test_estimate_tracks_real_resident);
 }
 
 TEST_MAIN()

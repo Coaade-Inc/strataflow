@@ -181,14 +181,32 @@ static double max_step_delta(const std::vector<std::vector<float>> &a,
 // real RAM does not change the explicit-target plan).
 static constexpr uint64_t kTightTargetBytes = 1288490188ull;  // 1.2 GiB
 
-// A 12 GiB box with ~10.6 GiB free (mirrors the Colab machine) for the AUTO /
-// MAX modes, which READ the profile. The explicit target above overrides this
-// for mode (a); the profile is still passed so the rest of the planner
-// (SSD/CPU/no-GPU) reflects a real machine.
+// A TIGHT box whose INSTANTANEOUS free RAM is far below its total physical RAM
+// (free << total), which is exactly the Colab situation that inverted Max: the
+// big model (or anything else) had already consumed RAM, so MemAvailable was
+// small. This profile BREAKS THE FIXTURE-BLINDNESS: at this budget the
+// fixture's full-n_ctx KV (2 GiB at n_ctx=32768, head_count_kv=2) + trunk +
+// experts cannot all stay resident under AUTO's good-neighbor share, so AUTO
+// steps the KV window down and/or streams, while MAX - sizing to ALL PHYSICAL
+// RAM (BUG 2 fix) - holds full KV + full experts + resident trunk. The two
+// modes therefore choose DIFFERENT levers, which is what makes the Max
+// inversion and the honest-floor fixes OBSERVABLE on the real load path.
+//
+// total = 3 GiB (all physical RAM Max dedicates); free = 2.25 GiB (the
+// instantaneous MemAvailable Auto's good-neighbor share is derived from). With
+// free << total, a free-based Max (the BUG) would resolve a SMALLER ceiling
+// than Auto; the fixed total-based Max resolves strictly above it. At this
+// budget on the Mixtral-geometry fixture (full-n_ctx KV = 2 GiB) the modes
+// choose GENUINELY DIFFERENT levers (fixture-blindness broken): AUTO caps at a
+// ~1.25 GiB good-neighbor share so it windows the KV down AND streams some
+// experts (slots far below full), while MAX dedicates all 3 GiB so it holds
+// FULL KV + FULL experts + resident trunk. That slot/window divergence is what
+// makes the Max inversion observable - with the pre-fix tiny-expert fixture (or
+// a free-based Max) both modes trivially held full residency.
 static HardwareProfile colab_profile() {
     HardwareProfile hw;
-    hw.ram_total_bytes = 12 * GiB;
-    hw.ram_free_bytes = (10 * GiB) + (640ull * 1024 * 1024);  // ~10.6 GiB
+    hw.ram_total_bytes = 3 * GiB;
+    hw.ram_free_bytes = (2 * GiB) + (256ull * 1024 * 1024);  // 2.25 GiB free
     return hw;
 }
 
@@ -263,6 +281,29 @@ static void test_target_ram_modes_real_path() {
                 target_plan.kv_window, target_plan.trunk_pool_layers,
                 target_plan.expert_slots_resident, shape.n_ctx, shape.n_layers);
 
+    // BUG 1 (hard): a genuinely-too-small target - below the TRUE minimal-KV
+    // floor - must REFUSE, and the refusal must name an HONEST floor built from
+    // the SMALLEST KV window (kMinKvWindow), NOT the full n_ctx reservation. The
+    // dishonest pre-fix behavior reported FULL KV (the ~8-10 GiB "minimal
+    // config") even though a small-window config fits in ~2.x GiB. We assert the
+    // refusal_reason's KV figure is far below the fixture's full-n_ctx KV. 64
+    // MiB is below even the process floor + margin, so no config can fit it.
+    std::unique_ptr<Model> tiny_model;
+    PlacementPlan tiny_plan{};
+    const uint64_t kTooSmall = 64ull * 1024 * 1024;  // 64 MiB, below the floor
+    load_model(strata_path, hw, /*vram=*/0, /*ram=*/0, tiny_model, &tiny_plan,
+               /*cache_budget=*/0, RamMode::Auto,
+               /*target_ram_budget=*/kTooSmall);
+    CHECK(!tiny_plan.fits);
+    CHECK(!tiny_plan.refusal_reason.empty());
+    CHECK(tiny_plan.refusal_reason.find("floor") != std::string::npos);
+    // The honest floor's KV figure reflects the SMALLEST window: for this
+    // fixture (full KV = 2 GiB = 2048 MiB) the minimal-window KV at W=256 is
+    // ~16 MiB, so the refusal must NOT mention the 2048 MiB full-KV figure.
+    CHECK(tiny_plan.refusal_reason.find(" KV 2048 MiB") == std::string::npos);
+    CHECK(tiny_plan.refusal_reason.find("KV window 256") != std::string::npos);
+    std::printf("[too-small-target refused honestly] ");
+
     // ---- (b) AUTO (good-neighbor default) ------------------------------
     std::unique_ptr<Model> auto_model;
     PlacementPlan auto_plan{};
@@ -285,6 +326,11 @@ static void test_target_ram_modes_real_path() {
     CHECK_EQ(st_m, SF_OK);
     CHECK(max_model != nullptr);
     CHECK(max_plan.fits);
+    // FIT INVARIANT on the Max plan after the monotonicity guard's slot re-fit:
+    // the final projected peak must still fit Max's usable budget. Guards the
+    // same construction-only guarantee the pure-function sweep covers, now on
+    // the REAL load path so a re-fit regression would be caught end to end.
+    CHECK(max_plan.planned_peak_bytes <= max_plan.usable_ram_bytes);
 
     std::printf("[auto: peak=%lluMiB usable=%lluMiB kv_window=%u trunk_pool=%u "
                 "slots=%u streamed? %d | max: peak=%lluMiB usable=%lluMiB "
@@ -320,6 +366,51 @@ static void test_target_ram_modes_real_path() {
     const uint32_t max_hot =
         max_plan.trunk_pool_layers ? max_plan.trunk_pool_layers : shape.n_layers;
     CHECK(max_hot >= auto_hot);
+
+    // BUG 2 FIXTURE-BLINDNESS BREAKER (hard): on THIS budget the two modes must
+    // choose GENUINELY DIFFERENT residency, not the trivially-identical full
+    // residency the pre-fix tiny-expert fixture produced. Max must hold FULL KV
+    // (window 0 == full n_ctx) while Auto's good-neighbor share forced a smaller
+    // window; and Max must hold strictly MORE experts resident than Auto (the
+    // exact inversion the real Colab run showed, where Max held FEWER). These
+    // HARD-fail (not skip) with the fixture env set.
+    CHECK(max_plan.usable_ram_bytes > auto_plan.usable_ram_bytes);  // total > share
+    CHECK(max_plan.kv_window == 0u);                 // Max holds full n_ctx KV
+    CHECK(auto_plan.kv_window > 0u);                 // Auto windowed down
+    CHECK(auto_plan.kv_window < shape.n_ctx);
+    CHECK(max_plan.expert_slots_resident > auto_plan.expert_slots_resident);
+    CHECK(auto_plan.stream_experts);                 // Auto streams some experts
+    CHECK(!max_plan.stream_experts);                 // Max holds the full set
+
+    // PEAK-ESTIMATE SANITY (BUG 3, hard): a windowed plan's projected peak is
+    // strictly BELOW what the SAME plan would project with the full n_ctx KV
+    // reservation. The only difference is the KV term, so recompute Auto's peak
+    // with full-n_ctx KV and confirm the windowed estimate is strictly smaller.
+    const uint64_t floats_per_col =
+        static_cast<uint64_t>(shape.head_dim) * shape.n_head_kv;
+    const uint64_t full_kv_bytes_shape = static_cast<uint64_t>(shape.n_layers) *
+                                         2 * floats_per_col * sizeof(float) *
+                                         shape.n_ctx;
+    const uint64_t auto_full_kv_peak =
+        auto_plan.planned_peak_bytes - auto_plan.kv_resident_bytes +
+        full_kv_bytes_shape;
+    CHECK(auto_plan.kv_resident_bytes < full_kv_bytes_shape);
+    CHECK(auto_plan.planned_peak_bytes < auto_full_kv_peak);
+    // The estimate must track the engine's REAL resident footprint, not stack
+    // to ~2x it. The real resident components are everything the engine actually
+    // allocates: resident KV + resident experts + one-layer staging + resident
+    // trunk + process floor. The only ESTIMATE padding on top is the
+    // conservative compute scratch + safety margin. BUG 3 was that padding
+    // (plus a full-n_ctx KV charge) roughly DOUBLING reality. Assert the padding
+    // stays below the real components here (planned_peak < 2x real) on this
+    // small fixture; the strict real-Mixtral-scale < 1.5x bound - where the
+    // multi-GiB KV dwarfs the fixed floors - is asserted in test_planner.cpp on
+    // the Mixtral geometry (test_estimate_tracks_real_resident).
+    const uint64_t auto_padding =
+        auto_plan.compute_bytes + auto_plan.safety_margin_bytes;
+    const uint64_t auto_real_components =
+        auto_plan.planned_peak_bytes - auto_padding;
+    CHECK(auto_padding < auto_real_components);  // planned_peak < 2x real
 
     // ---- (d) HARD byte-identity across modes + oracle ------------------
     // The decode half needs the matched STACKED GGUF for the tokenizer + the
