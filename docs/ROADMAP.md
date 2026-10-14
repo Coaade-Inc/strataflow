@@ -390,6 +390,52 @@ families are the remaining quant-coverage gap.
   Mixtral-8x7B-Instruct Q3_K_M run that this dial maps to (next bullet) is the
   absolute-number re-verify; the sandbox proves the mechanism, the mode
   differences, the honest refusal floor, estimate sanity, and byte-identity.
+- [x] **AUTO coherent retune + batched/sequential expert I/O (technique 6.7,
+  first half).** Fixes the two coupled problems the real-Mixtral Colab run
+  exposed, both residency/placement-only so decode stays byte-identical.
+  (1) COHERENT AUTO POLICY (`src/plan/planner.cpp`): AUTO now takes a
+  comfortable, DOCUMENTED share of total RAM (the conservative `usable_ram`
+  good-neighbor budget) and co-selects the three fit levers (KV window, trunk
+  pool, expert cache) consistently to FILL that share - more resident means less
+  streaming. The KV-window step-down now budgets against the FULL resident trunk,
+  so AUTO windows the KV BEFORE the trunk is forced to hard-stream, enforcing the
+  COHERENCE INVARIANT (asserted in code and in three tests): AUTO never keeps the
+  full-`n_ctx` KV resident while simultaneously hard-streaming the trunk (if
+  `0 < trunk_pool_layers < n_layers` then `0 < kv_window < n_ctx`). Before, AUTO
+  on a 12 GiB-class box was INCOHERENT (full KV while hard-streaming the trunk,
+  caching only 2 experts); now, when RAM affords it, it keeps the trunk resident
+  and caches far more. On the synthetic 12 GiB Mixtral shape: BEFORE incoherent
+  (windowed KV AND hard trunk streaming pool=20/32 AND only 4 experts, peak ~=
+  usable), MAX fits=0 (projected peak 14097 MiB `>` usable 12288 MiB); AFTER
+  coherent (AUTO `kv_window=8192`, trunk fully resident pool=0, 14 experts), MAX
+  fits=1 (peak 12249 `<=` 12288, `kv_window=16384`, 18 experts) and stays
+  `>= AUTO` on every lever. Experts resident went 2 (old) -> 14 (synthetic
+  12 GiB) / 104 (mxg real fixture). (2) LOSSLESS BATCHED/SEQUENTIAL EXPERT I/O
+  (`src/tws/strata_file.*`, `src/model/engine/engine.cpp`):
+  `StrataReader::read_bundle` issues ONE `read_at` over a whole `(layer, expert)`
+  bundle and splits it into gate/up/down by the known relative offsets, replacing
+  the three separate `read_blob` calls - byte-identical (the bytes `memcmp` equal
+  to the three per-kind reads, slices tightly packed gate|up|down,
+  `streamed_bytes()` totals unchanged), with a `read_calls()` counter proving the
+  3:1 read-count cut, through the REAL `StrataReader` in
+  `tests/test_coalesced_expert_read.cpp`. The larger coherent AUTO cache cuts
+  bytes/token: on the mxg real fixture streamed bytes/token drop from 29,408,625
+  (2-slot baseline) to 3,008,102 (104-slot AUTO), ~9.8x fewer. Greedy decode is
+  BIT-IDENTICAL across AUTO/TARGET/MAX (`|delta| = 0.000e+00`) and within the
+  quant bound vs the libllama oracle (`5.179e-02 < 1e-1`). Full matrix green
+  (GCC + Clang `-Werror`, release + clang ctest 22/22, the fixture-blindness
+  real-load gate, and TSan 22/22). Colab-only: the current real speed is
+  ~0.06 tok/s (~16 s/token) on the 12 GiB / 2-core / ~4 GiB/s SSD box, I/O-bound
+  (~74-78 GB streamed per 16 tokens, ~4.6 GB/token); this lever attacks both the
+  bytes/token term (bigger coherent AUTO cache) and the effective-bandwidth term
+  (fewer, larger sequential reads), but the box stays fundamentally I/O-bound on
+  2 cores (no compute/IO overlap; the async prefetch self-backs-off at
+  `completed-before-use = 0`), so NO tok/s number is promised - the absolute
+  real-Mixtral improvement is a Colab/hardware re-measurement. REMAINING SPEED
+  WORK toward the continuation: the adjacent-expert multi-bundle coalescing and
+  the co-activation packing LAYOUT (`PLAN.md` 3.10, technique 6.7 second half),
+  then speculative / draft decoding (technique 6.8, Phase 5 below) as the biggest
+  effective tok/s multiplier.
 - [x] Relicense to the Coaade Source-Available License v1.0 (#6, #7).
 - [x] Byte-identical correctness gate against the libllama oracle on every
   engine step; CI green on Linux (GCC+Clang), macOS, Windows.

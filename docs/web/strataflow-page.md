@@ -157,11 +157,16 @@ StrataFlow's correctness and bounded-RAM behavior are measured, not asserted:
   output - the "big model, small RAM, no GPU" proof on a real large MoE.
 
 The bounded-RAM mechanism is proven, and both a real dense model and a real
-large MoE run end to end through it on real hardware. Free-tier throughput on
-the large MoE was initially disk-bound (exactly what the auto-residency and
-async-prefetch work targets), so the large-MoE result is "runs end to end,
-bounded RAM, coherent output; throughput improvements are being measured on real
-hardware", not a settled tokens-per-second number. See Current status.
+large MoE run end to end through it on real hardware. The FIT is proven on the
+real large MoE: Mixtral-8x7B-Instruct Q3_K_M decoded byte-identically on the free
+12 GB Colab CPU box at about 2.4 GiB peak RSS. Throughput on that box is
+I/O-bound, not RAM-bound: on a 2-core machine with a slow SSD the limiter is how
+many bytes stream from disk per token and how fast the SSD can serve them, so
+decode is slow there and gets faster with more CPU cores and a faster NVMe drive.
+The large-MoE result is therefore "runs end to end, bounded RAM, coherent output,
+fit proven; throughput is I/O-bound on low-core / slow-SSD hardware and is being
+measured on real hardware", not a settled tokens-per-second number - we do not
+quote a tok/s figure as a product claim. See Current status.
 
 ## Who it is for
 
@@ -198,9 +203,12 @@ Windows:
 Honest open items:
 
 - Settled throughput for the real large MoE is still being measured on real
-  hardware. It runs end to end with bounded RAM and coherent output, and
-  free-tier throughput was initially disk-bound (what auto residency and async
-  prefetch target), so there is no settled tokens-per-second product number yet.
+  hardware. It runs end to end with bounded RAM and coherent output (fit proven
+  at about 2.4 GiB peak RSS on the free Colab box), but throughput there is
+  I/O-bound: on a 2-core / slow-SSD machine the bytes streamed per token and the
+  SSD read speed set the pace, so decode is slow on that box and improves with
+  more CPU cores and a faster NVMe drive. There is no settled tokens-per-second
+  product number yet, and we do not quote one.
 - The IQ quantization families are not yet validated (Q8_0 and K-quant
   Q4_K/Q6_K are).
 - Other MoE architectures (Qwen2-MoE, DeepSeek-MoE) are not yet implemented;

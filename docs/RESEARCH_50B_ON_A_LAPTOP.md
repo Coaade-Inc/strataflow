@@ -753,6 +753,68 @@ instead of byte-identity.
   LOSSLESS speed lever on 2-core hardware because it attacks the real
   bottleneck (effective bandwidth, not overlap). Strong candidate right after
   the FIT levers.
+- **PROGRESS [SHIPPED, lossless - coalesced bundle reads + coherent AUTO
+  retune].** The first half of this lever is now implemented and sandbox-proven.
+  (1) COALESCED BUNDLE READS: `StrataReader::read_bundle` issues ONE `read_at`
+  over a whole `(layer, expert)` bundle `[blob_offset, blob_offset +
+  blob_length)`, then splits it into the gate/up/down slices by their known
+  relative offsets, replacing the previous THREE separate `read_blob` calls (one
+  per kind). It is byte-identical: the returned bytes `memcmp` equal to the three
+  per-kind reads concatenated, the slices are tightly packed gate|up|down inside
+  the bundle, and `streamed_bytes()` totals are unchanged (the same bytes are
+  counted once). A `read_calls()` atomic counter proves the read-count drops 3:1
+  per bundle (3 underlying `read_at` -> 1), proven through the REAL `StrataReader`
+  (not a mock) in `tests/test_coalesced_expert_read.cpp`. The three engine
+  expert-read sites (`ensure_layer_experts_resident`, `warm_expert`,
+  `pf_read_bundle`) all route through `read_bundle` with a per-kind fallback, so
+  the resident bytes - and therefore the decode - stay byte-identical. This is
+  the effective-bandwidth proxy: fewer, larger reads run nearer peak sequential
+  bandwidth and pay less per-read overhead. (2) MORE OF THE WORKING SET RESIDENT:
+  the AUTO policy was retuned to a COHERENT good-neighbor share (see the AUTO
+  policy note below), which caches MANY more experts than the old 2, directly
+  cutting bytes/token: on the Mixtral-geometry (mxg) real fixture the streamed
+  bytes/token drop from 29,408,625 B (2-slot baseline) to 3,008,102 B (104-slot
+  AUTO), ~9.8x fewer expert bytes re-streamed per token. Greedy decode stays
+  BIT-IDENTICAL across AUTO/TARGET/MAX (`|delta| = 0.000e+00`) and within the
+  quant bound vs the libllama oracle (`5.179e-02 < 1e-1` on the random-weight
+  q4_k fixture). The REMAINING work in this lever is the adjacent-expert
+  multi-bundle coalescing and the co-activation packing LAYOUT (`PLAN.md` 3.10)
+  that places co-activated / sequential-layer experts adjacently on disk so even
+  more reads fuse into one sequential range.
+- **AUTO policy (coherent good-neighbor share).** AUTO now takes a comfortable,
+  DOCUMENTED share of total RAM (the conservative `usable_ram` good-neighbor
+  budget that leaves headroom for other apps) and co-selects the three fit levers
+  - KV window, trunk pool, expert cache - CONSISTENTLY to fill that share: more
+  resident means less streaming within the share. The KV-window step-down now
+  budgets against the FULL resident trunk, so AUTO windows the KV BEFORE the
+  trunk is forced to hard-stream. This enforces a COHERENCE INVARIANT: AUTO never
+  keeps the full-`n_ctx` KV resident while simultaneously hard-streaming the
+  trunk (if `trunk_pool_layers > 0` and `< n_layers`, then `0 < kv_window <
+  n_ctx`); the levers co-reduce. When RAM affords it, AUTO keeps the trunk fully
+  resident and caches far more experts than the old 2. On the synthetic 12 GiB
+  Mixtral shape: BEFORE was incoherent (windowed KV AND hard trunk streaming
+  pool=20/32 AND only 4 experts, peak ~= usable); AFTER is coherent (AUTO
+  `kv_window=8192`, trunk fully resident pool=0, 14 experts resident). MAX stays
+  `>= AUTO` on every lever and now fits its own budget (BEFORE projected peak
+  14097 MiB `>` usable 12288 MiB, fits=0; AFTER peak 12249 `<=` 12288, fits=1,
+  `kv_window=16384`, 18 experts). Experts resident went 2 (old) -> 14 (synthetic
+  12 GiB) / 104 (mxg real fixture). Residency/placement only, so decode is
+  byte-identical across all modes.
+- **The honest 2-core I/O-bound ceiling.** This box stays FUNDAMENTALLY
+  I/O-bound. With only 2 cores there is no compute/IO overlap to be had - the
+  async prefetch worker self-backs-off at `completed-before-use = 0` (reconciled
+  honestly in the oracle-safety note above). The coalesced sequential reads do
+  NOT change which bytes are read or which experts are resident; they cut
+  wall-clock by raising EFFECTIVE bandwidth and cutting per-read overhead, and
+  the coherent AUTO share cuts bytes/token by holding more of the working set
+  resident. Together these attack the two terms of the Ceiling B inequality
+  (bytes/token and effective bandwidth), but they do not make the box
+  compute-bound. We therefore do NOT promise a tok/s number: the current real
+  figure (~0.06 tok/s, ~16 s/token on the 12 GiB / 2-core / ~4 GiB/s SSD Colab
+  box) and any absolute improvement on real Mixtral is a Colab/hardware
+  re-measurement, not a sandbox number. The sandbox proves the MECHANISM (plan
+  geometry, ~9.8x bytes/token reduction on the fixture, 3:1 read-count cut,
+  byte-identity).
 
 ### 6.8 Speculative / draft decoding
 
