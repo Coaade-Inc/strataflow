@@ -9,6 +9,7 @@
 
 set(STRATAFLOW_SOURCES
     common/log.cpp
+    common/lz_codec.cpp
     common/status.cpp
     hw/profiler.cpp
     plan/planner.cpp

@@ -112,3 +112,12 @@ sf_add_test(test_target_ram_modes_real_path)
 # as test_target_ram_modes_real_path); skips cleanly when unset. Only drives the
 # library (pack + reader), so a plain sf_add_test suffices.
 sf_add_test(test_coalesced_expert_read)
+
+# test_lz_codec is the FEAT-001 unit gate for the self-contained LZ codec
+# (src/common/lz_codec): it round-trips empty / tiny / highly-compressible /
+# high-entropy / multi-MiB blob inputs byte-exact, asserts the
+# incompressible-does-not-fit path returns -1, proves lz_decompress rejects
+# truncated and garbage input with -1 (canary byte past the output verified
+# untouched, so no overrun), and prints a measured decompress GiB/s summary
+# line. Pure library test, no fixture env, always runs. Plain sf_add_test.
+sf_add_test(test_lz_codec)
