@@ -91,6 +91,44 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- Selectable GPU compute backend foundation (CPU default, byte-identical).
+  The engine's ggml compute backend is now SELECTABLE instead of a hard-coded
+  `ggml_backend_cpu_init()`. A new top-level `STRATAFLOW_GPU=off|cuda|metal|vulkan`
+  CMake option (default `off`) wires the vendored ggml `GGML_CUDA`/`GGML_METAL`/
+  `GGML_VULKAN` backends from the TOP-LEVEL CMake only (`third_party/llama.cpp`
+  is never edited; its options are merely toggled before `add_subdirectory`), and
+  defines compile-time guard macros (`STRATAFLOW_GPU_ENABLED` plus
+  `STRATAFLOW_GPU_<CUDA|METAL|VULKAN>`) on the single engine TU. At runtime the
+  engine selects the first available GPU ggml backend via the backend-agnostic
+  ggml-backend DEVICE/REGISTRY API (`ggml_backend_dev_count`/`_get`/`_type`/
+  `_init`, the SAME API `enumerate_gpus` uses - not a CUDA-specific call) when a
+  GPU backend is compiled in AND a device is present, and ALWAYS falls back to
+  the CPU backend otherwise; a missing or failed GPU never fails the load. When
+  a GPU backend is selected, the gallocr and every resident buffer (trunk
+  `wbuf`, KV `kvbuf`, expert staging `estbuf`) are allocated from the selected
+  backend's default buffer type, and the per-token expert "fault bytes into the
+  resident staging region" step becomes a host->device upload
+  (`ggml_backend_tensor_set`) through a single new host-or-device `stage_write`
+  primitive instead of a host `memcpy`. The planner's VRAM budget and the C ABI
+  `sf_context_params.preferred_backend` are plumbed through `load_model` ->
+  `load_ggml_model`/`load_strata_model` -> `GgmlModel` -> `Engine::load` via a
+  backward-compatible defaulted trailing parameter, so existing callers/tests
+  compile unchanged. HARD CPU-ONLY INVARIANT (the only part CI/the sandbox can
+  validate): on the default `STRATAFLOW_GPU=off` build the macro is 0, every GPU
+  branch is compiled out, the engine selects CPU, `ggml_backend_cpu_set_n_threads`
+  is still called only for the CPU backend, and decode is BYTE-IDENTICAL to the
+  prior engine and the oracle (`max|delta| = 0.000e+00`). The CPU path stays
+  single-threaded and TSan-clean (`stage_write` is a pure branch on a bool, no
+  new threads). FIRST-INCREMENT SCOPE: when a GPU is selected the WHOLE resident
+  set runs in VRAM and the streamed trunk is forced resident
+  (streamed-trunk-on-GPU is a documented follow-on); the per-token EXPERT
+  upload seam is device-correct regardless, as it is the per-token crux. A new
+  `test_backend_selection` unit test proves the CPU-selection invariant and the
+  byte-identical-to-oracle decode on a CPU-only build. GPU-accelerated decode is
+  NOT built or run-validated in the sandbox (no GPU/toolkit); it is gated behind
+  the compile-time guard for hardware validation. Full ctest 25/25 green under
+  GCC + Clang `-Werror`. No change to `third_party/llama.cpp`.
+
 - Optional lossless on-disk expert-blob compression (compress what streams).
   `strata-pack` gains a `--compress <lz|none>` flag (default `none`,
   uncompressed): when `lz` is selected, each per-expert blob is compressed at

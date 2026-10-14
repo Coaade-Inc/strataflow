@@ -426,10 +426,16 @@ Precedence (highest wins): the low-level knobs
 auto/max may read VRAM and the planner budgets VRAM PLACEMENT (GPU discovery ->
 VRAM-first trunk/expert placement -> the pure `derive_llama_placement`
 translation to `n_gpu_layers`, all CPU-unit-tested in `test_llama_placement` /
-`test_planner`), but the `.strata` engine decode is CPU-only today, so full
-GPU-accelerated compute is enterprise roadmap work (wiring a GPU buffer type into
-the engine's `ggml_backend_sched`, hardware-gated), not something these modes
-turn on. The RAM side is the proven, measured mechanism.
+`test_planner`). The engine's compute backend is now also SELECTABLE - a
+`STRATAFLOW_GPU=off|cuda|metal|vulkan` build option (default `off`) plus a
+runtime selector that picks the first available GPU ggml backend and ALWAYS
+falls back to CPU, with resident buffers on the selected backend's buffer type
+and a host-or-device `stage_write` upload for the per-token expert bytes
+(`test_backend_selection` proves CPU is picked and decode stays byte-identical
+to the oracle on a CPU-only build). But on this free Colab box there is no GPU,
+so the `.strata` engine decode runs CPU-only; full GPU-accelerated COMPUTE is
+enterprise roadmap work that needs real GPU hardware to validate, not something
+these modes turn on. The RAM side is the proven, measured mechanism.
 
 - **Sandbox-proven (offline, in CI):** the MECHANISM, the mode differences, the
   honest refusal floor, estimate sanity, and byte-identity through the REAL load

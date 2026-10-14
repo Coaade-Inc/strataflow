@@ -178,11 +178,16 @@ sf_status sf_context_create(const sf_context_params *params, sf_context **out_ct
     // offload). An explicit budget of 0 means "auto from the profile". The
     // target/mode select the usable-RAM ceiling the plan is sized against
     // (precedence: explicit low-level knobs > target_ram_budget > ram_mode).
+    // FEAT-003: forward the caller's preferred compute backend. On a CPU-only
+    // build this is ignored downstream (the engine selects CPU regardless); on
+    // a GPU build it asks the engine to init the selected GPU ggml backend if a
+    // device is present, falling back to CPU if not.
     sf_status st = sf::load_model(params->model_path, ctx->hw,
                                   params->vram_budget, params->ram_budget,
                                   ctx->model, &ctx->plan,
                                   params->cache_budget, ram_mode,
-                                  params->target_ram_budget);
+                                  params->target_ram_budget,
+                                  static_cast<int>(params->preferred_backend));
     if (st != SF_OK) return st;
 
     // FEAT-002: REFUSE LOUDLY rather than hand back an over-committing context.

@@ -314,6 +314,52 @@ struct Engine::Impl {
     // global ggml backend state in the oracle tests).
     ggml_backend_t backend = nullptr;
     ggml_gallocr_t galloc  = nullptr;
+    // FEAT-003: true when `backend` is a GPU ggml backend (CUDA/Metal/Vulkan),
+    // false for the CPU backend. The per-token staging writes and the resident-
+    // buffer allocations branch on this: on CPU they stay a host std::memcpy /
+    // the CPU buffer type (byte-identical to the pre-FEAT-003 engine); on a GPU
+    // backend they become a host->device ggml_backend_tensor_set upload / the
+    // selected backend's default (device) buffer type. On a CPU-only build
+    // (STRATAFLOW_GPU_ENABLED==0) this is ALWAYS false and every GPU branch is
+    // compiled out, so the default build is byte-identical and links zero GPU
+    // code. The compute path stays single-threaded regardless (this is a pure
+    // bool, no new threads), so the TSan contract is unchanged.
+    bool is_gpu = false;
+
+    // FEAT-003: host-or-device aware write of `n` bytes from `src` into graph
+    // tensor `dst` at byte `offset`. The ONE primitive every per-token staging
+    // write routes through so the SAME residency/streaming logic drives a host
+    // buffer (CPU) or a device buffer (GPU). On CPU this is a raw std::memcpy
+    // into dst->data (byte-identical to the pre-FEAT-003 engine); on a GPU
+    // backend it is a host->device upload via ggml_backend_tensor_set. It is a
+    // pure branch on is_gpu with no locking and no new threads, so it does not
+    // perturb the single-threaded-compute / TSan contract.
+    void stage_write(ggml_tensor *dst, size_t offset, const void *src,
+                     size_t n) {
+#if STRATAFLOW_GPU_ENABLED
+        if (is_gpu) {
+            ggml_backend_tensor_set(dst, src, offset, n);
+            return;
+        }
+#endif
+        std::memcpy(static_cast<uint8_t *>(dst->data) + offset, src, n);
+    }
+
+    // FEAT-003: host-or-device aware zero-fill of all `ggml_nbytes(dst)` bytes
+    // of graph tensor `dst`. On CPU a std::memset (byte-identical); on a GPU
+    // backend a host->device upload of a zero scratch buffer so non-routed
+    // expert slices are well-defined on the device too.
+    void stage_zero(ggml_tensor *dst) {
+#if STRATAFLOW_GPU_ENABLED
+        if (is_gpu) {
+            const size_t n = ggml_nbytes(dst);
+            std::vector<uint8_t> zeros(n, 0);
+            ggml_backend_tensor_set(dst, zeros.data(), 0, n);
+            return;
+        }
+#endif
+        std::memset(dst->data, 0, ggml_nbytes(dst));
+    }
 
     // EC-4: when the model was loaded from a .strata single file, `reader` is
     // the byte source for the SlotPool: expert bundles are streamed from the
@@ -419,6 +465,11 @@ struct Engine::Impl {
     ggml_context *pltctx = nullptr;         // per-layer streamed projections (metadata)
     bool trunk_stream_layers = false;       // per-layer attention projections stream
     uint32_t trunk_pool_layers = 0;         // bounded hot-trunk ring depth (layers)
+    // FEAT-003: the backend the PLAN/caller prefers for compute, mirroring the
+    // public sf_backend enum (0 == SF_BACKEND_CPU). Stashed in load() before
+    // select_compute_backend() consults it. On a CPU-only build this is ignored
+    // (no GPU backend is compiled in) and the engine always selects CPU.
+    int preferred_backend = 0;
     // One shared backing buffer holding `trunk_pool_layers` ring slots, each
     // sized to ONE layer's four projection weights (q|k|v|output concatenated
     // at fixed sub-offsets). A ring slot is refilled from disk immediately
@@ -547,6 +598,30 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
                                              // resident (edge AND per-layer)
         }
     }
+    // FEAT-003 STREAMED-TRUNK-ON-GPU (documented first-increment choice): the
+    // streamed-trunk paths (edge token_embd/output and the per-layer attention
+    // projections) repoint a metadata tensor's ->data at an OWNED HOST buffer
+    // (trunk_stream_buf / layer_trunk_buf) and fetch bytes straight into it.
+    // That host-pointer aliasing is only correct when the compute backend reads
+    // host memory - i.e. the CPU backend. On a GPU backend those tensors must be
+    // DEVICE graph leaves with their bytes uploaded, which is a larger change
+    // than this crux increment needs. The briefing explicitly permits requiring
+    // the RESIDENT (non-streamed) trunk on the GPU path for this first
+    // increment and documenting streamed-trunk-on-GPU as a follow-on, PROVIDED
+    // the per-token EXPERT-streaming upload seam (Impl::stage_write) is device-
+    // correct - and it is (see ensure_layer_experts_resident). So on a GPU
+    // backend we force the whole trunk resident (trunk tensors go into wctx,
+    // which is already allocated from the selected backend's device buffer
+    // type above) and issue no per-forward host-pointer trunk fetch. The CPU
+    // path is UNCHANGED and byte-identical. The expert set still streams and
+    // UPLOADS per token, which is the per-token crux this feature delivers.
+    if (im.is_gpu) {
+        im.trunk_streaming     = false;
+        im.trunk_stream_layers = false;
+        log_info("engine: GPU backend selected - trunk forced resident in VRAM "
+                 "(streamed-trunk-on-GPU is a follow-on); experts stream and "
+                 "upload per token");
+    }
     {
         ggml_init_params ip{};
         ip.mem_size = ggml_tensor_overhead() *
@@ -609,8 +684,11 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
 
     // Allocate the RESIDENT trunk tensors (wctx) resident. ectx (experts) is
     // left unbacked on purpose - experts stream from the .strata file.
+    // FEAT-003: allocate the resident trunk tensors from the SELECTED backend's
+    // default buffer type. On CPU this is the CPU buffer type (byte-identical);
+    // on a GPU backend the resident trunk lives in device memory.
     im.wbuf = ggml_backend_alloc_ctx_tensors_from_buft(
-        im.wctx, ggml_backend_cpu_buffer_type());
+        im.wctx, ggml_backend_get_default_buffer_type(im.backend));
     if (im.wbuf == nullptr) {
         log_warn("engine: .strata weight buffer alloc failed");
         return false;
@@ -753,6 +831,8 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
 }
 
 const EngineHParams &Engine::hparams() const { return impl_->hp; }
+
+bool Engine::is_gpu_backend() const { return impl_->is_gpu; }
 const EngineCacheStats &Engine::cache_stats() const { return impl_->cstats; }
 
 uint64_t Engine::resident_kv_bytes() const {
@@ -879,10 +959,18 @@ bool Engine::stream_layer_trunk(int il) {
     return true;
 }
 
+namespace {
+// FEAT-003: forward declaration so Engine::load (below) can select the compute
+// backend before building any resident context; the definition lives in the
+// later anonymous namespace next to run_segment.
+ggml_backend_t select_compute_backend(int preferred, bool *out_is_gpu);
+}  // namespace
+
 std::unique_ptr<Engine> Engine::load(const std::string &path,
                                      uint32_t expert_slots,
                                      uint32_t plan_kv_window,
-                                     uint32_t plan_trunk_pool_layers) {
+                                     uint32_t plan_trunk_pool_layers,
+                                     int preferred_backend) {
     std::unique_ptr<Engine> eng(new Engine());
     Impl &im = *eng->impl_;
     // FEAT-003: stash the plan's per-layer trunk-streaming decision before
@@ -890,6 +978,30 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     // to decide whether to route the per-layer attention projections into the
     // metadata-only pltctx vs resident wctx).
     im.trunk_pool_layers = plan_trunk_pool_layers;
+    // FEAT-003: stash the compute-backend hint before the backend is selected
+    // below. On a CPU-only build this is ignored (always CPU).
+    im.preferred_backend = preferred_backend;
+
+    // FEAT-003: select the compute backend FIRST, before building any resident
+    // context, because the resident-buffer allocations below
+    // (ggml_backend_alloc_ctx_tensors_from_buft) must target the SELECTED
+    // backend's default buffer type. On a CPU-only build this is exactly
+    // ggml_backend_cpu_init() and im.is_gpu stays false, so every alloc targets
+    // the CPU buffer type and the staging-write primitive stays a std::memcpy -
+    // byte-identical to the pre-FEAT-003 engine. A GPU is never required: a
+    // missing/failed GPU device falls back to CPU and the load continues.
+    im.backend = select_compute_backend(im.preferred_backend, &im.is_gpu);
+    if (im.backend == nullptr) {
+        log_warn("engine: compute backend init failed; staying on libllama path");
+        return nullptr;
+    }
+    // The n_threads knob is CPU-backend-specific (1 thread for the greedy-
+    // determinism contract). Only call it for the CPU backend; a GPU backend
+    // has no such knob and skipping it keeps the single-threaded-COMPUTE
+    // contract intact on CPU.
+    if (!im.is_gpu) {
+        ggml_backend_cpu_set_n_threads(im.backend, 1);
+    }
 
     // EC-4: a .strata single file is our own split trunk/expert format. We read
     // its embedded GGUF metadata + trunk tensors directly here (NO
@@ -1114,8 +1226,12 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
             im.k_cache[static_cast<size_t>(il)] = kc;
             im.v_cache[static_cast<size_t>(il)] = vc;
         }
+        // FEAT-003: KV cache from the SELECTED backend's default buffer type
+        // (CPU buffer type on CPU, byte-identical; device memory on a GPU
+        // backend - the KV input/output already uses ggml_backend_tensor_set/get
+        // so it is correct on either).
         im.kvbuf = ggml_backend_alloc_ctx_tensors_from_buft(
-            im.kvctx, ggml_backend_cpu_buffer_type());
+            im.kvctx, ggml_backend_get_default_buffer_type(im.backend));
         if (im.kvbuf == nullptr) {
             log_warn("engine: KV buffer alloc failed; staying on libllama path");
             return nullptr;
@@ -1199,8 +1315,13 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         ggml_set_name(im.stage_gate, "stg_gate");
         ggml_set_name(im.stage_up,   "stg_up");
         ggml_set_name(im.stage_down, "stg_down");
+        // FEAT-003: expert STAGING tensors from the SELECTED backend's default
+        // buffer type. On CPU this is the CPU buffer type and stage_*->data is a
+        // host pointer (the per-token writes stay std::memcpy, byte-identical);
+        // on a GPU backend stage_*->data is a device pointer and the per-token
+        // writes become ggml_backend_tensor_set uploads via Impl::stage_write.
         im.estbuf = ggml_backend_alloc_ctx_tensors_from_buft(
-            im.estctx, ggml_backend_cpu_buffer_type());
+            im.estctx, ggml_backend_get_default_buffer_type(im.backend));
         if (im.estbuf == nullptr) {
             log_warn("engine: staging buffer alloc failed; libllama path");
             return nullptr;
@@ -1208,9 +1329,11 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
         // Zero the staging buffer so non-routed expert slices are well-defined
         // (the kernel skips cne1==0 experts, but defined zeros avoid any inf/nan
         // in uninitialized memory leaking into an assert on debug builds).
-        std::memset(im.stage_gate->data, 0, ggml_nbytes(im.stage_gate));
-        std::memset(im.stage_up->data,   0, ggml_nbytes(im.stage_up));
-        std::memset(im.stage_down->data, 0, ggml_nbytes(im.stage_down));
+        // FEAT-003: route through stage_zero so the zero-fill is a std::memset on
+        // CPU (byte-identical) or a host->device zero upload on a GPU backend.
+        im.stage_zero(im.stage_gate);
+        im.stage_zero(im.stage_up);
+        im.stage_zero(im.stage_down);
 
         // Pool size: auto (0) holds the whole working set (n_layer*n_expert, no
         // eviction); a positive request is clamped up to n_expert_used so a
@@ -1261,15 +1384,13 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
                                                static_cast<uint32_t>(hp.n_expert)));
     }
 
-    // One CPU backend + gallocr for the engine's lifetime (1 thread for the
-    // greedy-determinism contract). Reused across every segment and token.
-    im.backend = ggml_backend_cpu_init();
-    if (im.backend == nullptr) {
-        log_warn("engine: cpu backend init failed; staying on libllama path");
-        return nullptr;
-    }
-    ggml_backend_cpu_set_n_threads(im.backend, 1);
-    im.galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    // One gallocr for the engine's lifetime, reused across every segment and
+    // token. FEAT-003: the compute backend was already SELECTED at the top of
+    // load() (CPU by default and the always-safe fallback; the selected GPU
+    // ggml backend when compiled in AND present). Allocate the gallocr from the
+    // SELECTED backend's default buffer type. On CPU this is the CPU buffer type
+    // (byte-identical); on a GPU backend the compute graph lives on the device.
+    im.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     if (im.galloc == nullptr) {
         log_warn("engine: gallocr init failed; staying on libllama path");
         return nullptr;
@@ -1316,6 +1437,50 @@ void Engine::reset_kv() {
 }
 
 namespace {
+
+// FEAT-003: select the compute backend for the engine. On a CPU-only build
+// (STRATAFLOW_GPU_ENABLED==0 - the sandbox/CI default) this is EXACTLY
+// ggml_backend_cpu_init(), byte-identical to the pre-FEAT-003 engine, and
+// `out_is_gpu` is set false. When a GPU ggml backend is compiled in
+// (STRATAFLOW_GPU_ENABLED==1) it uses the backend-agnostic ggml-backend
+// DEVICE/REGISTRY API (the SAME API enumerate_gpus() uses in ggml_model.cpp,
+// NOT a CUDA-specific call) to find and init the first GPU-type device; if no
+// GPU device is present or its init fails, it falls back to the CPU backend and
+// continues. The engine load NEVER fails because a GPU is absent. `preferred`
+// mirrors sf_backend (0 == SF_BACKEND_CPU); SF_BACKEND_CPU forces the CPU
+// backend even on a GPU build. Logs an ASCII line naming the chosen backend.
+ggml_backend_t select_compute_backend(int preferred, bool *out_is_gpu) {
+    *out_is_gpu = false;
+#if STRATAFLOW_GPU_ENABLED
+    // preferred == 0 is SF_BACKEND_CPU: honor an explicit CPU request even on a
+    // GPU-enabled build (the always-safe fallback is also the opt-out).
+    if (preferred != 0) {
+        const size_t n = ggml_backend_dev_count();
+        for (size_t i = 0; i < n; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (dev == nullptr) continue;
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;  // skip CPU/ACCEL devices
+            }
+            ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
+            if (b != nullptr) {
+                const char *desc = ggml_backend_dev_description(dev);
+                log_info(std::string("engine: compute backend = GPU (") +
+                         (desc != nullptr ? desc : "gpu") + ")");
+                *out_is_gpu = true;
+                return b;
+            }
+            log_warn("engine: GPU device init failed; falling back to CPU");
+            break;  // first GPU failed to init: fall back to CPU
+        }
+        log_warn("engine: no usable GPU device found; using CPU backend");
+    }
+#else
+    (void)preferred;
+#endif
+    log_info("engine: compute backend = CPU");
+    return ggml_backend_cpu_init();
+}
 
 // Allocate and run one segment graph `gf` (rooted at `roots`) on a fresh CPU
 // backend, calling `set_inputs()` after allocation to fill the segment's input
@@ -1872,16 +2037,20 @@ bool Engine::ensure_layer_experts_resident(int il, const int32_t *ids,
 
         // Copy the resident slot bytes into the staging tensors' nb02 slices for
         // this expert, so ggml_mul_mat_id reads correct bytes at cur_a*nb02.
+        // FEAT-003 (the per-token crux): this is the 'fault bytes into the
+        // resident region' step. The SlotPool slot `s` is ALWAYS a host buffer;
+        // the staging tensor `dst_*` lives in the SELECTED backend's buffer -
+        // host on CPU, device on a GPU backend. Route every write through
+        // stage_write so it is a byte-identical std::memcpy on CPU and a
+        // host->device ggml_backend_tensor_set upload on a GPU backend, at the
+        // exact same per-expert nb02 offsets.
         const uint8_t *s = static_cast<const uint8_t *>(im.pool->slot_data(slot));
-        std::memcpy(static_cast<uint8_t *>(dst_gate->data) +
-                        static_cast<size_t>(e) * gb,
-                    s, static_cast<size_t>(gb));
-        std::memcpy(static_cast<uint8_t *>(dst_up->data) +
-                        static_cast<size_t>(e) * ub,
-                    s + gb, static_cast<size_t>(ub));
-        std::memcpy(static_cast<uint8_t *>(dst_down->data) +
-                        static_cast<size_t>(e) * db,
-                    s + gb + ub, static_cast<size_t>(db));
+        im.stage_write(dst_gate, static_cast<size_t>(e) * gb, s,
+                       static_cast<size_t>(gb));
+        im.stage_write(dst_up, static_cast<size_t>(e) * ub, s + gb,
+                       static_cast<size_t>(ub));
+        im.stage_write(dst_down, static_cast<size_t>(e) * db, s + gb + ub,
+                       static_cast<size_t>(db));
     }
     return true;
 }

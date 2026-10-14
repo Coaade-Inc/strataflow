@@ -94,12 +94,13 @@ public:
     GgmlModel(llama_model *model, llama_context *ctx, const ModelShape &shape,
               llama_token eos, std::string path, bool is_strata,
               uint32_t plan_expert_slots, uint32_t plan_kv_window,
-              uint32_t plan_trunk_pool_layers)
+              uint32_t plan_trunk_pool_layers, int preferred_backend = 0)
         : model_(model), ctx_(ctx), vocab_(llama_model_get_vocab(model)),
           shape_(shape), eos_(eos), path_(std::move(path)),
           plan_expert_slots_(plan_expert_slots),
           plan_kv_window_(plan_kv_window),
-          plan_trunk_pool_layers_(plan_trunk_pool_layers) {
+          plan_trunk_pool_layers_(plan_trunk_pool_layers),
+          preferred_backend_(preferred_backend) {
         log_debug(std::string("GgmlModel: inference via engine (EC-5) on ") +
                   (is_strata ? ".strata" : "GGUF") + " '" + path_ + "'");
     }
@@ -255,8 +256,12 @@ private:
             // Plumbed the SAME way as plan_kv_window_: a load parameter, not an
             // env side-channel, so the bounded hot-trunk pool applies BY
             // DEFAULT on the real .strata load path.
+            // FEAT-003: forward the compute-backend hint so a GPU build selects
+            // a GPU ggml backend; on a CPU-only build the engine ignores it and
+            // selects CPU (byte-identical).
             engine_ = engine::Engine::load(path_, slots, plan_kv_window_,
-                                           plan_trunk_pool_layers_);
+                                           plan_trunk_pool_layers_,
+                                           preferred_backend_);
             if (engine_ == nullptr) return -1;  // arch unsupported / load failed
         }
         if (n_past_ == 0) engine_->reset_kv();
@@ -297,6 +302,11 @@ private:
     // stream the per-layer attention projections with this many layers hot.
     // Passed to Engine::load so the bounded hot-trunk pool applies BY DEFAULT.
     uint32_t             plan_trunk_pool_layers_ = 0;
+    // FEAT-003: the compute-backend hint from the C ABI
+    // (sf_context_params.preferred_backend), mirroring sf_backend (0 ==
+    // SF_BACKEND_CPU). Forwarded to Engine::load. On a CPU-only build the
+    // engine ignores it (no GPU backend compiled in) and selects CPU.
+    int                  preferred_backend_ = 0;
     std::unique_ptr<engine::Engine> engine_;
 };
 
@@ -516,7 +526,8 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
                             uint64_t vram_budget, uint64_t ram_budget,
                             std::unique_ptr<Model> &out,
                             PlacementPlan *out_plan, uint64_t cache_budget,
-                            RamMode mode, uint64_t target_ram_budget) {
+                            RamMode mode, uint64_t target_ram_budget,
+                            int preferred_backend) {
     StrataReader reader;
     if (!reader.open(path)) {
         log_warn("load_strata_model: cannot open .strata '" + path + "'");
@@ -785,7 +796,7 @@ sf_status load_strata_model(const std::string &path, const HardwareProfile &hw,
     out = std::unique_ptr<Model>(
         new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/true,
                       plan.expert_slots_resident, plan.kv_window,
-                      plan.trunk_pool_layers));
+                      plan.trunk_pool_layers, preferred_backend));
     return SF_OK;
 }
 
@@ -793,7 +804,7 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
                           uint64_t vram_budget, uint64_t ram_budget,
                           std::unique_ptr<Model> &out, PlacementPlan *out_plan,
                           uint64_t cache_budget, RamMode mode,
-                          uint64_t target_ram_budget) {
+                          uint64_t target_ram_budget, int preferred_backend) {
     ensure_backend();
     llama_log_set(sf_llama_log_cb, nullptr);
 
@@ -802,7 +813,7 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
     if (is_strata_file(path)) {
         return load_strata_model(path, hw, vram_budget, ram_budget, out,
                                  out_plan, cache_budget, mode,
-                                 target_ram_budget);
+                                 target_ram_budget, preferred_backend);
     }
 
     llama_model_params mp = llama_model_default_params();
@@ -938,7 +949,7 @@ sf_status load_ggml_model(const std::string &path, const HardwareProfile &hw,
     out = std::unique_ptr<Model>(
         new GgmlModel(model, ctx, shape, eos, path, /*is_strata=*/false,
                       final_plan.expert_slots_resident, final_plan.kv_window,
-                      final_plan.trunk_pool_layers));
+                      final_plan.trunk_pool_layers, preferred_backend));
     return SF_OK;
 }
 

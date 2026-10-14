@@ -147,13 +147,23 @@ full GPU-accelerated COMPUTE is the enterprise roadmap track, not a claim here.
 The RAM side is the measured mechanism. What IS built and CPU-tested toward the
 GPU track (so the eventual GPU-compute step plugs into an exercised seam, not a
 blank one): GPU discovery into `HardwareProfile::gpus`, the planner's VRAM-first
-trunk/expert placement (`trunk_layers_in_vram` / `expert_slots_vram`), and the
-pure `derive_llama_placement` translation to `n_gpu_layers` + the routed-expert
+trunk/expert placement (`trunk_layers_in_vram` / `expert_slots_vram`), the pure
+`derive_llama_placement` translation to `n_gpu_layers` + the routed-expert
 CPU-offload override (whose regex already covers the fused `gate_up_exps`
-tensors), all unit-tested with no GPU (`test_llama_placement`, `test_planner`).
-The remaining hardware-gated work is wiring a GPU buffer type into the engine's
-`ggml_backend_sched` so the resident tier lands in VRAM for the `.strata` path;
-that cannot be built or validated in the CPU-only sandbox. See
+tensors), and - new - the engine's SELECTABLE compute backend: a
+`STRATAFLOW_GPU=off|cuda|metal|vulkan` build option (default `off`) that wires
+the vendored ggml backends from the top-level CMake, a runtime backend selector
+over the backend-agnostic ggml-backend DEVICE/REGISTRY API that picks the first
+available GPU and ALWAYS falls back to CPU, resident buffers allocated from the
+selected backend's buffer type, and a single host-or-device `stage_write`
+primitive that turns the per-token expert "fault bytes into the resident region"
+step into a host->device upload on a GPU backend. All of this is unit-tested
+with no GPU (`test_llama_placement`, `test_planner`, and the new
+`test_backend_selection`, which proves the engine selects CPU and decodes
+byte-identically to the oracle on a CPU-only build). The remaining hardware-gated
+work is the actual GPU-COMPUTE validation (and streamed-trunk-on-GPU / full
+`ggml_backend_sched` multi-tier splitting) on real GPU hardware; it cannot be
+built or run-validated in the CPU-only sandbox. See
 [`ROADMAP.md`](./ROADMAP.md) "Enterprise / multi-GPU execution".
 
 The projected peak the planner reports is now a RECALIBRATED, honest estimate.

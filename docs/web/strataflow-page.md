@@ -224,11 +224,19 @@ Honest open items:
 - GPU backends are structurally reachable but need real GPU hardware to
   validate. The VRAM-placement decision an eventual GPU path consumes is already
   built and CPU-unit-tested (GPU discovery, VRAM-first trunk/expert placement,
-  and the pure plan-to-`n_gpu_layers` translation); what remains, and is
-  hardware-gated, is wiring a GPU buffer type into the engine so the resident
-  tier lands in VRAM. Enterprise GPU acceleration - single-GPU first, then
-  multi-GPU scale-out for high-throughput serving - is planned future work, not a
-  shipped feature; the no-GPU CPU path remains the proven core.
+  and the pure plan-to-`n_gpu_layers` translation), and the engine's compute
+  backend is now SELECTABLE: a `STRATAFLOW_GPU=off|cuda|metal|vulkan` build
+  option (default `off`) wires the vendored ggml backends, a runtime selector
+  picks the first available GPU and always falls back to CPU, resident buffers
+  move to the selected backend's buffer type, and a single host-or-device
+  `stage_write` primitive turns the per-token expert "fault bytes resident" step
+  into a host->device upload on a GPU backend. On the default CPU-only build the
+  whole GPU path compiles out and decode is byte-identical to the oracle, proven
+  by `test_backend_selection`. What remains, and is hardware-gated, is the actual
+  GPU-COMPUTE validation on real hardware. Enterprise GPU acceleration -
+  single-GPU first, then multi-GPU scale-out for high-throughput serving - is
+  planned future work, not a shipped feature; the no-GPU CPU path remains the
+  proven core.
 - No tagged release and no OpenAI-compatible HTTP server front-end yet.
 
 The mechanism is proven on real hardware; settled real large-model throughput is

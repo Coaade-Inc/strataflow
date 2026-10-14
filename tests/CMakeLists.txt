@@ -140,3 +140,17 @@ sf_add_test(test_compressed_strata)
 # untouched, so no overrun), and prints a measured decompress GiB/s summary
 # line. Pure library test, no fixture env, always runs. Plain sf_add_test.
 sf_add_test(test_lz_codec)
+
+# test_backend_selection is the FEAT-003 selectable-compute-backend gate: on a
+# CPU-only build (STRATAFLOW_GPU_ENABLED=0, the default) - or a GPU build on a
+# machine with no GPU - it proves the engine SELECTS the CPU backend for the
+# default load, an explicit SF_BACKEND_CPU, AND an SF_BACKEND_CUDA hint (which
+# must fall back to CPU, never fail the load because a GPU is absent), and that
+# the selectable-backend refactor is a bit-for-bit NO-OP on CPU: the decoded
+# greedy sequence + per-step logits are byte-identical (max|delta|==0.0) to the
+# libllama oracle and between the default and explicit-CPU loads. The GPU
+# compute path is NOT exercised here (it requires real hardware the sandbox/CI
+# lacks); this gate validates only the CPU-selection invariant. Only drives the
+# library (engine + oracle) and reuses the MoE fixture via STRATAFLOW_TEST_MOE_GGUF
+# (same skip-when-absent pattern), so a plain sf_add_test suffices.
+sf_add_test(test_backend_selection)

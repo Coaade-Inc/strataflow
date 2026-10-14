@@ -757,13 +757,30 @@ most are pure CPU/disk work.
         small-GPU + big-MoE offloads experts, whole-working-set-in-VRAM keeps
         experts resident, dense never offloads, `n_gpu_layers` clamps to the
         layer count) and the planner's VRAM-pressure cases in `test_planner`.
-    HONEST SCOPE: this only drives the NON-authoritative plain-GGUF libllama
-    sidecar today; the authoritative `.strata` engine decode is still CPU-only
-    (`n_gpu_layers = 0` in `engine.cpp`). The remaining, hardware-gated work is
-    the actual GPU-compute step - wiring a GPU buffer type into the engine's
-    `ggml_backend_sched` and the SSD->RAM->VRAM transfer nodes so the resident
-    tier lands in VRAM for the `.strata` path - which cannot be built or
-    validated in the CPU-only sandbox/CI.
+    SELECTABLE-BACKEND SEAM NOW IN PLACE (CPU-validated, not GPU-validated).
+    The engine's ggml compute backend is SELECTABLE: a `STRATAFLOW_GPU=off|cuda|
+    metal|vulkan` CMake option (default `off`) wires the vendored ggml backends
+    from the top-level CMake and defines compile-time guards on the engine TU,
+    and at runtime the engine picks the first available GPU ggml backend via the
+    backend-agnostic ggml-backend DEVICE/REGISTRY API (falling back to CPU when
+    none is compiled in or present). When a GPU is selected the gallocr and
+    every resident buffer (trunk `wbuf`, KV `kvbuf`, expert staging `estbuf`) are
+    allocated from the selected backend's default (device) buffer type, and the
+    per-token expert "fault bytes into the resident region" step becomes a
+    host->device upload (`ggml_backend_tensor_set`) through a single
+    host-or-device `stage_write` primitive. The planner VRAM budget and the C
+    ABI `preferred_backend` are plumbed to `Engine::load`. For this first
+    increment, when a GPU is selected the whole resident set runs in VRAM and
+    the streamed trunk is forced resident (streamed-trunk-on-GPU is a follow-on);
+    the per-token EXPERT upload seam is device-correct regardless.
+    HONEST SCOPE: on the default CPU-only build the whole GPU path compiles out,
+    the engine selects CPU, and decode is byte-identical to before and the
+    oracle (`max|delta| = 0.000e+00`), proven by `test_backend_selection` (CPU
+    selection + byte-identity) under GCC + Clang `-Werror`. The remaining,
+    hardware-gated work is the actual GPU-COMPUTE validation (and
+    streamed-trunk-on-GPU / multi-tier `ggml_backend_sched` splitting), which
+    cannot be built or run-validated in the CPU-only sandbox/CI and must be
+    exercised on real GPU hardware.
   - [ ] **Multi-GPU parallelism.** Expert / tensor / pipeline parallelism across
     devices; a device-placement policy deciding which layers and experts live on
     which GPU; NVLink / PCIe topology-aware placement so transfers follow the
