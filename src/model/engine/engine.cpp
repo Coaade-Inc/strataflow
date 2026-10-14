@@ -1119,6 +1119,38 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     ggml_tensor *dg0  = ggml_get_tensor(im.wctx, "blk.0.ffn_gate.weight");
     im.is_moe = (ge0 != nullptr && hp.n_expert > 0);
 
+#if STRATAFLOW_GPU_ENABLED
+    // FEAT-003 follow-on (plain-GGUF MoE on a GPU backend): on the plain-GGUF
+    // path (im.reader == nullptr) a MoE model serves its experts from the
+    // RESIDENT wctx weight tensors, and the per-token fault reads those tensors'
+    // bytes host-side (static_cast<uint8_t*>(src_gate->data) + e*nb02 in
+    // ensure_layer_experts_resident / warm_expert / pf_read_bundle). That
+    // host-side read is only valid when wctx is a graph leaf the compute backend
+    // reads directly - i.e. the CPU backend. The GPU-supported first-increment
+    // path is the .strata STREAMING path (host StrataReader -> stage_write
+    // host->device upload), which is unaffected. Rather than silently misbehave,
+    // force this one case (GPU backend + plain GGUF + MoE) back to the CPU
+    // backend for the whole model and say so plainly. Dense GGUF and every
+    // .strata load (including .strata-on-GPU) are untouched. This runs BEFORE
+    // any resident buffer (kvbuf/estbuf) is allocated from the backend buffer
+    // type, so the fallback is coherent (no device buffer was allocated yet on
+    // the GGUF path; wbuf is .strata-only). Plain-GGUF MoE on GPU is a follow-on.
+    if (im.is_gpu && im.reader == nullptr && im.is_moe) {
+        log_warn("engine: plain-GGUF MoE on a GPU backend is a follow-on - the "
+                 "GPU-supported path is the .strata streaming path; forcing CPU "
+                 "compute for this model");
+        ggml_backend_free(im.backend);
+        im.backend      = ggml_backend_cpu_init();
+        im.is_gpu       = false;
+        im.backend_name = "cpu";
+        if (im.backend == nullptr) {
+            log_warn("engine: CPU backend init failed; staying on libllama path");
+            return nullptr;
+        }
+        ggml_backend_cpu_set_n_threads(im.backend, 1);
+    }
+#endif
+
     hp.n_vocab = static_cast<int>(tok_embd->ne[1]);
     if (hp.n_embd == 0) hp.n_embd = static_cast<int>(tok_embd->ne[0]);
 

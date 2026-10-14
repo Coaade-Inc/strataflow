@@ -777,7 +777,14 @@ most are pure CPU/disk work.
     ABI `preferred_backend` are plumbed to `Engine::load`. For this first
     increment, when a GPU is selected the whole resident set runs in VRAM and
     the streamed trunk is forced resident (streamed-trunk-on-GPU is a follow-on);
-    the per-token EXPERT upload seam is device-correct regardless.
+    the per-token EXPERT upload seam is device-correct regardless. The
+    GPU-supported first-increment path is the `.strata` STREAMING path (host
+    `StrataReader` -> host->device `stage_write` upload); a plain-GGUF MoE on a
+    GPU backend serves its experts from the resident `wctx` weight tensors with a
+    host-side read, so for this first increment that one case (GPU backend +
+    plain GGUF + MoE) is forced back to the CPU compute backend with a clear log
+    line. Dense GGUF and every `.strata` load (including `.strata`-on-GPU) are
+    unaffected; plain-GGUF MoE on GPU is a follow-on.
     DONE (merged to main): the selectable-backend FOUNDATION - the
     `STRATAFLOW_GPU` build option, the runtime GPU-when-present selector with
     CPU fallback, the forward graph + resident buffers + expert-streaming upload
@@ -794,9 +801,10 @@ most are pure CPU/disk work.
     GPU decode has the SAME greedy token sequence as the CPU/oracle run and a
     per-logit delta within a documented tolerance (not bit-identity, because GPU
     arithmetic differs at the last ULPs). The remaining follow-on work is
-    streamed-trunk-on-GPU, multi-GPU sharding, fine VRAM-vs-RAM tiering, and
-    GPU-resident KV (multi-tier `ggml_backend_sched` splitting), which must be
-    exercised on real GPU hardware.
+    plain-GGUF-MoE-on-GPU (the `.strata` streaming path is the GPU-supported
+    one today), streamed-trunk-on-GPU, multi-GPU sharding, fine VRAM-vs-RAM
+    tiering, and GPU-resident KV (multi-tier `ggml_backend_sched` splitting),
+    which must be exercised on real GPU hardware.
   - [ ] **Multi-GPU parallelism.** Expert / tensor / pipeline parallelism across
     devices; a device-placement policy deciding which layers and experts live on
     which GPU; NVLink / PCIe topology-aware placement so transfers follow the
