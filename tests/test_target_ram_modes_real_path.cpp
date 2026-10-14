@@ -114,6 +114,7 @@ struct DecodeRun {
     std::vector<std::vector<float>> step_logits;
     uint64_t resident_kv_bytes = 0;
     uint64_t full_kv_bytes = 0;
+    uint64_t streamed_bytes = 0;  // per-token expert bytes streamed from disk
     bool ok = false;
 };
 
@@ -151,6 +152,7 @@ static DecodeRun decode_with_plan(const char *engine_path,
     }
     r.resident_kv_bytes = eng->resident_kv_bytes();
     r.full_kv_bytes = eng->full_kv_bytes();
+    r.streamed_bytes = eng->streamed_bytes();
     r.ok = true;
     return r;
 }
@@ -172,14 +174,25 @@ static double max_step_delta(const std::vector<std::vector<float>> &a,
 
 // Explicit tight target used directly as the usable ceiling (target_ram_budget
 // OVERRIDES the mode and is used as the exact ceiling, like an explicit
-// ram_budget). 1.2 GiB is BELOW the fixture's full-n_ctx KV (2 GiB at n_ctx=
-// 32768, head_count_kv=2) plus the other mandatory resident costs, so the
-// planner MUST step the KV window down AND engage adaptive per-layer trunk
-// streaming to fit. Verified on the fixture: at 1.2 GiB the plan reports
-// kv_window=512 and trunk stream[hot=4 layers], peak ~1 GiB. Because the target
-// is used verbatim as the ceiling, this is machine-independent (the profile's
-// real RAM does not change the explicit-target plan).
-static constexpr uint64_t kTightTargetBytes = 1288490188ull;  // 1.2 GiB
+// ram_budget). 700 MiB is tight enough that even a windowed KV plus the FULL
+// resident trunk cannot fit, so the planner MUST step the KV window down AND
+// hard-stream the per-layer attention trunk to fit - the COHERENT combination
+// (FEAT-002): when the trunk hard-streams the KV is ALSO windowed, the two
+// levers co-reduce. Verified on the fixture (full-n_ctx KV = 2 GiB at n_ctx=
+// 32768, head_count_kv=2; trunk ~46 MiB of which ~45 MiB is streamable attn):
+// at 700 MiB the plan reports kv_window=256 and trunk stream[hot=1 layers],
+// peak ~700 MiB, slots ~13. Because the target is used verbatim as the ceiling,
+// this is machine-independent (the profile's real RAM does not change the
+// explicit-target plan).
+//
+// FEAT-002 RETUNE NOTE: before the coherent retune, the previous value here was
+// 1.2 GiB, at which the planner USED to engage trunk streaming. After the
+// retune the KV window is budgeted against the FULL resident trunk, so at
+// 1.2 GiB the planner now (correctly) keeps the small trunk resident and only
+// windows the KV (trunk_pool_layers==0) - a COHERENT plan, but not one that
+// exercises the trunk-streaming lever. The 700 MiB target below forces trunk
+// streaming to engage AND proves the coherence invariant holds when it does.
+static constexpr uint64_t kTightTargetBytes = 734003200ull;  // 700 MiB
 
 // A TIGHT box whose INSTANTANEOUS free RAM is far below its total physical RAM
 // (free << total), which is exactly the Colab situation that inverted Max: the
@@ -273,6 +286,11 @@ static void test_target_ram_modes_real_path() {
     // conditional skip. The target above is dimensioned so streaming engages.
     CHECK(target_plan.trunk_pool_layers > 0u);
     CHECK(target_plan.trunk_pool_layers < shape.n_layers);
+    // FEAT-002 COHERENCE INVARIANT (hard): because the trunk is HARD-streaming
+    // (0 < trunk_pool_layers < n_layers) the KV MUST ALSO be windowed
+    // (0 < kv_window < n_ctx) - the two resident levers co-reduce; a plan must
+    // NEVER keep the full n_ctx KV resident while hard-streaming the trunk.
+    CHECK(target_plan.kv_window > 0u && target_plan.kv_window < shape.n_ctx);
 
     std::printf("[target: peak=%lluMiB usable=%lluMiB kv_window=%u "
                 "trunk_pool=%u slots=%u | n_ctx=%u n_layers=%u] ",
@@ -331,6 +349,20 @@ static void test_target_ram_modes_real_path() {
     // same construction-only guarantee the pure-function sweep covers, now on
     // the REAL load path so a re-fit regression would be caught end to end.
     CHECK(max_plan.planned_peak_bytes <= max_plan.usable_ram_bytes);
+
+    // FEAT-002 COHERENCE INVARIANT on BOTH AUTO and MAX (hard): neither mode may
+    // keep the full n_ctx KV resident while hard-streaming the trunk. If the
+    // trunk hard-streams (0 < trunk_pool_layers < n_layers) the KV window must
+    // be windowed (0 < kv_window < n_ctx). This holds trivially when the trunk
+    // is fully resident (trunk_pool_layers == 0).
+    if (auto_plan.trunk_pool_layers > 0u &&
+        auto_plan.trunk_pool_layers < shape.n_layers) {
+        CHECK(auto_plan.kv_window > 0u && auto_plan.kv_window < shape.n_ctx);
+    }
+    if (max_plan.trunk_pool_layers > 0u &&
+        max_plan.trunk_pool_layers < shape.n_layers) {
+        CHECK(max_plan.kv_window > 0u && max_plan.kv_window < shape.n_ctx);
+    }
 
     std::printf("[auto: peak=%lluMiB usable=%lluMiB kv_window=%u trunk_pool=%u "
                 "slots=%u streamed? %d | max: peak=%lluMiB usable=%lluMiB "
@@ -455,6 +487,35 @@ static void test_target_ram_modes_real_path() {
     // The tight target engaged the KV window, so its resident KV is strictly
     // below the full reservation (the FIT win, proven byte-identical below).
     CHECK(target_run.resident_kv_bytes < target_run.full_kv_bytes);
+
+    // FEAT-002 STREAMED-BYTES/TOKEN DROP (hard). The coherent AUTO retune caches
+    // materially MORE experts than the old 2-bundle baseline (slots=104 here vs
+    // 2), which directly cuts how many expert bundles are re-streamed per token.
+    // Decode the SAME prompt with a forced 2-slot pool (the old baseline that
+    // re-streams almost every routed expert every token) and with AUTO's large
+    // pool, and assert the per-token streamed-expert bytes DROP. Byte-identity
+    // is unaffected (both runs compute the same bytes); only HOW MANY are read
+    // from disk changes. A larger resident pool must stream strictly fewer
+    // expert bytes per decoded token.
+    const int n_decoded = n_generate + static_cast<int>(prompt_ids.size());
+    DecodeRun small_pool = decode_with_plan(
+        strata_path.c_str(), prompt_ids, n_generate,
+        /*expert_slots=*/static_cast<uint32_t>(shape.n_experts_used),
+        auto_plan.kv_window, auto_plan.trunk_pool_layers);
+    CHECK(small_pool.ok);
+    // auto_run above decoded with AUTO's large pool (slots=104); reuse it.
+    CHECK(auto_plan.expert_slots_resident > shape.n_experts_used);
+    if (small_pool.ok && n_decoded > 0) {
+        const double small_per_tok =
+            static_cast<double>(small_pool.streamed_bytes) / n_decoded;
+        const double auto_per_tok =
+            static_cast<double>(auto_run.streamed_bytes) / n_decoded;
+        std::printf("[streamed/token: 2-slot=%.0fB auto(%u-slot)=%.0fB] ",
+                    small_per_tok, auto_plan.expert_slots_resident,
+                    auto_per_tok);
+        // The larger pool re-streams strictly fewer expert bytes per token.
+        CHECK(auto_run.streamed_bytes < small_pool.streamed_bytes);
+    }
 
     std::vector<int32_t> oracle_tokens;
     std::vector<std::vector<float>> oracle_step_logits;
