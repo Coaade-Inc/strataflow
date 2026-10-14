@@ -9,6 +9,52 @@ grouped by the pull request that merged them.
 
 ## Unreleased
 
+### Fixes
+
+- MAX now CLAMPS to the largest fitting plan instead of REFUSING on a 12-13
+  GiB-class box (`src/plan/planner.cpp`). RamMode::Max (and Auto) are MODES, not
+  numeric ceilings: a pure mode run (`target_ram_budget == 0` AND
+  `ram_budget == 0`) now ALWAYS converges on the largest plan that FITS physical
+  RAM and never refuses while the minimal config fits. The regression: on a
+  Mixtral geometry whose full-`n_ctx` KV (8 GiB) + trunk + maximal experts
+  overflow physical RAM, MAX kept the FULL KV window (the step-down did not
+  engage because full KV + the minimal expert floor fit under MAX's larger
+  all-physical-RAM usable), then the MAX>=AUTO monotonicity clamp forced the
+  resident expert count up to the reference AUTO plan's (AUTO had windowed its KV
+  DOWN and bought MORE experts than MAX can hold at full KV) - overflowing usable
+  so the fit invariant set `fits=false`, the C ABI returned `SF_ERR_RUNTIME`, and
+  the CLI exited 1. THE FIX (one coherent clamp-not-refuse mechanism): when
+  holding at least AUTO's resident experts does not fit at MAX's current (larger)
+  KV window, MAX steps its KV window DOWN to AT LEAST AUTO's (bounded by the
+  smallest safe window) and adopts at least AUTO's trunk pool, then sizes the
+  resident expert count from the remainder (never below AUTO's). Because AUTO
+  already fits inside `auto.usable <= max.usable` with its windowed lever set,
+  adopting at least AUTO's levers always lands a fitting MAX plan whenever AUTO
+  fits. A general MODE-path backstop windows the KV, streams the trunk, and caps
+  experts from the remainder for any mode path whose natural plan would overflow,
+  so Auto never refuses either. The LOUD refusal (`fits=false` + the honest
+  `refusal_reason` naming the floor) is now reachable ONLY for an EXPLICIT
+  numeric ceiling (`target_ram_budget` or `ram_budget > 0`) pinned below the
+  achievable floor; that wording/floor computation is UNCHANGED. Preserves the
+  MAX>=AUTO monotonicity (`max.resident >= auto.resident`, `max KV window >=
+  auto`, `max trunk pool >= auto`), the fit invariant (`planned_peak_bytes <=
+  usable_ram_bytes` for every returned fitting plan), and byte-identity to the
+  libllama oracle (residency/placement/sizing only - never which bytes compute or
+  the graph order). On the synthetic 13 GiB repro (full KV 8 GiB, 32 layers x 8
+  experts ~72 MiB, 0.5 GiB trunk): BEFORE MAX refused (natural peak 14630 MiB vs
+  usable 13312 MiB, floor 2510 MiB) while AUTO fit (peak 10343 MiB, 57 slots,
+  `kv_window=16384`); AFTER MAX fits (peak 10518 MiB `<=` 13312 MiB, 57 slots,
+  `kv_window=16384`, trunk fully resident), monotonic with AUTO on every lever.
+  Full matrix green: GCC 11.5 + Clang 15 `-Werror`, release + debug ctest 22/22
+  (incl. the two new regression tests `test_max_clamps_not_refuses_12gb` and
+  `test_max_clamps_not_refuses_real_path`), and the gated real-load path
+  (`test_target_ram_modes_real_path`) byte-identical across AUTO/TARGET/MAX
+  (`max|delta| = 0.000e+00`, oracle `5.179e-02 < 1e-1`). The planner is a pure
+  function with no threads, so there is no TSan concern for this change. The real
+  ~19 GB Mixtral MAX run on the 12 GiB Colab box is Colab-verified separately;
+  the fix and the geometry regression are proven end-to-end in-sandbox. No change
+  to `third_party/llama.cpp`; no new feature.
+
 ### Features
 
 - AUTO coherent retune + lossless batched/sequential expert reads +

@@ -43,8 +43,25 @@ namespace sf {
 //     clamps Max up to at least Auto's residency when full KV + maximal experts
 //     cannot otherwise coexist).
 //
+//     CLAMP, NEVER REFUSE (task-max-mode-clamp-not-refuse). Max (like Auto) is a
+//     MODE, not a numeric ceiling: it must ALWAYS converge on the LARGEST plan
+//     that FITS physical RAM, never refuse. When the full-n_ctx KV + maximal
+//     experts overflow all-physical-RAM, Max steps its KV window DOWN (at least
+//     to Auto's window, bounded by the smallest safe window) and/or engages
+//     trunk streaming (at least as hard as Auto) so that holding >= Auto's
+//     residency fits, then sizes the resident expert count from the remainder
+//     (never below Auto's). Because Auto already fits inside auto.usable <=
+//     max.usable with its windowed lever set, adopting at least Auto's levers
+//     always lands a fitting Max plan whenever Auto fits - so on any box where
+//     the minimal config fits, Max returns fits=true. This is residency/sizing
+//     only (lossless KV paging, bounded hot trunk, fewer resident bundles); it
+//     never changes which bytes compute, so output stays byte-identical.
+//
 // An explicit target_ram_budget (bytes, see plan_placement) OVERRIDES the mode:
-// it is used directly as the exact usable ceiling regardless of Auto/Max.
+// it is used directly as the exact usable ceiling regardless of Auto/Max, and
+// is the ONLY path that can refuse (fits=false) - when the minimal achievable
+// floor exceeds that explicit ceiling. A pure Auto/Max mode run never refuses
+// while the minimal config fits physical RAM.
 enum class RamMode { Auto, Max };
 
 struct ModelShape {
@@ -188,11 +205,23 @@ struct PlacementPlan {
 //      else ram_free_bytes, else the unknown-profile fallback) WITHOUT the
 //      conservative shave, so the plan holds the full KV window + maximal
 //      experts + trunk fully resident when all-RAM affords it. Monotonic vs
-//      Auto on the same machine (never fewer residents / more streaming).
+//      Auto on the same machine (never fewer residents / more streaming). When
+//      the full-resident plan overflows all-physical-RAM, Max CLAMPS to the
+//      largest fitting plan (step KV window down to at least Auto's, stream the
+//      trunk, cap experts from the remainder) rather than refusing.
 //   5. mode == RamMode::Auto (the DEFAULT) - the conservative good-neighbor
 //      usable_ram() share that leaves headroom for other apps.
 // The zero-RAM / unknown-profile path always yields a non-zero usable budget
 // (never collapses to 0), in every mode.
+//
+// CLAMP-NOT-REFUSE INVARIANT (task-max-mode-clamp-not-refuse): the pure MODE
+// paths (target_ram_budget == 0 AND ram_budget == 0, i.e. Auto or Max) ALWAYS
+// return a fitting plan (fits=true, planned_peak_bytes <= usable_ram_bytes) when
+// the minimal config fits physical RAM; they never refuse. fits=false (the loud
+// refusal with refusal_reason naming the floor) is reachable ONLY for an
+// EXPLICIT numeric ceiling (target_ram_budget or ram_budget > 0) pinned below
+// the achievable floor. The MAX>=AUTO monotonicity and the fit invariant both
+// hold for every returned fitting plan.
 PlacementPlan plan_placement(const HardwareProfile &hw,
                              const ModelShape &model,
                              uint64_t vram_budget,

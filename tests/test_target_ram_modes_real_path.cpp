@@ -223,6 +223,142 @@ static HardwareProfile colab_profile() {
     return hw;
 }
 
+// task-max-mode-clamp-not-refuse FEAT-002 (TDD regression): a profile that
+// breaks the OTHER fixture-blindness - colab_profile() (3 GiB total) leaves
+// MAX's full-n_ctx-KV natural plan (peak ~2885 MiB) UNDER usable (~3072 MiB),
+// so the real 12-13 GiB-class Mixtral MAX refusal is never exercised on the
+// real load path. This profile is dimensioned (verified empirically on THIS
+// fixture) so the full natural MAX plan OVERFLOWS the usable ceiling while a
+// smaller plan FITS: at ram_total = 2.8 GiB (free 2.1 GiB) the current
+// (pre-fix) planner refuses MAX (natural peak ~2885 MiB vs usable ~2867 MiB,
+// floor ~695 MiB) while AUTO fits (peak ~1086 MiB, slots 256, kv_window 4096).
+// NOTE: the small fixture's absolute sizes differ from real Mixtral (its full
+// KV at head_count_kv=2 is ~2 GiB, not 8 GiB), so the OVERFLOW total is a few
+// GiB, not 12-13; the pure-function test (test_planner.cpp) carries the exact
+// 12-13 GiB reproduction. This profile proves the SAME failure mode - MAX's
+// natural full-KV plan overflowing usable and the planner refusing instead of
+// clamping - end to end on the real sf::load_model path.
+static HardwareProfile colab_max_overflow_profile() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = (2 * GiB) + (820ull * 1024 * 1024);   // 2.8 GiB total
+    hw.ram_free_bytes = (2 * GiB) + (100ull * 1024 * 1024);    // ~2.1 GiB free
+    return hw;
+}
+
+// FEAT-002 real-load-path reproduction of the MAX-must-clamp regression. On
+// colab_max_overflow_profile() the natural full-n_ctx-KV MAX plan overflows
+// usable, so RamMode::Max must CLAMP down to the largest plan that FITS (window
+// the KV, cap experts) with resident experts >= AUTO's (monotonic), NOT refuse.
+// These MAX-fits assertions FAIL against the current (pre-fix) planner, which
+// returns fits==false (SF_OK with max_plan.fits==false). The coexisting correct
+// behavior (an EXPLICIT target below the floor still refuses) stays green. The
+// existing byte-identity half lives in test_target_ram_modes_real_path(); this
+// test only pins the plan-geometry regression (no decode), so it runs from the
+// GGUF alone and needs no stacked oracle.
+static void test_max_clamps_not_refuses_real_path() {
+    const char *gguf = std::getenv("STRATAFLOW_TEST_MIXTRAL_GEOM_GGUF");
+    const char *strata_env = std::getenv("STRATAFLOW_TEST_MIXTRAL_GEOM_STRATA");
+    if ((gguf == nullptr || gguf[0] == '\0') &&
+        (strata_env == nullptr || strata_env[0] == '\0')) {
+        std::printf("[skipped: set STRATAFLOW_TEST_MIXTRAL_GEOM_GGUF or "
+                    "STRATAFLOW_TEST_MIXTRAL_GEOM_STRATA] ");
+        return;
+    }
+
+    std::string strata_path;
+    bool packed_here = false;
+    if (gguf != nullptr && gguf[0] != '\0') {
+        strata_path = std::string(gguf) + ".maxclamp.strata";
+        std::string err;
+        const bool packed = pack_gguf_to_strata(gguf, strata_path, &err);
+        CHECK(packed);
+        if (!packed) {
+            std::printf("[pack failed: %s] ", err.c_str());
+            return;
+        }
+        packed_here = true;
+    } else {
+        strata_path = strata_env;
+    }
+
+    ScopedEnv clear_win("STRATAFLOW_ENGINE_KV_WINDOW", "");
+    const HardwareProfile hw = colab_max_overflow_profile();
+
+    // AUTO: windows the KV down and fits its conservative share.
+    std::unique_ptr<Model> auto_model;
+    PlacementPlan auto_plan{};
+    const sf_status st_a =
+        load_model(strata_path, hw, /*vram=*/0, /*ram=*/0, auto_model,
+                   &auto_plan, /*cache_budget=*/0, RamMode::Auto,
+                   /*target_ram_budget=*/0);
+    CHECK_EQ(st_a, SF_OK);
+    CHECK(auto_model != nullptr);
+    if (auto_model == nullptr) {
+        if (packed_here) std::remove(strata_path.c_str());
+        return;
+    }
+    const ModelShape &shape = auto_model->shape();
+    CHECK(auto_plan.fits);
+    CHECK(auto_plan.planned_peak_bytes <= auto_plan.usable_ram_bytes);
+
+    // MAX: must CLAMP to the largest plan that FITS, never refuse. [FAILS
+    // pre-fix: the natural full-n_ctx-KV MAX plan overflows usable and the
+    // planner returns fits==false.]
+    std::unique_ptr<Model> max_model;
+    PlacementPlan max_plan{};
+    const sf_status st_m =
+        load_model(strata_path, hw, /*vram=*/0, /*ram=*/0, max_model, &max_plan,
+                   /*cache_budget=*/0, RamMode::Max, /*target_ram_budget=*/0);
+    CHECK_EQ(st_m, SF_OK);
+
+    std::printf("[max clamp real-path: AUTO fits=%d peak=%lluMiB usable=%lluMiB "
+                "slots=%u kv=%u | MAX fits=%d peak=%lluMiB usable=%lluMiB "
+                "slots=%u kv=%u] ",
+                auto_plan.fits ? 1 : 0,
+                static_cast<unsigned long long>(auto_plan.planned_peak_bytes >> 20),
+                static_cast<unsigned long long>(auto_plan.usable_ram_bytes >> 20),
+                auto_plan.expert_slots_resident, auto_plan.kv_window,
+                max_plan.fits ? 1 : 0,
+                static_cast<unsigned long long>(max_plan.planned_peak_bytes >> 20),
+                static_cast<unsigned long long>(max_plan.usable_ram_bytes >> 20),
+                max_plan.expert_slots_resident, max_plan.kv_window);
+    if (!max_plan.fits) {
+        std::printf("[MAX refusal: %s] ", max_plan.refusal_reason.c_str());
+    }
+
+    CHECK(max_model != nullptr);
+    CHECK(max_plan.fits);
+    CHECK(max_plan.planned_peak_bytes <= max_plan.usable_ram_bytes);
+
+    // Monotonicity vs AUTO on the real load path (normalize 0 == full).
+    CHECK(max_plan.usable_ram_bytes > auto_plan.usable_ram_bytes);
+    CHECK(max_plan.expert_slots_resident >= auto_plan.expert_slots_resident);
+    const uint32_t auto_win = auto_plan.kv_window ? auto_plan.kv_window : shape.n_ctx;
+    const uint32_t max_win = max_plan.kv_window ? max_plan.kv_window : shape.n_ctx;
+    CHECK(max_win >= auto_win);
+    const uint32_t auto_hot =
+        auto_plan.trunk_pool_layers ? auto_plan.trunk_pool_layers : shape.n_layers;
+    const uint32_t max_hot =
+        max_plan.trunk_pool_layers ? max_plan.trunk_pool_layers : shape.n_layers;
+    CHECK(max_hot >= auto_hot);
+
+    // COEXISTING CORRECT BEHAVIOR (stays green pre-fix): an EXPLICIT target
+    // below the achievable floor still refuses loudly, naming the floor. The
+    // clamp-not-refuse change for MODE paths must not touch this.
+    std::unique_ptr<Model> tiny_model;
+    PlacementPlan tiny_plan{};
+    const uint64_t kTooSmall = 64ull * 1024 * 1024;  // 64 MiB, below the floor
+    load_model(strata_path, hw, /*vram=*/0, /*ram=*/0, tiny_model, &tiny_plan,
+               /*cache_budget=*/0, RamMode::Auto,
+               /*target_ram_budget=*/kTooSmall);
+    CHECK(!tiny_plan.fits);
+    CHECK(!tiny_plan.refusal_reason.empty());
+    CHECK(tiny_plan.refusal_reason.find("floor") != std::string::npos);
+    std::printf("[explicit-below-floor refused honestly] ");
+
+    if (packed_here) std::remove(strata_path.c_str());
+}
+
 static void test_target_ram_modes_real_path() {
     const char *gguf = std::getenv("STRATAFLOW_TEST_MIXTRAL_GEOM_GGUF");
     const char *strata_env = std::getenv("STRATAFLOW_TEST_MIXTRAL_GEOM_STRATA");
@@ -567,6 +703,7 @@ static void test_target_ram_modes_real_path() {
 
 static void run_all() {
     RUN(test_target_ram_modes_real_path);
+    RUN(test_max_clamps_not_refuses_real_path);
 }
 
 TEST_MAIN()

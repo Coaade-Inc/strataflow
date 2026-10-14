@@ -547,12 +547,80 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
                         non_attn_trunk + per_layer_attn * trunk_pool_layers;
                 }
             }
-            // Re-fit the slot count to the (possibly raised) KV window + trunk
-            // so Max never overflows its own budget after the clamp: size slots
-            // from the remainder at the final reserved cost, but keep at least
-            // Auto's resident count (which is guaranteed to fit because Auto's
-            // whole config fits auto.usable <= max.usable). This preserves BOTH
-            // the fit invariant AND max.slots >= auto.slots.
+            // CLAMP-NOT-REFUSE (task-max-mode-clamp-not-refuse). The clamp above
+            // raised the KV window / trunk pool only when Auto's were LARGER /
+            // deeper than Max's. But the regression is the OPPOSITE case: Max
+            // kept the FULL (largest) KV window because full KV + the minimal
+            // expert floor fit under Max's larger all-physical-RAM usable, so
+            // the step-down never engaged. Holding at least Auto's resident
+            // experts at that FULL window then does NOT fit, and forcing slots
+            // up to Auto's count (below) used to overflow usable -> refusal.
+            //
+            // The fix: because Auto already fits inside auto.usable <=
+            // max.usable with ITS (windowed) lever set, adopting AT LEAST Auto's
+            // levers (its KV window, its trunk pool) is GUARANTEED to let Max
+            // hold >= Auto's residency under max.usable. So when >= Auto's
+            // experts cannot fit at Max's CURRENT (larger/full) KV window, step
+            // Max's KV window DOWN toward Auto's and adopt at least Auto's trunk
+            // pool, then size slots from the remainder (never below Auto's
+            // count). This keeps monotonicity (Max's window/pool land AT Auto's,
+            // i.e. >= Auto, and slots >= Auto) AND the fit invariant (peak <=
+            // usable) by construction. Lossless: the KV step-down only pages
+            // cold columns; residency/sizing only, never which bytes compute.
+            //
+            // Helper: does holding `want` resident experts fit `usable` at the
+            // current KV window + trunk? (reserved + experts <= usable, VRAM a
+            // separate pool.)
+            auto experts_fit = [&](uint64_t want) -> bool {
+                const uint64_t compute_w = compute_estimate_bytes(
+                    model, used_auto_window ? chosen_window : model.n_ctx);
+                const uint64_t reserved_w = trunk_in_ram_eff + kv_resident +
+                                            staging + compute_w +
+                                            process_floor + margin;
+                uint64_t room_w = usable > reserved_w ? usable - reserved_w : 0;
+                room_w += vram_left;
+                const uint64_t have =
+                    per_bundle > 0 ? room_w / per_bundle : want;
+                return have >= want;
+            };
+            // If >= Auto's experts do not fit at Max's current (larger) window /
+            // trunk, adopt Auto's window and trunk pool. Auto fit >=
+            // ref.expert_slots_resident experts within auto.usable, and
+            // max.usable >= auto.usable, so adopting Auto's levers always fits
+            // at least Auto's residency. We only step DOWN to AT MOST Auto's
+            // window / UP to AT LEAST Auto's pool depth, so Max stays >= Auto on
+            // every axis (monotonicity preserved).
+            if (!experts_fit(ref.expert_slots_resident) && model.n_ctx > 0) {
+                // Adopt Auto's KV window (step Max's window DOWN to Auto's).
+                if (ref.kv_window == 0) {
+                    used_auto_window = false;  // full n_ctx (Auto kept full)
+                    kv_resident = full_kv_bytes(model);
+                } else {
+                    used_auto_window = true;
+                    chosen_window = ref.kv_window;
+                    kv_resident = kv_bytes_for_window(model, ref.kv_window);
+                }
+                // Adopt Auto's trunk pool (stream at least as hard as Auto).
+                if (ref.trunk_pool_layers == 0) {
+                    trunk_pool_layers = 0;
+                    trunk_in_ram_eff = trunk_in_ram;
+                } else {
+                    trunk_pool_layers = ref.trunk_pool_layers;
+                    const uint64_t non_attn_trunk =
+                        trunk_in_ram > attn_trunk_total
+                            ? trunk_in_ram - attn_trunk_total
+                            : 0;
+                    trunk_in_ram_eff =
+                        non_attn_trunk + per_layer_attn * trunk_pool_layers;
+                }
+            }
+            // Re-fit the slot count to the (possibly stepped-down) KV window +
+            // trunk so Max never overflows its own budget after the clamp: size
+            // slots from the remainder at the final reserved cost, but keep at
+            // least Auto's resident count (which is guaranteed to fit because,
+            // after adopting at least Auto's levers above, Max holds Auto's
+            // whole config, which fit auto.usable <= max.usable). This preserves
+            // BOTH the fit invariant AND max.slots >= auto.slots.
             const uint64_t compute_clamped = compute_estimate_bytes(
                 model, used_auto_window ? chosen_window : model.n_ctx);
             const uint64_t reserved_clamped = trunk_in_ram_eff + kv_resident +
@@ -567,6 +635,90 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
             if (slots > affordable_clamped) slots = affordable_clamped;
             if (slots < ref.expert_slots_resident)
                 slots = ref.expert_slots_resident;
+            if (slots > full_slots) slots = full_slots;
+        }
+    }
+
+    // MODE-PATH CLAMP-NOT-REFUSE (task-max-mode-clamp-not-refuse). For a PURE
+    // mode run (no explicit target_ram_budget / ram_budget - the user picked
+    // Auto or Max, not a numeric ceiling) the planner must ALWAYS converge on
+    // the LARGEST plan that FITS usable, never refuse. The levers above (KV
+    // step-down, trunk streaming, expert sizing from the remainder) normally
+    // land a fitting plan, and the Max monotonicity clamp re-fits to Auto's
+    // lever set. This is a BACKSTOP: if a mode path's natural plan still
+    // projects a peak over usable, step the KV window DOWN to the largest that
+    // fits, engage maximal trunk streaming, and cap experts from the remainder
+    // so the fit holds - rather than setting fits=false. The honest LOUD
+    // refusal is reserved for an EXPLICIT numeric ceiling (target_ram_budget or
+    // ram_budget > 0) pinned below the achievable floor, handled below. This is
+    // residency/sizing only (lossless KV paging, bounded hot trunk, fewer
+    // resident expert bundles); it never changes which bytes compute.
+    const bool mode_path = (target_ram_budget == 0 && ram_budget == 0);
+    {
+        uint64_t peak_now = trunk_in_ram_eff + slots * per_bundle + kv_resident +
+                            staging +
+                            compute_estimate_bytes(
+                                model, used_auto_window ? chosen_window
+                                                        : model.n_ctx) +
+                            process_floor + margin;
+        if (mode_path && peak_now > usable && model.is_moe && per_bundle > 0) {
+            // 1) Step the KV window DOWN to the largest window that leaves room
+            //    for the minimal expert floor (lossless; cold columns page).
+            if (model.n_ctx > 0 && model.head_dim && model.n_head_kv) {
+                uint32_t w = 1;
+                while (w * 2u <= model.n_ctx) w *= 2u;  // largest pow2 <= n_ctx
+                for (; w >= kMinKvWindow; w /= 2u) {
+                    const uint64_t kvw = kv_bytes_for_window(model, w);
+                    const uint64_t compute_w = compute_estimate_bytes(model, w);
+                    const uint64_t fixed_w = trunk_in_ram_eff + staging +
+                                             process_floor + margin + compute_w +
+                                             lower_experts * per_bundle;
+                    if (fixed_w + kvw <= usable) {
+                        if (w < (used_auto_window ? chosen_window : model.n_ctx)) {
+                            chosen_window = w;
+                            kv_resident = kvw;
+                            used_auto_window = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            // 2) Engage maximal trunk streaming (hot pool = 1 layer) if the
+            //    attention trunk is streamable and the plan still overflows.
+            uint64_t compute_r = compute_estimate_bytes(
+                model, used_auto_window ? chosen_window : model.n_ctx);
+            uint64_t reserved_r = trunk_in_ram_eff + kv_resident + staging +
+                                  compute_r + process_floor + margin;
+            if (reserved_r + lower_experts * per_bundle > usable &&
+                per_layer_attn > 0) {
+                const uint64_t non_attn_trunk =
+                    trunk_in_ram > attn_trunk_total ? trunk_in_ram - attn_trunk_total
+                                                    : 0;
+                uint64_t fixed_wo_attn = non_attn_trunk + kv_resident + staging +
+                                         compute_r + process_floor + margin +
+                                         lower_experts * per_bundle;
+                const uint64_t room =
+                    usable > fixed_wo_attn ? usable - fixed_wo_attn : 0;
+                uint64_t fit_layers = room / per_layer_attn;
+                if (fit_layers < 1) fit_layers = 1;
+                if (fit_layers < model.n_layers) {
+                    trunk_pool_layers = static_cast<uint32_t>(fit_layers);
+                    trunk_in_ram_eff =
+                        non_attn_trunk + per_layer_attn * trunk_pool_layers;
+                }
+            }
+            // 3) Cap experts from the remainder at the (now reduced) reserved
+            //    cost, but keep the top-k floor resident.
+            compute_r = compute_estimate_bytes(
+                model, used_auto_window ? chosen_window : model.n_ctx);
+            reserved_r = trunk_in_ram_eff + kv_resident + staging + compute_r +
+                         process_floor + margin;
+            uint64_t room_r = usable > reserved_r ? usable - reserved_r : 0;
+            room_r += vram_left;
+            uint64_t affordable_r = room_r / per_bundle;
+            if (affordable_r > full_slots) affordable_r = full_slots;
+            if (slots > affordable_r) slots = affordable_r;
+            if (slots < lower_experts) slots = lower_experts;
             if (slots > full_slots) slots = full_slots;
         }
     }

@@ -735,8 +735,117 @@ static void test_auto_caches_more_experts() {
                 a.expert_slots_resident);
 }
 
+// ---------------------------------------------------------------------------
+// task-max-mode-clamp-not-refuse FEAT-002 (TDD regression): the real 12-13
+// GiB-class MAX refusal. On a Mixtral geometry whose FULL (natural max) resident
+// plan - full n_ctx KV (8 GiB) + trunk + maximal experts - exceeds physical RAM,
+// but a SMALLER plan (windowed KV / fewer experts) fits, RamMode::Max must
+// CLAMP down to the largest plan that FITS, NOT refuse. These assertions FAIL
+// against the current (pre-fix) planner, which keeps full KV under MAX's larger
+// usable ceiling, then the MAX>=AUTO monotonicity clamp forces slots up to the
+// reference AUTO plan's expert count, overflowing usable -> fits=false. The
+// coexisting correct behavior (an EXPLICIT target below the achievable floor
+// still refuses loudly) must stay green. FEAT-003 makes the MAX-fits assertions
+// pass; this feature only pins the failing regression.
+//
+// Geometry (verified in-sandbox to reproduce): full KV = 32*2*1024*4*32768 =
+// 8 GiB, 32 layers x 8 experts, expert ~72 MiB, trunk 0.5 GiB, attn_trunk 0. At
+// ram_total=13 GiB (free ~11.6 GiB): AUTO fits (peak ~10343 MiB, slots 57,
+// kv_window 16384) while MAX refuses (natural peak ~14630 MiB vs usable 13312
+// MiB, floor ~2510 MiB).
+static ModelShape mixtral_full_kv_overflow() {
+    ModelShape m;
+    m.name = "mixtral-max-clamp-repro";
+    m.n_layers = 32;
+    m.is_moe = true;
+    m.n_experts = 8;
+    m.n_experts_used = 2;
+    m.expert_bytes = static_cast<uint64_t>(72.0 * static_cast<double>(MiB));
+    m.attn_trunk_bytes = 0;   // nothing streamable: trunk stays resident
+    m.trunk_bytes = static_cast<uint64_t>(0.5 * static_cast<double>(GiB));
+    m.total_bytes = m.trunk_bytes +
+        uint64_t(m.n_experts) * m.n_layers * m.expert_bytes;
+    // REAL Mixtral KV geometry: n_ctx=32768, head_dim=128, n_head_kv=8 =>
+    // full KV = 32*2*(128*8)*4*32768 = 8 GiB.
+    m.n_ctx = 32768;
+    m.head_dim = 128;
+    m.n_head_kv = 8;
+    return m;
+}
+
+static void test_max_clamps_not_refuses_12gb() {
+    HardwareProfile hw;
+    hw.ram_total_bytes = 13 * GiB;
+    hw.ram_free_bytes =
+        static_cast<uint64_t>((13.0 - 1.4) * static_cast<double>(GiB));
+
+    ModelShape m = mixtral_full_kv_overflow();
+    const uint32_t full_slots =
+        static_cast<uint32_t>(uint64_t(m.n_layers) * m.n_experts);  // 256
+    // Full n_ctx KV for this geometry = 8 GiB.
+    const uint64_t full_kv =
+        uint64_t(m.n_layers) * 2 * uint64_t(m.head_dim) * m.n_head_kv *
+        sizeof(float) * m.n_ctx;
+    CHECK_EQ(full_kv, 8ull * GiB);
+
+    PlacementPlan a = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                     /*cache=*/0, RamMode::Auto);
+    PlacementPlan x = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                     /*cache=*/0, RamMode::Max);
+
+    // BEFORE evidence: AUTO windows its KV down (buys more experts) and fits;
+    // MAX keeps full KV and is forced over usable by the monotonicity clamp.
+    std::printf("[max clamp 13GiB: AUTO fits=%d peak=%lluMiB usable=%lluMiB "
+                "slots=%u kv=%u | MAX fits=%d peak=%lluMiB usable=%lluMiB "
+                "slots=%u kv=%u] ",
+                a.fits ? 1 : 0,
+                static_cast<unsigned long long>(a.planned_peak_bytes / MiB),
+                static_cast<unsigned long long>(a.usable_ram_bytes / MiB),
+                a.expert_slots_resident, a.kv_window,
+                x.fits ? 1 : 0,
+                static_cast<unsigned long long>(x.planned_peak_bytes / MiB),
+                static_cast<unsigned long long>(x.usable_ram_bytes / MiB),
+                x.expert_slots_resident, x.kv_window);
+
+    // AUTO must fit (its good-neighbor share windows the KV and buys experts).
+    CHECK(a.fits);
+    CHECK(a.planned_peak_bytes <= a.usable_ram_bytes);
+
+    // MAX must CLAMP to the largest plan that FITS, never refuse. [FAILS pre-fix
+    // with a refusal: the natural MAX plan keeps full KV (kv_window=0) and the
+    // monotonicity clamp forces slots up to AUTO's count, overflowing usable.]
+    CHECK(x.fits);
+    CHECK(x.planned_peak_bytes <= x.usable_ram_bytes);
+
+    // Monotonicity vs AUTO: MAX holds >= experts resident, a KV window at least
+    // as large, and streams the trunk no harder. (Normalize 0 == full.)
+    CHECK(x.expert_slots_resident >= a.expert_slots_resident);
+    const uint32_t a_win = a.kv_window ? a.kv_window : m.n_ctx;
+    const uint32_t x_win = x.kv_window ? x.kv_window : m.n_ctx;
+    CHECK(x_win >= a_win);
+    const uint32_t a_hot =
+        a.trunk_pool_layers ? a.trunk_pool_layers : m.n_layers;
+    const uint32_t x_hot =
+        x.trunk_pool_layers ? x.trunk_pool_layers : m.n_layers;
+    CHECK(x_hot >= a_hot);
+    CHECK(x.expert_slots_resident <= full_slots);
+
+    // COEXISTING CORRECT BEHAVIOR (must stay green pre-fix): an EXPLICIT target
+    // below the achievable floor still refuses loudly, naming the floor. This
+    // documents that the clamp-not-refuse change for MODE paths does NOT touch
+    // the honest refusal for an explicit pinned-too-low target.
+    const uint64_t below_floor = 256 * MiB;
+    PlacementPlan refused = plan_placement(hw, m, /*vram=*/0, /*ram=*/0,
+                                           /*cache=*/0, RamMode::Auto,
+                                           /*target=*/below_floor);
+    CHECK(!refused.fits);
+    CHECK(!refused.refusal_reason.empty());
+    CHECK(refused.refusal_reason.find("floor") != std::string::npos);
+}
+
 static void run_all() {
     RUN(test_low_ram_streams);
+    RUN(test_max_clamps_not_refuses_12gb);
     RUN(test_auto_coherent_share_12gb);
     RUN(test_auto_caches_more_experts);
     RUN(test_small_moe_fully_resident);
