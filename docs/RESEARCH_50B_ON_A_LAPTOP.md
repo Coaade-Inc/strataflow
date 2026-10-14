@@ -107,9 +107,15 @@ StrataFlow now folds those three knobs into ONE dial. `--target-ram-gb 2` (ABI
 `target_ram_budget`, bytes) is used directly as the usable budget, and the
 planner drives the KV window, the adaptive per-layer trunk streaming, and the
 expert cache from it in one decision, so the same ~2.4 GiB manual experiment is
-now a single number the planner resolves. If a target is below the achievable
-floor the planner refuses LOUDLY, naming the floor, instead of OOM-killing the
-box. For the common case the user does not even pick a number:
+now a single number the planner resolves. An explicit target SHRINKS the KV
+window (the power-of-two step-down to the smallest safe window) and engages
+trunk streaming to hit the number; it fits achievable small targets rather than
+refusing them. If a target is genuinely below the achievable floor the planner
+refuses LOUDLY, and the refusal names the HONEST minimal-KV floor (the smallest
+safe window + maximal trunk streaming + the top-k experts) - for real Mixtral
+that true floor is ~2.x GiB (the user already proved 2406 MiB decodes at a
+2048-column window), NOT the full-`n_ctx` ~10 GiB figure the old estimate
+reported. For the common case the user does not even pick a number:
 
 - **Auto (the default, `--ram-mode auto`, ABI `ram_mode == SF_RAM_MODE_AUTO ==
   0`)** is the good-neighbor policy. It takes only the conservative `usable_ram`
@@ -118,14 +124,18 @@ box. For the common case the user does not even pick a number:
   decodes. It pulls the resident set down (KV window + trunk streaming) only as
   far as that share requires.
 - **Max (`--ram-mode max`, or `--max-performance`, ABI `ram_mode ==
-  SF_RAM_MODE_MAX == 1`)** is the opposite end: dedicate the machine. It uses all
-  available RAM (plus the full VRAM budget the planner places), a full KV window,
-  the maximal expert cache, and the trunk fully resident, minimizing streaming
-  and maximizing tok/s. Honest edge: max sizes to ACTUAL free RAM with no
-  conservative shave, so on a machine whose free RAM is already low while total
-  RAM is large, max's ceiling can land near or below the auto share (which can
-  fall back to avail/2 or the 85%-of-total cap); max holds at least as much as
-  auto only when free RAM is ample.
+  SF_RAM_MODE_MAX == 1`)** is the opposite end: dedicate the machine. It sizes
+  its usable ceiling from ALL PHYSICAL RAM (`ram_total_bytes`), NOT the
+  instantaneous free RAM, and holds the MAXIMUM experts resident with a full KV
+  window and the trunk fully resident, streaming the LEAST. Sizing from total
+  physical RAM makes Max MONOTONIC against Auto on the same machine:
+  `max.expert_slots_resident >= auto.expert_slots_resident`, Max's KV window is
+  at least Auto's (full when physical RAM affords it), and Max streams the trunk
+  no harder than Auto (`max.streamed <= auto.streamed`). Max is never inverted:
+  it never ends up with FEWER residents or MORE streaming than Auto. (The earlier
+  behavior sized Max from the instantaneous free RAM, so on a box where the big
+  model had already consumed RAM, Max resolved a tiny ceiling and held fewer
+  experts than Auto - that inversion is fixed.)
 
 Precedence (highest wins): the explicit low-level knobs
 (`STRATAFLOW_ENGINE_KV_WINDOW` / `--expert-slots` / `--cache-gb`) still win for
@@ -136,18 +146,37 @@ PLACEMENT, but the authoritative `.strata` engine decode is CPU-only today, so
 full GPU-accelerated COMPUTE is the enterprise roadmap track, not a claim here.
 The RAM side is the measured mechanism.
 
+The projected peak the planner reports is now a RECALIBRATED, honest estimate.
+It was previously ~2x the engine's real resident footprint (it printed "~10 GiB"
+for an auto run that really peaked ~5 GiB, and "~11 GiB" for a max run that
+really peaked ~2.2 GiB, because the conservative staging + compute + safety
+margin stacked on top of a full-KV charge). That over-estimate is WHAT made the
+explicit-target path refuse achievable targets. The estimate now tracks the
+engine's real windowed resident footprint (resident KV at the chosen window +
+resident experts + one-layer staging + trunk + process floor + a trimmed
+margin): slightly high so the fit invariant stays safe, no longer ~2x.
+
 What is proven where: the ~2.4 GiB absolute number on the real Mixtral is the
 user's Colab result and the `--target-ram-gb 2` equivalence is a Colab re-run to
 confirm (a projection). The sandbox proves the MECHANISM, the mode differences,
-and byte-identity through the REAL load path on a Mixtral-geometry fixture
-(`n_ctx` 32768, 32 layers, pack -> `.strata` -> `load_model` -> planner ->
-engine): an explicit ~1.2 GiB target fits at projected peak ~1228 MiB with
-`kv_window=512`, `trunk_pool_layers=4` (trunk streaming engaged) and `slots=5`;
-auto projects a lower peak than max (~3647 vs ~3756 MiB) on the ~12 GiB profile
-with a strictly smaller usable budget; and the greedy decode is byte-identical
-(`|delta| = 0.0`) across explicit-target, auto and max, and within the soft
-oracle bound for the random-weight fixture. The exact Colab commands and expected
-plan/stats for all three modes are in [`../colab/README.md`](../colab/README.md).
+the honest refusal floor, estimate sanity, and byte-identity through the REAL
+load path on a Mixtral-geometry fixture (`n_ctx` 32768, 32 layers, pack ->
+`.strata` -> `load_model` -> planner -> engine). On a tight 3 GiB-total /
+2.25 GiB-free simulated profile (free << total, so auto and max DIVERGE): AUTO
+resolves usable 1280 MiB, steps the KV window down to 8192 (`< n_ctx`), holds
+`slots=104`, and streams some experts; MAX resolves usable 3072 MiB (= all
+physical RAM, the fix), keeps a FULL KV window (`kv_window=0`), holds `slots=256`
+(the full working set), and streams nothing - so `max.slots > auto.slots`, Max's
+window is >= Auto's, and only Auto streams (Max monotonic, not inverted). An
+explicit achievable small target (~1.2 GiB) still FITS by shrinking the KV
+window + engaging trunk streaming (`fits=true`, `kv_window` in `(0, n_ctx)`,
+`trunk_pool_layers > 0`), while a genuinely-too-small target refuses with a
+floor built from the SMALLEST safe window (the refusal names a KV figure far
+below full KV, e.g. "KV window 256", not the full-`n_ctx` 2048/8192 MiB). The
+greedy decode is byte-identical (`|delta| = 0.0`) across explicit-target, auto
+and max, and within the soft oracle bound for the random-weight fixture. The
+exact Colab commands and expected plan/stats for all three modes are in
+[`../colab/README.md`](../colab/README.md).
 
 ---
 

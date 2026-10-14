@@ -397,20 +397,28 @@ On the real Mixtral-8x7B-Instruct Q3_K_M `.strata` (32 layers, 8 experts top-2,
 those three knobs into ONE dial, with two modes plus an explicit numeric target:
 
 - `--target-ram-gb X` (ABI `target_ram_budget`, bytes; 0 = use the mode): an
-  explicit RAM ceiling. The planner drives the KV window + adaptive trunk
-  streaming + expert cache so the projected peak fits X, even below the
-  trunk-resident floor, and REFUSES LOUDLY (naming the achievable floor) if X is
-  too small. Overrides the mode.
+  explicit RAM ceiling. The planner SHRINKS the KV window (the power-of-two
+  step-down to the smallest safe window) + engages adaptive trunk streaming +
+  sizes the expert cache so the projected peak fits X, even below the
+  trunk-resident floor, so an ACHIEVABLE small target FITS. It REFUSES LOUDLY
+  only when X is below the achievable floor, and the refusal names the HONEST
+  minimal-KV floor (smallest safe window + maximal trunk streaming + the top-k
+  experts) - for real Mixtral the true floor is ~2.x GiB (not the full-`n_ctx`
+  ~10 GiB the old estimate reported). Overrides the mode.
 - `--ram-mode auto` (the DEFAULT, no flag needed; ABI `ram_mode ==
   SF_RAM_MODE_AUTO == 0`): the good-neighbor share. It takes only the
   conservative `usable_ram` (`free - max(1 GiB, 12.5%)`, capped at 85% of total),
   leaving headroom so other apps keep running while the model decodes.
 - `--ram-mode max` (or `--max-performance`; ABI `ram_mode == SF_RAM_MODE_MAX ==
-  1`): dedicate the machine. All available RAM (plus the full VRAM budget the
-  planner places), full KV window, maximal expert cache, trunk fully resident,
-  minimal streaming, maximal tok/s. (Max sizes to ACTUAL free RAM with no shave,
-  so on a box with little free but large total RAM its ceiling can land near or
-  below the auto share; max >= auto only when free RAM is ample.)
+  1`): dedicate the machine. It sizes its usable ceiling from ALL PHYSICAL RAM
+  (`ram_total_bytes`), NOT the instantaneous free RAM, and holds the MAXIMUM
+  experts resident + full KV window + trunk fully resident, streaming the LEAST
+  for the highest tok/s. Sizing from total physical RAM makes Max MONOTONIC
+  against Auto on the same machine: `max` holds at least as many experts
+  resident as `auto`, a KV window at least as large, and streams no harder
+  (`max.streamed <= auto.streamed`). Max is never inverted (never fewer
+  residents / more streaming than auto); the earlier free-RAM sizing that caused
+  that inversion is fixed.
 
 Precedence (highest wins): the low-level knobs
 (`STRATAFLOW_ENGINE_KV_WINDOW` / `--expert-slots` / `--cache-gb`) >
@@ -420,15 +428,23 @@ engine decode is CPU-only today, so full GPU-accelerated compute is enterprise
 roadmap work, not something these modes turn on. The RAM side is the proven,
 measured mechanism.
 
-- **Sandbox-proven (offline, in CI):** the MECHANISM, the mode differences, and
-  byte-identity through the REAL load path on a Mixtral-geometry fixture
-  (`n_ctx` 32768, 32 layers, pack -> `.strata` -> `load_model` -> planner ->
-  engine): an explicit ~1.2 GiB target fits at projected peak ~1228 MiB with
-  `kv_window=512`, `trunk_pool_layers=4` (trunk streaming engaged), `slots=5`;
-  auto on a ~12 GiB / ~10.6 free profile projects peak ~3647 MiB (usable
-  ~9520 MiB), full KV window, trunk resident, `slots=256`; max projects peak
-  ~3756 MiB (usable ~10880 MiB), full KV, trunk resident, `slots=256`; the
-  invariants `max.usable > auto.usable` and `auto.peak < max.peak` hold and the
+- **Sandbox-proven (offline, in CI):** the MECHANISM, the mode differences, the
+  honest refusal floor, estimate sanity, and byte-identity through the REAL load
+  path on a Mixtral-geometry fixture (`n_ctx` 32768, 32 layers, pack ->
+  `.strata` -> `load_model` -> planner -> engine). On a tight 3 GiB-total /
+  2.25 GiB-free profile (free << total, so auto and max DIVERGE): AUTO resolves
+  usable 1280 MiB, steps the KV window down to 8192 (`< n_ctx`), holds
+  `slots=104`, and streams some experts; MAX resolves usable 3072 MiB (= all
+  physical RAM, the fix), keeps a FULL KV window (`kv_window=0`), holds
+  `slots=256`, and streams nothing - so `max.slots (256) > auto.slots (104)`,
+  Max's window >= Auto's, and only Auto streams (Max monotonic, not inverted).
+  An explicit achievable ~1.2 GiB target still FITS by shrinking the KV window +
+  engaging trunk streaming (`fits=true`, `kv_window` in `(0, n_ctx)`,
+  `trunk_pool_layers > 0`); a genuinely-too-small target refuses with a floor
+  built from the SMALLEST safe window (the refusal names a KV figure far below
+  full KV, e.g. "KV window 256", not full-`n_ctx` 2048 MiB). The projected peak
+  is a recalibrated estimate (no longer ~2x the engine's real resident
+  footprint, and strictly below the same plan sized with full-`n_ctx` KV). The
   greedy decode is byte-identical (`max|delta| = 0.000e+00`) across all three
   modes and within the soft oracle bound.
 - **Colab-only (real Mixtral):** the absolute ~2.4 GiB peak RSS and the
@@ -455,30 +471,51 @@ measured mechanism.
   decode; absolute GiB are hardware-dependent on the free runtime, so compare the
   three on the SAME model and prompt):
 
-  - `--target-ram-gb 2`: an aggressive plan line, e.g. `... experts STREAMED
-    (bounded), kv window=2048, trunk stream[hot=... layers], est. peak ~2 GiB`,
-    with a `stats:` line showing a small windowed `resident_kv`, resident model
-    weights at the bounded hot trunk pool, a non-zero `streamed`, and `peak RSS`
-    near ~2.4 GiB (matching the old `STRATAFLOW_ENGINE_KV_WINDOW=2048
-    --expert-slots 8 --cache-gb 1` run), decoded text byte-identical to the other
-    two modes.
-  - auto (default, no flag): a good-neighbor plan line that leaves RAM free, with
-    a `stats:` line whose `peak RSS` is bounded below the conservative usable
-    share (so other apps keep running) and strictly below the max run, resident
-    weights and `streamed` between the target and max runs.
-  - `--ram-mode max`: a full-resident plan line (full `kv window`, no `trunk
-    stream[hot=...]` segment when the trunk stays resident), with a `stats:` line
-    showing the full `resident_kv`, the whole trunk resident, `streamed` at its
-    lowest, the highest `peak RSS`, and the highest tok/s.
+  - `--target-ram-gb 2`: this now FITS (not the pre-fix ~10 GiB refusal) if 2.0
+    GiB is at or above the model's true floor. Expect an aggressive plan line,
+    e.g. `... experts STREAMED (bounded), kv window=2048, trunk stream[hot=...
+    layers], est. peak ~2 GiB`, with a `stats:` line showing a small windowed
+    `resident_kv`, resident model weights at the bounded hot trunk pool, a
+    non-zero `streamed`, and `peak RSS` near ~2.4 GiB (matching the old
+    `STRATAFLOW_ENGINE_KV_WINDOW=2048 --expert-slots 8 --cache-gb 1` run),
+    decoded text byte-identical to the other two modes. If 2.0 GiB is BELOW the
+    true floor (the user's manual experiment landed at ~2.4 GiB, so the honest
+    floor is ~2.4 GiB), the planner now REFUSES with an HONEST message naming
+    that floor and its minimal-KV config (smallest safe window + maximal trunk
+    streaming + top-k experts) - NOT the old dishonest full-`n_ctx` ~10 GiB
+    figure. In that case raise the target to at least the named floor, e.g.
+    `--target-ram-gb 2.4` or `--target-ram-gb 3`, and it fits:
 
-  Keep it honest: the absolute real-Mixtral GiB per mode are the Colab re-run;
-  the sandbox proves the mechanism, the mode differences (max uses more RAM /
-  streams fewer bytes than auto; auto leaves a good-neighbor margin below max
-  when free RAM is ample), and that the decoded text is byte-identical across
-  all three modes. Honest edge: max sizes to actual free RAM with no shave, so
-  on a machine with little free but large total RAM max's ceiling can land near
-  or below the auto share (which can fall back to avail/2 or the 85%-of-total
-  cap); the max > auto ordering holds only when free RAM is ample.
+    ```bash
+    %%bash
+    cd /content/strataflow/build/release
+    # If --target-ram-gb 2 refuses naming a ~2.4 GiB floor, raise to >= that floor.
+    ./bin/strataflow --model /content/mixtral.strata \
+      --target-ram-gb 3 --max-tokens 16 --async-prefetch on --prompt "The city of"
+    ```
+
+  - auto (default, no flag): UNCHANGED good-neighbor behavior. Expect a plan line
+    that leaves RAM free with a `kv window` segment (~16384 on this box) and
+    `experts[resident=~44 bundles]`, and a `stats:` line whose `peak RSS` is
+    ~5 GiB (bounded below the conservative usable share so other apps keep
+    running) and strictly below the max run, with `resident weights` and
+    `streamed` between the target and max runs.
+  - `--ram-mode max`: a full-resident plan line that holds the MOST experts
+    resident (`experts[resident=...]` at or above auto's ~44), a full `kv window`
+    (no `trunk stream[hot=...]` segment, trunk resident), with a `stats:` line
+    showing the full `resident_kv`, `streamed` at its LOWEST (`streamed <=`
+    auto's), and the highest tok/s. Max is now MONOTONIC: more experts resident
+    and fewer streamed bytes than auto, never the inverted fewer-residents /
+    more-streaming the pre-fix build produced.
+
+  Keep it honest: the absolute real-Mixtral GiB per mode are the Colab re-run
+  (COLAB-ONLY); the sandbox proves the mechanism, the mode differences, the
+  honest refusal floor, and that the decoded text is byte-identical across all
+  three modes (SANDBOX-PROVEN). Max now sizes from ALL PHYSICAL RAM
+  (`ram_total_bytes`), so `max >= auto` resident and `max.streamed <=
+  auto.streamed` hold monotonically on the same machine - the earlier
+  free-RAM-sizing inversion (where max could land near or below the auto share)
+  is fixed.
 
 ### Which real model, and why
 
