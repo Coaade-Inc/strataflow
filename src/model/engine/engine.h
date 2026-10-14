@@ -168,6 +168,14 @@ public:
     // CPU-only build/machine.
     bool is_gpu_backend() const;
 
+    // FEAT-004: canonical name of the ACTIVE compute backend the engine
+    // selected at load, one of "cpu" | "cuda" | "metal" | "vulkan" | "hip" |
+    // "gpu". On a CPU-only build (STRATAFLOW_GPU_ENABLED==0, the default) this
+    // is ALWAYS "cpu". Lets the API/CLI plan surface report, honestly, the
+    // backend that actually ran the forward pass without the api/model layers
+    // including any ggml header above the sf::Model seam.
+    const std::string &active_backend_name() const;
+
     // Bytes of model WEIGHTS held resident in RAM (the trunk-weight backing
     // buffer). On the .strata streaming path this EXCLUDES the expert tensors
     // (they stream on demand), so it is the hard proof that a huge MoE's expert

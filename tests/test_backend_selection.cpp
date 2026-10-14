@@ -17,6 +17,14 @@
 //       the host-or-device stage_write primitive) reduces to exactly the
 //       pre-FEAT-003 CPU memcpy path.
 //
+// FEAT-004 extends this file with a HARDWARE-GATED GPU decode gate
+// (test_gpu_decode_matches_cpu_within_tolerance): when a GPU backend is
+// compiled in AND a GPU device is present it asserts the GPU decode has the
+// SAME greedy token SEQUENCE as the CPU/oracle run and a per-logit delta within
+// a documented tolerance (NOT bit-identity - see that function's WHY note). On
+// a CPU-only build / no device / no fixture it SKIPS CLEANLY and returns
+// success, so CI stays green. That gate is a no-op pass in this sandbox.
+//
 // Part (a) that needs no fixture always runs; the fixture-backed parts follow
 // the same STRATAFLOW_TEST_MOE_GGUF skip-when-absent pattern as
 // test_engine_oracle so the suite stays green in CI where the fixture is not
@@ -245,9 +253,111 @@ static void test_cpu_decode_byte_identical_to_oracle() {
     CHECK(max_eo < 1e-3);
 }
 
+// FEAT-004 explicit GPU-logit tolerance. GPU arithmetic (fused multiply-add,
+// different reduction order, vendor math libraries) differs from the CPU
+// reference at the last ULPs, so a GPU decode is NOT expected to be
+// bit-identical (max|delta| == 0.0) to the CPU/oracle run - demanding that
+// would make the gate impossible to pass on real hardware. Instead the gate is
+// (1) the GREEDY TOKEN SEQUENCE must match exactly (the user-visible output is
+// identical) and (2) the per-logit absolute delta must stay within this
+// tolerance band. 2e-2 is the same soft quant tolerance the engine-vs-oracle
+// K-quant gates use elsewhere in the suite; it comfortably covers GPU
+// last-ULP drift while still catching a real numerical regression.
+static constexpr double kGpuLogitTol = 2e-2;
+
+// FEAT-004 HARDWARE-GATED GPU DECODE GATE. This is the scaffolding that, on a
+// machine with a GPU backend compiled in (-DSTRATAFLOW_GPU=cuda|metal|vulkan)
+// AND a GPU device present, proves the GPU decode produces the SAME greedy
+// token SEQUENCE as the CPU/oracle run and a per-logit delta within
+// kGpuLogitTol - the honest "GPU is the fastest tier of the SAME engine" gate.
+//
+// WHY same-sequence + tolerance, NOT max|delta| == 0.0: GPU floating-point
+// arithmetic (FMA contraction, parallel reduction order, vendor BLAS) differs
+// from the single-threaded CPU reference at the last ULPs. Bit-identity CPU-vs-
+// GPU is physically unattainable and asserting it would guarantee a false
+// failure on correct hardware. The byte-identity (max|delta| == 0.0) contract
+// is kept where it IS attainable and meaningful: CPU-vs-CPU, in
+// test_cpu_decode_byte_identical_to_oracle above and the oracle gates.
+//
+// SKIP-ON-CPU-ONLY: this gate requires real hardware the sandbox/CI lacks. It
+// skips CLEANLY (prints "skipped: no GPU backend" and returns success, so CI
+// stays green) whenever (a) no GPU backend is compiled in / no device is
+// present - detected by requesting SF_BACKEND_CUDA and finding the engine fell
+// back to CPU (is_gpu_backend() == false) - or (b) the MoE fixture is not
+// generated. It is therefore safe to run on the CPU-only build, where it is a
+// no-op pass. Only when BOTH a GPU is selected AND the fixture is present does
+// it run the real same-sequence + tolerance assertions.
+static void test_gpu_decode_matches_cpu_within_tolerance() {
+    const char *path = std::getenv("STRATAFLOW_TEST_MOE_GGUF");
+    if (path == nullptr || path[0] == '\0') {
+        std::printf("[skipped: no GPU backend (no fixture)] ");
+        return;
+    }
+
+    const std::string prompt = "hello world";
+    const int n_generate = 8;
+
+    // Probe for a GPU backend: request a GPU and see if the engine actually
+    // selected one. On a CPU-only build / no device this falls back to CPU.
+    bool is_gpu = false;
+    std::vector<std::vector<float>> gpu_logits;
+    std::vector<int32_t> gpu_tokens = decode_with_backend(
+        path, prompt, n_generate, kBackendCuda, &is_gpu, gpu_logits);
+
+    if (!is_gpu) {
+        // CPU-only build or no GPU device present: skip cleanly, stay green.
+        std::printf("[skipped: no GPU backend] ");
+        return;
+    }
+
+    // A GPU backend ran. Compute the CPU reference (byte-identical to the
+    // oracle, proven above) and assert the GPU decode matches the greedy
+    // SEQUENCE exactly and the per-logit delta stays within kGpuLogitTol.
+    bool is_gpu_cpu_ref = true;  // must come back false for the CPU reference
+    std::vector<std::vector<float>> cpu_logits;
+    std::vector<int32_t> cpu_tokens = decode_with_backend(
+        path, prompt, n_generate, kBackendCpu, &is_gpu_cpu_ref, cpu_logits);
+
+    CHECK(!is_gpu_cpu_ref);
+    CHECK_EQ(gpu_tokens.size(), static_cast<size_t>(n_generate));
+    CHECK_EQ(cpu_tokens.size(), static_cast<size_t>(n_generate));
+
+    // (1) HARD gate: the GPU greedy sequence equals the CPU sequence token for
+    // token (the user-visible output is identical across backends).
+    bool seq_match = gpu_tokens.size() == cpu_tokens.size();
+    for (size_t i = 0; i < gpu_tokens.size() && i < cpu_tokens.size(); ++i) {
+        CHECK_EQ(gpu_tokens[i], cpu_tokens[i]);
+        if (gpu_tokens[i] != cpu_tokens[i]) seq_match = false;
+    }
+
+    // (2) per-logit max|delta| within the documented GPU tolerance (NOT 0.0 -
+    // see the WHY note above).
+    double max_d = 0.0;
+    const size_t steps = gpu_logits.size() < cpu_logits.size()
+                             ? gpu_logits.size()
+                             : cpu_logits.size();
+    for (size_t s = 0; s < steps; ++s) {
+        const size_t n = gpu_logits[s].size() < cpu_logits[s].size()
+                             ? gpu_logits[s].size()
+                             : cpu_logits[s].size();
+        for (size_t i = 0; i < n; ++i) {
+            const double d = std::fabs(static_cast<double>(gpu_logits[s][i]) -
+                                       static_cast<double>(cpu_logits[s][i]));
+            if (d > max_d) max_d = d;
+        }
+    }
+
+    std::printf("[gpu-vs-cpu seq match=%s max|delta|=%.3e tol=%.1e] ",
+                seq_match ? "yes" : "no", max_d, kGpuLogitTol);
+
+    CHECK(seq_match);
+    CHECK(max_d <= kGpuLogitTol);
+}
+
 static void run_all() {
     RUN(test_selects_cpu_without_gpu);
     RUN(test_cpu_decode_byte_identical_to_oracle);
+    RUN(test_gpu_decode_matches_cpu_within_tolerance);
 }
 
 TEST_MAIN()

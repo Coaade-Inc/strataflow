@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -325,6 +326,15 @@ struct Engine::Impl {
     // code. The compute path stays single-threaded regardless (this is a pure
     // bool, no new threads), so the TSan contract is unchanged.
     bool is_gpu = false;
+
+    // FEAT-004: canonical name of the ACTIVE compute backend, one of
+    // "cpu" | "cuda" | "metal" | "vulkan" | "gpu" (the last only if a GPU
+    // device reports an unrecognized backend). Set by select_compute_backend()
+    // at load. On a CPU-only build this is ALWAYS "cpu". Surfaced read-only via
+    // Engine::active_backend_name() so the API/CLI plan line can report the
+    // backend that actually ran, honestly, without the api layer including any
+    // ggml header above the sf::Model seam.
+    std::string backend_name = "cpu";
 
     // FEAT-003: host-or-device aware write of `n` bytes from `src` into graph
     // tensor `dst` at byte `offset`. The ONE primitive every per-token staging
@@ -833,6 +843,9 @@ bool Engine::load_strata_weights(Impl &im, const std::string &path) {
 const EngineHParams &Engine::hparams() const { return impl_->hp; }
 
 bool Engine::is_gpu_backend() const { return impl_->is_gpu; }
+const std::string &Engine::active_backend_name() const {
+    return impl_->backend_name;
+}
 const EngineCacheStats &Engine::cache_stats() const { return impl_->cstats; }
 
 uint64_t Engine::resident_kv_bytes() const {
@@ -963,7 +976,8 @@ namespace {
 // FEAT-003: forward declaration so Engine::load (below) can select the compute
 // backend before building any resident context; the definition lives in the
 // later anonymous namespace next to run_segment.
-ggml_backend_t select_compute_backend(int preferred, bool *out_is_gpu);
+ggml_backend_t select_compute_backend(int preferred, bool *out_is_gpu,
+                                      std::string *out_name);
 }  // namespace
 
 std::unique_ptr<Engine> Engine::load(const std::string &path,
@@ -990,7 +1004,8 @@ std::unique_ptr<Engine> Engine::load(const std::string &path,
     // the CPU buffer type and the staging-write primitive stays a std::memcpy -
     // byte-identical to the pre-FEAT-003 engine. A GPU is never required: a
     // missing/failed GPU device falls back to CPU and the load continues.
-    im.backend = select_compute_backend(im.preferred_backend, &im.is_gpu);
+    im.backend = select_compute_backend(im.preferred_backend, &im.is_gpu,
+                                        &im.backend_name);
     if (im.backend == nullptr) {
         log_warn("engine: compute backend init failed; staying on libllama path");
         return nullptr;
@@ -1449,8 +1464,10 @@ namespace {
 // continues. The engine load NEVER fails because a GPU is absent. `preferred`
 // mirrors sf_backend (0 == SF_BACKEND_CPU); SF_BACKEND_CPU forces the CPU
 // backend even on a GPU build. Logs an ASCII line naming the chosen backend.
-ggml_backend_t select_compute_backend(int preferred, bool *out_is_gpu) {
+ggml_backend_t select_compute_backend(int preferred, bool *out_is_gpu,
+                                      std::string *out_name) {
     *out_is_gpu = false;
+    *out_name = "cpu";
 #if STRATAFLOW_GPU_ENABLED
     // preferred == 0 is SF_BACKEND_CPU: honor an explicit CPU request even on a
     // GPU-enabled build (the always-safe fallback is also the opt-out).
@@ -1465,8 +1482,36 @@ ggml_backend_t select_compute_backend(int preferred, bool *out_is_gpu) {
             ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
             if (b != nullptr) {
                 const char *desc = ggml_backend_dev_description(dev);
+                // FEAT-004: classify the active GPU backend into a canonical
+                // token for the plan/stats surface. The ggml-backend registry
+                // reports a backend name (e.g. "CUDA", "Metal", "Vulkan") for
+                // the device's backend_reg; lower-case and match it so the
+                // CLI/API report cuda|metal|vulkan honestly, falling back to the
+                // generic "gpu" if a backend we do not have a token for is used.
+                *out_name = "gpu";
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                const char *rn = reg != nullptr ? ggml_backend_reg_name(reg)
+                                                : nullptr;
+                if (rn != nullptr) {
+                    std::string lower(rn);
+                    for (char &c : lower) {
+                        c = static_cast<char>(std::tolower(
+                            static_cast<unsigned char>(c)));
+                    }
+                    if (lower.find("cuda") != std::string::npos) {
+                        *out_name = "cuda";
+                    } else if (lower.find("metal") != std::string::npos) {
+                        *out_name = "metal";
+                    } else if (lower.find("vulkan") != std::string::npos) {
+                        *out_name = "vulkan";
+                    } else if (lower.find("hip") != std::string::npos ||
+                               lower.find("rocm") != std::string::npos) {
+                        *out_name = "hip";
+                    }
+                }
                 log_info(std::string("engine: compute backend = GPU (") +
-                         (desc != nullptr ? desc : "gpu") + ")");
+                         (desc != nullptr ? desc : "gpu") + ", " + *out_name +
+                         ")");
                 *out_is_gpu = true;
                 return b;
             }

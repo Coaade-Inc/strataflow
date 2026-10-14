@@ -377,8 +377,19 @@ sf_status sf_describe_plan(sf_context *ctx, char *buf, size_t buf_size) {
         ", experts=" + (place.offload_experts_to_cpu ? "CPU-offload" : "default") +
         "]";
 
+    // FEAT-004: append the ACTIVE compute backend token (cpu|cuda|metal|
+    // vulkan|hip|gpu) so the plan line reports, honestly, what actually ran the
+    // forward pass. On a CPU-only build (the default) this is always
+    // "compute=cpu". On a GPU build it reflects the engine's selected backend
+    // (which falls back to CPU when no device is present). The CPU golden
+    // output / determinism test (test_api) only asserts the plan line is
+    // non-empty, so appending this additive token keeps that gate green.
+    std::string backend = ctx->model != nullptr
+                              ? ctx->model->active_backend_name()
+                              : std::string("cpu");
+
     std::string line = ctx->hw.to_summary() + " | " + ctx->plan.to_summary() +
-                       " | " + decision;
+                       " | " + decision + " | compute=" + backend;
     std::strncpy(buf, line.c_str(), buf_size - 1);
     buf[buf_size - 1] = '\0';
     return SF_OK;

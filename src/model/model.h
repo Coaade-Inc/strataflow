@@ -69,6 +69,15 @@ public:
     // decode stays byte-identical. 0 when not applicable (dry-run, or no engine
     // loaded yet).
     virtual uint64_t resident_kv_bytes() const { return 0; }
+
+    // FEAT-004: canonical name of the ACTIVE compute backend that ran the
+    // forward pass, one of "cpu" | "cuda" | "metal" | "vulkan" | "hip" | "gpu".
+    // On a CPU-only build (STRATAFLOW_GPU_ENABLED==0, the default) this is
+    // ALWAYS "cpu"; the GgmlModel engine path forwards the engine's selected
+    // backend. The dry-run model and the plain-GGUF/libllama path have no
+    // StrataFlow engine, so they report "cpu" (the default). Surfaced through
+    // the C ABI plan line so the active backend is observable honestly.
+    virtual std::string active_backend_name() const { return "cpu"; }
 };
 
 // Factory: inspects `path` and returns the right implementation.

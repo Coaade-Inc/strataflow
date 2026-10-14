@@ -214,6 +214,17 @@ public:
         return engine_ != nullptr ? engine_->resident_kv_bytes() : 0;
     }
 
+    // FEAT-004: the ACTIVE compute backend the engine selected. The engine is
+    // created lazily on the first forward(), so before any decode (e.g. the
+    // --plan path) it reports the backend that WILL be selected: on a CPU-only
+    // build (the default) that is unconditionally "cpu"; on a GPU build the
+    // preferred_backend_ hint names what was requested but the engine falls
+    // back to CPU if no device is present, so we only claim a GPU token once
+    // the engine exists and confirms it. This keeps the plan line honest.
+    std::string active_backend_name() const override {
+        return engine_ != nullptr ? engine_->active_backend_name() : "cpu";
+    }
+
 private:
     // The engine inference path (EC-5: the ONLY inference path): run OUR OWN
     // ggml graph for one token at position n_past_ and take the greedy argmax.
