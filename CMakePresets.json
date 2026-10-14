@@ -14,10 +14,19 @@
     {
       "name": "debug",
       "inherits": "base",
-      "displayName": "Debug (CPU)",
+      "displayName": "Debug (CPU, GCC)",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "STRATAFLOW_WERROR": "ON"
+      }
+    },
+    {
+      "name": "clang",
+      "inherits": "debug",
+      "displayName": "Debug (CPU, Clang)",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
       }
     },
     {
@@ -32,29 +41,53 @@
       "name": "release-cuda",
       "inherits": "release",
       "displayName": "Release + CUDA",
-      "cacheVariables": { "STRATAFLOW_CUDA": "ON" }
+      "cacheVariables": { "STRATAFLOW_GPU": "cuda" }
     },
     {
       "name": "release-vulkan",
       "inherits": "release",
       "displayName": "Release + Vulkan",
-      "cacheVariables": { "STRATAFLOW_VULKAN": "ON" }
+      "cacheVariables": { "STRATAFLOW_GPU": "vulkan" }
     },
     {
       "name": "release-metal",
       "inherits": "release",
       "displayName": "Release + Metal",
-      "cacheVariables": { "STRATAFLOW_METAL": "ON" }
+      "cacheVariables": { "STRATAFLOW_GPU": "metal" }
+    },
+    {
+      "name": "debug-gpu-cuda",
+      "inherits": "debug",
+      "displayName": "Debug + CUDA (requires CUDA Toolkit + NVIDIA GPU)",
+      "cacheVariables": { "STRATAFLOW_GPU": "cuda" }
+    },
+    {
+      "name": "debug-gpu-vulkan",
+      "inherits": "debug",
+      "displayName": "Debug + Vulkan (requires Vulkan SDK + GPU)",
+      "cacheVariables": { "STRATAFLOW_GPU": "vulkan" }
+    },
+    {
+      "name": "debug-gpu-metal",
+      "inherits": "debug",
+      "displayName": "Debug + Metal (requires macOS/Apple Silicon)",
+      "cacheVariables": { "STRATAFLOW_GPU": "metal" }
     }
   ],
   "buildPresets": [
     { "name": "debug",   "configurePreset": "debug" },
+    { "name": "clang",   "configurePreset": "clang" },
     { "name": "release", "configurePreset": "release" }
   ],
   "testPresets": [
     {
       "name": "debug",
       "configurePreset": "debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "clang",
+      "configurePreset": "clang",
       "output": { "outputOnFailure": true }
     },
     {

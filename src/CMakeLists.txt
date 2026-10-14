@@ -110,8 +110,38 @@ target_include_directories(strataflow SYSTEM PRIVATE
 target_include_directories(strataflow SYSTEM PRIVATE
     ${STRATAFLOW_LLAMA_DIR}/ggml/src)
 
-# Backend wiring (Phase 1b): when a backend option is ON, define a macro and,
-# later, link the vendored ggml backend target. Kept inert for now.
+# ---------------------------------------------------------------------------
+# Compute backend compile-time guard (Phase 1b).
+#
+# STRATAFLOW_GPU_RESOLVED is set by the top-level CMakeLists.txt from the single
+# STRATAFLOW_GPU knob (and the back-compat STRATAFLOW_<CUDA|VULKAN|METAL|HIP>
+# booleans). The guard macros below let engine.cpp branch at compile time onto
+# a GPU ggml-backend without pulling ggml headers into non-engine TUs. They are
+# attached ONLY to the engine translation unit; nothing GPU is defined on the
+# "off" (default) path beyond STRATAFLOW_GPU_ENABLED=0, keeping the public
+# strataflow_cxx / strataflow_warnings interfaces clean.
+#
+#   STRATAFLOW_GPU_ENABLED  0 (off) or 1 (a GPU backend selected)
+#   STRATAFLOW_GPU_CUDA     defined (=1) only when cuda is selected
+#   STRATAFLOW_GPU_METAL    defined (=1) only when metal is selected
+#   STRATAFLOW_GPU_VULKAN   defined (=1) only when vulkan is selected
+# ---------------------------------------------------------------------------
+set(STRATAFLOW_ENGINE_TU ${CMAKE_CURRENT_SOURCE_DIR}/model/engine/engine.cpp)
+if(NOT DEFINED STRATAFLOW_GPU_RESOLVED OR STRATAFLOW_GPU_RESOLVED STREQUAL "off")
+    set_property(SOURCE ${STRATAFLOW_ENGINE_TU} APPEND
+        PROPERTY COMPILE_DEFINITIONS STRATAFLOW_GPU_ENABLED=0)
+else()
+    string(TOUPPER "${STRATAFLOW_GPU_RESOLVED}" STRATAFLOW_GPU_UPPER)
+    set_property(SOURCE ${STRATAFLOW_ENGINE_TU} APPEND
+        PROPERTY COMPILE_DEFINITIONS
+            STRATAFLOW_GPU_ENABLED=1
+            STRATAFLOW_GPU_${STRATAFLOW_GPU_UPPER}=1)
+    message(STATUS "StrataFlow: engine compiled with STRATAFLOW_GPU_${STRATAFLOW_GPU_UPPER} guard")
+endif()
+
+# Back-compat: keep the historical STRATAFLOW_HAVE_<backend> macro on the whole
+# library when a per-backend boolean is ON, so any existing references still see
+# it. The ggml backend link target is wired in a later feature.
 foreach(bk CUDA VULKAN METAL HIP)
     if(STRATAFLOW_${bk})
         target_compile_definitions(strataflow PRIVATE STRATAFLOW_HAVE_${bk}=1)
