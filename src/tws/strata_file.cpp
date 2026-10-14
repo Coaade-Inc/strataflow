@@ -274,7 +274,14 @@ int64_t StrataReader::read_bundle(uint32_t layer, uint32_t expert,
     read_calls_.fetch_add(1, std::memory_order_relaxed);
     const int64_t n = file_.read_at(dst, static_cast<size_t>(e->blob_length),
                                     e->blob_offset);
-    if (n > 0) {
+    // Count the coalesced read toward streamed_bytes_ ONLY on a FULL-length
+    // read (n == blob_length). The engine treats any short read as a failure
+    // (nb != gb+ub+db) and falls back to the three read_blob calls, each of
+    // which counts its own slice; counting a partial coalesced read here too
+    // would double-count those partial bytes. Making this all-or-nothing keeps
+    // streamed_bytes() byte-accurate on both the success and the fallback path
+    // (header comment: "counts the bundle's bytes exactly once").
+    if (n == static_cast<int64_t>(e->blob_length)) {
         streamed_bytes_.fetch_add(static_cast<uint64_t>(n),
                                   std::memory_order_relaxed);
     }
