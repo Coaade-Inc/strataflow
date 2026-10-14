@@ -315,11 +315,6 @@ static void test_predictor_driven_residency() {
     const uint32_t n_layer = 4;
     const uint32_t n_expert = 8;
     const uint32_t n_expert_used = 2;
-    // floor 2/layer = 8 used, only 3 spare slots. With a scarce spare budget
-    // the weight order decides who gets the extra slots: the busiest layers are
-    // served first, so the hot layer gets a spare and the quiet layer does not.
-    // (A roomy budget would let every layer reach the ceil and hide the bias;
-    // scarcity is exactly the production regime where residency choice matters.)
     // floor 2/layer = 8 used, exactly 1 spare slot. With a single spare the
     // weight order decides who gets it: the busiest layer wins the slot and the
     // others sit at the floor. (A roomy budget would let every layer reach the
