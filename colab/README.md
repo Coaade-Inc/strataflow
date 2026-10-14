@@ -517,6 +517,102 @@ measured mechanism.
   free-RAM-sizing inversion (where max could land near or below the auto share)
   is fixed.
 
+### AUTO coherent retune + batched/sequential expert reads (corrected behavior)
+
+The real Colab run exposed that AUTO was INCOHERENT on a 12 GiB-class box: it
+kept the FULL `n_ctx` KV resident (8192 MiB) while HARD-streaming the trunk
+(hot=9/32) and caching only 2 experts - windowing nothing yet holding too little
+of the working set, so almost every expert re-streamed each token. AUTO is now
+retuned to a COHERENT good-neighbor policy and the expert reads are coalesced.
+Both are residency/placement-only, so decoded text stays BYTE-IDENTICAL.
+
+What changed, and the corrected expectations:
+
+- **AUTO now takes a comfortable, documented share** of total RAM (the
+  conservative `usable_ram` good-neighbor budget, mid-single-GiB on the 12 GiB
+  box) and co-selects the three levers (KV window, trunk pool, expert cache)
+  CONSISTENTLY to FILL that share. The KV-window step-down budgets against the
+  FULL resident trunk, so AUTO windows the KV BEFORE the trunk is forced to
+  hard-stream. COHERENCE INVARIANT: AUTO never keeps full KV while hard-streaming
+  the trunk (if the trunk is hard-streamed then the KV is windowed; the levers
+  co-reduce). When RAM affords it, AUTO keeps the trunk resident and caches MANY
+  more experts than the old 2, so its streamed-bytes/token is LOWER than the old
+  2-expert run. On the synthetic 12 GiB Mixtral shape AUTO went from the old
+  incoherent plan (windowed KV + hard trunk streaming pool=20/32 + 4 experts) to
+  a coherent `kv_window=8192`, trunk fully resident (pool=0), 14 experts; experts
+  resident went 2 (old) -> 14 (synthetic) / 104 (mxg real fixture).
+- **TARGET and MAX are UNCHANGED in intent.** An explicit `--target-ram-gb` still
+  drives all the levers to fit the named ceiling (refusing loudly, naming the
+  honest minimal-KV floor, when it cannot). MAX still dedicates all physical RAM
+  (full KV, maximal experts, trunk resident, least streaming) and now also FITS
+  its own budget while staying `>= AUTO` on every lever (on the synthetic shape
+  MAX fits=1 at peak 12249 `<=` usable 12288 MiB, `kv_window=16384`, 18 experts).
+- **Coalesced expert reads (lossless).** Each `(layer, expert)` bundle is now
+  read with ONE `read_at` instead of three per-kind reads, byte-identical and
+  cutting the underlying read-count 3:1; `streamed_bytes()` totals are unchanged.
+  On the mxg real fixture the streamed bytes/token drop from 29,408,625 B
+  (2-slot baseline) to 3,008,102 B (104-slot AUTO), ~9.8x fewer expert bytes
+  re-streamed per token.
+
+Re-verify all three modes on Colab (run on the SAME model and prompt; the plan
+line prints before the decode and the `stats:` line after):
+
+```bash
+%%bash
+cd /content/strataflow/build/release
+# AUTO (default): coherent good-neighbor share.
+./bin/strataflow --model /content/mixtral.strata \
+  --max-tokens 16 --async-prefetch on --prompt "The city of"
+# TARGET: one dial to an explicit ceiling (unchanged intent).
+./bin/strataflow --model /content/mixtral.strata \
+  --target-ram-gb 3 --max-tokens 16 --async-prefetch on --prompt "The city of"
+# MAX: dedicate the machine (unchanged intent, now fits its own budget).
+./bin/strataflow --model /content/mixtral.strata \
+  --ram-mode max --max-tokens 16 --async-prefetch on --prompt "The city of"
+```
+
+Expected corrected per-mode behavior (absolute GiB are hardware-dependent;
+compare the three on the SAME model and prompt):
+
+- **AUTO**: the plan line now shows a COHERENT geometry - a `kv window` segment
+  (windowed only if the trunk would otherwise hard-stream) with the trunk
+  resident (NO `trunk stream[hot=...]` segment when RAM affords it) and
+  `experts[resident=...]` MANY more than the old 2 (on the mxg geometry ~104),
+  within a comfortable mid-single-GiB share that leaves RAM for other apps. Its
+  `stats:` line shows a LOWER `streamed` / bytes-per-token than the old
+  2-expert run.
+- **TARGET** (`--target-ram-gb 3`): fits the 3 GiB ceiling by co-driving the
+  levers (windowed KV + bounded trunk pool + bounded expert cache), `peak RSS`
+  near the target, decoded text byte-identical to AUTO and MAX.
+- **MAX**: the MOST experts resident (`>= AUTO`), full `kv window`, trunk
+  resident (no `trunk stream` segment), `streamed` at its LOWEST
+  (`streamed <= auto.streamed`), and its projected peak FITS its own budget.
+
+All three modes decode BYTE-IDENTICAL text (`max|delta| = 0.000e+00` in-sandbox;
+within the quant bound vs the libllama oracle, `5.179e-02 < 1e-1`).
+
+### Current token speed (and why)
+
+What is the current speed of tokens? On the real Colab box
+(Mixtral-8x7B-Instruct Q3_K_M, 12 GiB RAM, 2 cores, SSD ~4 GiB/s, no GPU) decode
+is about **~0.06 tok/s (~16 s/token)**. It is **I/O-bound, not RAM-bound**:
+~74-78 GB is streamed per 16 tokens (~4.6 GB/token), which far exceeds the
+~18 GB expert set, so with the OLD 2-bundle resident pool almost every expert was
+re-streamed each token. The bottleneck is bytes-streamed-per-token and effective
+read bandwidth, not the RAM mode (streaming volume was ~identical across modes).
+
+The coherent AUTO retune (more of the working set resident -> fewer bytes/token)
+and the coalesced sequential reads (fewer, larger reads -> higher effective
+bandwidth, lower per-read overhead) both push wall-clock DOWN, byte-identically.
+But on 2 cores there is NO compute/IO overlap to be had (the async prefetch
+self-backs-off at `completed-before-use = 0`), so the box stays FUNDAMENTALLY
+I/O-bound. We therefore do NOT promise a tok/s number: the ~0.06 tok/s figure
+and any absolute improvement on real Mixtral are a Colab/hardware
+re-measurement, measured by re-running the three-mode commands above on the real
+model. The sandbox proves the MECHANISM (coherent plan geometry, ~9.8x
+bytes/token reduction on the fixture, 3:1 read-count cut, byte-identity), not an
+absolute tok/s.
+
 ### Which real model, and why
 
 The engine runs **llama-architecture** models only. That drives the choice:

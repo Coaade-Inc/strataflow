@@ -67,6 +67,37 @@ public:
     int64_t read_blob(uint32_t layer, uint32_t expert, ExpertTensorKind kind,
                       void *dst) const;
 
+    // FEAT-002 COALESCED BUNDLE READ. Read the WHOLE (layer,expert) bundle -
+    // gate|up|down contiguously - into `dst` (which must hold at least
+    // blob_length bytes) with ONE underlying read_at over the bundle's
+    // [blob_offset, blob_offset+blob_length) range, instead of the three
+    // separate read_blob(kGate/kUp/kDown) calls (3 reads -> 1). The slices are
+    // packed TIGHTLY inside the bundle in gate|up|down order (only the blob
+    // START is 4 KiB-aligned, see tools/strata-pack), so the bytes `dst`
+    // receives are BYTE-IDENTICAL to the three read_blob calls concatenated:
+    // read_blob(kGate,dst) then read_blob(kUp,dst+gate_len) then
+    // read_blob(kDown,dst+gate_len+up_len) produce exactly these same bytes in
+    // these same positions. This changes HOW the bytes are read (one large
+    // sequential read, higher effective bandwidth), never WHICH bytes.
+    //
+    // Returns the number of bytes read (== blob_length) on success, or -1 on a
+    // lookup/read error OR on a FUSED-gate_up bundle (gate_rel == up_rel),
+    // whose two-slice layout does not match the engine's three-slice slot; the
+    // caller must then fall back to the per-kind read_blob path. streamed_bytes()
+    // counts the bundle's bytes exactly once (identical total to three reads).
+    int64_t read_bundle(uint32_t layer, uint32_t expert, void *dst) const;
+
+    // Count of underlying BlockFile::read_at calls issued by the EXPERT read
+    // path (read_blob + read_bundle) since open(). read_blob increments it once
+    // per slice (3 per bundle); read_bundle increments it once per bundle. Lets
+    // a test prove the 3:1 coalescing (read_bundle is 1 call where three
+    // read_blob calls would be 3). Trunk reads are not counted here (they go
+    // through read_at / read_trunk_tensor). Atomic for the same reason as
+    // streamed_bytes_: the async prefetch worker may call concurrently.
+    uint64_t read_calls() const {
+        return read_calls_.load(std::memory_order_relaxed);
+    }
+
     // Read `len` bytes at the absolute file `offset` into `dst`. Used by the
     // engine (src/model/engine) to fill the resident trunk tensors from the
     // trunk block (whose start is superblock().trunk_offset). Returns bytes
@@ -130,6 +161,10 @@ private:
     // byte-counter whose value is read only for benchmark reporting, with no
     // ordering dependency on other memory). The reported total is unchanged.
     mutable std::atomic<uint64_t>   streamed_bytes_{0};
+    // Count of underlying read_at calls on the EXPERT path (read_blob +
+    // read_bundle). mutable+atomic for the same reasons as streamed_bytes_
+    // (const read path, concurrent async prefetch worker, benchmark reporting).
+    mutable std::atomic<uint64_t>   read_calls_{0};
     // Accumulated TRUNK bytes read via read_trunk_tensor(). Separate counter so
     // streamed_bytes() keeps its expert-only meaning. mutable+atomic for the
     // same reasons as streamed_bytes_ (const read path, benchmark reporting).

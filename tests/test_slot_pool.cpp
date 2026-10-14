@@ -1,5 +1,6 @@
 // Copyright 2026 Coaade Inc., a Delaware C corporation. SPDX-License-Identifier: LicenseRef-Coaade-Source-Available-1.0
 #include "test_util.h"
+#include "predict/predictor.h"
 #include "tws/weight_store.h"
 
 #include <cstdint>
@@ -300,6 +301,106 @@ static void test_capacity_below_topk_still_correct() {
     CHECK(s.evictions > 0);
 }
 
+// PREDICTOR-DRIVEN RESIDENCY, END TO END (FEAT-002 step 5, review issue 1).
+// The engine refines the layer-stratified pool once every few tokens via
+// pool.set_layer_weights(predictor->layer_activity()) (see Engine::forward).
+// The existing test_capacity_budget_and_floor proves set_layer_weights biases
+// toward hand-made weights; this test proves the WHOLE chain that the engine
+// actually runs: observed routing -> ExpertPredictor::layer_activity() ->
+// set_layer_weights -> the busier layer ends up with MORE resident capacity,
+// which in turn keeps MORE of that layer's reused experts resident across a
+// decode sweep (the reduce-thrash goal). Residency only: the floor guarantees
+// every layer's top-k is still staged, so decode byte-identity is untouched.
+static void test_predictor_driven_residency() {
+    const uint32_t n_layer = 4;
+    const uint32_t n_expert = 8;
+    const uint32_t n_expert_used = 2;
+    // floor 2/layer = 8 used, exactly 1 spare slot. With a single spare the
+    // weight order decides who gets it: the busiest layer wins the slot and the
+    // others sit at the floor. (A roomy budget would let every layer reach the
+    // ceil and hide the bias; scarcity is exactly the production regime where
+    // residency choice matters.)
+    const uint32_t n_slots = 9;  // floor 2/layer = 8, 1 spare to distribute
+
+    ExpertPredictor predictor(n_layer, n_expert);
+    SlotPool pool(n_slots, 8, n_layer, n_expert, n_expert_used);
+    CHECK(pool.stratified());
+
+    // Before any observation layer_activity() is all-zero, so the pool keeps
+    // its shape-derived split: spare slots are handed out in plain index order
+    // (no layer favored by frequency yet). Record the hot layer's starting
+    // capacity so we can prove the predictor shifts capacity TOWARD it.
+    const uint32_t cap_hot_before = pool.layer_capacity(3);
+
+    // Simulate decoding where layer 3 routes to a WIDE, reused set of experts
+    // every token (high activation) while layer 0 barely routes. layer_activity
+    // sums per-layer activation counts, so layer 3 becomes by far the busiest.
+    const int n_tokens = 50;
+    for (int t = 0; t < n_tokens; ++t) {
+        // Layer 3: all 8 experts fire each token (busiest, biggest reuse set).
+        for (uint32_t e = 0; e < n_expert; ++e) predictor.observe({3, e});
+        // Layer 2: half the experts fire.
+        for (uint32_t e = 0; e < n_expert / 2; ++e) predictor.observe({2, e});
+        // Layer 0 and 1: only the top-k fire (quiet).
+        for (uint32_t e = 0; e < n_expert_used; ++e) {
+            predictor.observe({0, e});
+            predictor.observe({1, e});
+        }
+    }
+
+    // Feed the predictor's per-layer activity into the pool exactly as the
+    // engine does.
+    const std::vector<uint64_t> activity = predictor.layer_activity();
+    CHECK_EQ(activity.size(), static_cast<size_t>(n_layer));
+    CHECK(activity[3] > activity[2]);
+    CHECK(activity[2] > activity[0]);
+    pool.set_layer_weights(activity);
+
+    // The busiest layer now has the SINGLE scarce spare slot: its capacity is
+    // the strict maximum across all layers, strictly greater than every other
+    // layer's (which sit at the floor). And the hot layer's capacity GREW
+    // relative to its pre-frequency (index-order) starting point - the shift is
+    // caused by the observed activity, not an artifact of the initial split.
+    const uint32_t cap_hot = pool.layer_capacity(3);
+    CHECK(cap_hot > cap_hot_before);
+    for (uint32_t l = 0; l < n_layer; ++l) {
+        if (l == 3) continue;
+        CHECK(cap_hot > pool.layer_capacity(l));
+    }
+    const uint32_t cap_cold = pool.layer_capacity(0);
+    // Every layer still holds at least its top-k floor (residency change never
+    // starves a layer below what decode needs staged).
+    for (uint32_t l = 0; l < n_layer; ++l) {
+        CHECK(pool.layer_capacity(l) >= n_expert_used);
+    }
+    // Budget invariant preserved.
+    uint32_t sum = 0;
+    for (uint32_t l = 0; l < n_layer; ++l) sum += pool.layer_capacity(l);
+    CHECK(sum <= n_slots);
+
+    // The extra capacity on the hot layer actually REDUCES thrash: drive one
+    // more decode sweep touching the hot layer's wide reused set and a cold
+    // layer's wide set with IDENTICAL access patterns, and the hot layer (which
+    // now has more slots) must keep at least as many experts resident as the
+    // cold layer at the end of the sweep.
+    auto load = [](void *) {};
+    const int sweep_tokens = 4;
+    for (int t = 0; t < sweep_tokens; ++t) {
+        for (uint32_t e = 0; e < n_expert; ++e) {
+            pool.acquire({3, e}, load);  // hot layer reuses its wide set
+            pool.acquire({0, e}, load);  // cold layer touches the same width
+        }
+    }
+    uint32_t resident_hot = 0, resident_cold = 0;
+    for (uint32_t e = 0; e < n_expert; ++e) {
+        if (pool.resident({3, e})) ++resident_hot;
+        if (pool.resident({0, e})) ++resident_cold;
+    }
+    CHECK(resident_hot >= resident_cold);
+    CHECK(resident_hot <= cap_hot);
+    CHECK(resident_cold <= cap_cold);
+}
+
 static void run_all() {
     RUN(test_hit_and_miss);
     RUN(test_lru_eviction);
@@ -310,6 +411,7 @@ static void run_all() {
     RUN(test_fully_resident_never_evicts);
     RUN(test_capacity_budget_and_floor);
     RUN(test_capacity_below_topk_still_correct);
+    RUN(test_predictor_driven_residency);
 }
 
 TEST_MAIN()

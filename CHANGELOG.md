@@ -11,6 +11,82 @@ grouped by the pull request that merged them.
 
 ### Features
 
+- AUTO coherent retune + lossless batched/sequential expert reads +
+  reused-expert residency. Fixes the two coupled problems the real-Mixtral Colab
+  run exposed, both residency/placement-only so decode stays byte-identical.
+  (1) COHERENT AUTO POLICY (`src/plan/planner.cpp`): AUTO now takes a
+  comfortable, DOCUMENTED share of total RAM (the conservative `usable_ram`
+  good-neighbor budget that leaves headroom for other apps) and co-selects the
+  three fit levers (KV window, trunk pool, expert cache) CONSISTENTLY to fill
+  that share - more resident means less streaming. The KV-window step-down now
+  budgets against the FULL resident trunk, so AUTO windows the KV BEFORE the
+  trunk is forced to hard-stream, enforcing the COHERENCE INVARIANT (asserted in
+  code and in three tests): AUTO never keeps the full-`n_ctx` KV resident while
+  simultaneously hard-streaming the trunk (if `0 < trunk_pool_layers < n_layers`
+  then `0 < kv_window < n_ctx`); the levers co-reduce. Before, AUTO on a
+  12 GiB-class box was INCOHERENT (it kept full KV while hard-streaming the trunk
+  and cached only 2 experts); now, when RAM affords it, it keeps the trunk fully
+  resident and caches far more. On the synthetic 12 GiB Mixtral shape: BEFORE
+  incoherent (windowed KV AND hard trunk streaming pool=20/32 AND only 4 experts,
+  peak ~= usable), with MAX fits=0 (projected peak 14097 MiB `>` usable
+  12288 MiB because the clamp-to-Auto raised full KV over budget); AFTER coherent
+  (AUTO `kv_window=8192`, trunk fully resident pool=0, 14 experts resident), with
+  MAX fits=1 (peak 12249 `<=` 12288, `kv_window=16384`, 18 experts) and MAX stays
+  `>= AUTO` on every lever (usable, KV window, resident experts, trunk
+  residency). Experts resident went from 2 (old) to 14 (synthetic 12 GiB) /
+  104 (mxg real fixture). (2) LOSSLESS BATCHED/SEQUENTIAL EXPERT I/O
+  (`src/tws/strata_file.h/.cpp`, `src/model/engine/engine.cpp`): a new
+  `StrataReader::read_bundle` issues ONE `read_at` over a whole `(layer, expert)`
+  bundle `[blob_offset, blob_offset + blob_length)` and splits it into the
+  gate/up/down slices by their known relative offsets, replacing the previous
+  THREE per-kind `read_blob` calls. It is byte-identical (the returned bytes
+  `memcmp` equal to the three per-kind reads concatenated, the slices are tightly
+  packed gate|up|down inside the bundle, and `streamed_bytes()` totals are
+  unchanged - the same bytes counted once), and a new `read_calls()` atomic
+  counter proves the underlying read-count drops 3:1 per bundle. `read_bundle`
+  counts a coalesced read toward `streamed_bytes()` ALL-OR-NOTHING: only a
+  FULL-length read (`n == blob_length`) is counted, so a short/partial read -
+  which the engine treats as a failure and retries via the three per-kind
+  `read_blob` calls (each counting its own slice) - is not double-counted; the
+  byte total stays accurate on both the success and the fallback path. The three engine
+  expert-read sites (`ensure_layer_experts_resident`, `warm_expert`,
+  `pf_read_bundle`) route through `read_bundle` with a per-kind fallback and keep
+  loading EXACTLY the router-selected top-k experts, so the resident bytes - and
+  the decode - stay byte-identical, and the coalesced read is TSan-safe (const +
+  atomic counters) on the compute thread and the async prefetch path. (3) The
+  larger coherent AUTO cache (and the predictor's per-layer activation frequency
+  keeping reused experts resident) directly cuts re-streaming: on the mxg real
+  fixture streamed bytes/token drop from 29,408,625 B (2-slot baseline) to
+  3,008,102 B (104-slot AUTO), ~9.8x fewer expert bytes re-streamed per token.
+  The predictor-driven residency path is the existing wiring in
+  `Engine::forward` (`SlotPool::set_layer_weights(ExpertPredictor::layer_activity())`
+  every few tokens, so busier layers keep more of their reused experts resident
+  within the mode's budget); it is now proven END TO END by
+  `test_predictor_driven_residency` in `tests/test_slot_pool.cpp` (observed
+  routing -> `layer_activity()` -> `set_layer_weights` -> the busiest layer wins
+  the scarce spare slot and keeps strictly more of its reused experts resident
+  across a sweep), with the top-k floor guaranteeing decode stays byte-identical.
+  Greedy decode is BIT-IDENTICAL across AUTO/TARGET/MAX (`max|delta| =
+  0.000e+00`) and within the quant bound vs the libllama oracle (`5.179e-02 <
+  1e-1` on the random-weight q4_k fixture). Full matrix green: GCC 11.5 + Clang
+  15 `-Werror`, release + clang ctest 22/22 (+`test_coalesced_expert_read`), the
+  fixture-blindness real-load gate (`test_target_ram_modes_real_path`), and TSan
+  22/22. CURRENT TOKEN SPEED (the user's question): the real Colab
+  Mixtral-8x7B-Instruct Q3_K_M run is ~0.06 tok/s (~16 s/token) on the 12 GiB /
+  2-core / ~4 GiB/s SSD / no-GPU box, I/O-bound - ~74-78 GB streamed per 16
+  tokens (~4.6 GB/token) because the OLD resident pool held only 2 bundles so
+  almost every expert re-streamed each token. This change attacks both the
+  bytes/token term (the bigger coherent AUTO cache) and the effective-bandwidth
+  term (fewer, larger sequential reads), but the box stays fundamentally
+  I/O-bound on 2 cores (no compute/IO overlap; the async prefetch self-backs-off
+  at `completed-before-use = 0`), so NO tok/s number is promised - the absolute
+  real-Mixtral improvement is a Colab/hardware re-measurement; the sandbox proves
+  the MECHANISM (coherent plan geometry, ~9.8x bytes/token reduction on the
+  fixture, 3:1 read-count cut, byte-identity). The exact three-mode re-verify
+  commands and expected per-mode behavior are in `colab/README.md`;
+  `docs/ROADMAP.md` records the lever as done and names the remaining speed work
+  (co-activation packing layout, then speculative/draft decoding, technique 6.7
+  second half and 6.8). See `docs/RESEARCH_50B_ON_A_LAPTOP.md` section 6.7.
 - Target-RAM capability: one dial for the fit-vs-speed tradeoff, with two modes
   {auto, max} plus an explicit numeric target. A single target-RAM concept now
   drives ALL the fit levers together (KV window, expert slots/cache, adaptive

@@ -101,3 +101,14 @@ sf_add_test(test_kv_window_real_path)
 # fixture env (STRATAFLOW_TEST_MIXTRAL_GEOM_GGUF / _STACKED_GGUF) propagates
 # through ctest the same way as test_kv_window_real_path.
 sf_add_test(test_target_ram_modes_real_path)
+
+# test_coalesced_expert_read is the FEAT-002 lossless batched-I/O gate: it packs
+# the Mixtral-geometry legacy fixture to a .strata and proves, through the REAL
+# StrataReader, that read_bundle() (one coalesced read_at over the whole
+# gate|up|down bundle) returns byte-identical bytes to the three per-kind
+# read_blob calls concatenated AND issues ONE underlying read_at where the three
+# read_blob calls issue THREE (the 3:1 coalescing), with streamed_bytes()
+# totals unchanged. Guarded on STRATAFLOW_TEST_MIXTRAL_GEOM_GGUF (same fixture
+# as test_target_ram_modes_real_path); skips cleanly when unset. Only drives the
+# library (pack + reader), so a plain sf_add_test suffices.
+sf_add_test(test_coalesced_expert_read)
