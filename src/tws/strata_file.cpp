@@ -234,11 +234,46 @@ int64_t StrataReader::read_blob(uint32_t layer, uint32_t expert,
     uint64_t offset = 0;
     uint64_t length = 0;
     if (!slice_range(layer, expert, kind, offset, length)) return -1;
+    // Count every underlying read_at on the expert path (one per slice here),
+    // so a test can observe the 3:1 reduction read_bundle gives.
+    read_calls_.fetch_add(1, std::memory_order_relaxed);
     const int64_t n = file_.read_at(dst, static_cast<size_t>(length), offset);
     // Count only successful expert-slice reads toward the per-token streamed
     // total. read_at() (the one-time trunk fill in Engine::load_strata_weights)
     // is intentionally NOT counted here, so streamed_bytes() reflects per-token
     // expert streaming rather than the trunk load.
+    if (n > 0) {
+        streamed_bytes_.fetch_add(static_cast<uint64_t>(n),
+                                  std::memory_order_relaxed);
+    }
+    return n;
+}
+
+int64_t StrataReader::read_bundle(uint32_t layer, uint32_t expert,
+                                  void *dst) const {
+    const ExpertIndexEntry *e = find(layer, expert);
+    if (e == nullptr) return -1;
+    // A FUSED gate_up bundle (gate_rel == up_rel) has a two-slice layout
+    // (gate_up fused, then down) that does NOT match the engine's three-slice
+    // gate|up|down slot buffer. Refuse so the caller falls back to the per-kind
+    // read_blob path (which handles the fused case). The non-fused path below
+    // is the common MoE arch (Mixtral et al.).
+    if (e->up_rel == e->gate_rel) return -1;
+    // The three slices must be tightly packed in gate|up|down order starting at
+    // the blob start and covering the whole blob_length, so that ONE read of
+    // [blob_offset, blob_offset+blob_length) yields the exact same bytes as the
+    // three read_blob calls concatenated. The packer guarantees this (gate_rel
+    // == 0, up_rel == gate_len, down_rel == gate_len+up_len, blob_length ==
+    // gate_len+up_len+down_len). Verify defensively; refuse (fall back) if any
+    // assumption fails so a malformed/unexpected layout can never silently
+    // corrupt the slot.
+    if (e->gate_rel != 0 || e->up_rel <= e->gate_rel ||
+        e->down_rel <= e->up_rel || e->down_rel >= e->blob_length) {
+        return -1;
+    }
+    read_calls_.fetch_add(1, std::memory_order_relaxed);
+    const int64_t n = file_.read_at(dst, static_cast<size_t>(e->blob_length),
+                                    e->blob_offset);
     if (n > 0) {
         streamed_bytes_.fetch_add(static_cast<uint64_t>(n),
                                   std::memory_order_relaxed);

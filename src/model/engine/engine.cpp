@@ -1817,19 +1817,30 @@ bool Engine::ensure_layer_experts_resident(int il, const int32_t *ids,
         const uint32_t slot = im.pool->acquire(id, [&](void *dst) {
             uint8_t *d = static_cast<uint8_t *>(dst);
             if (im.reader != nullptr) {
-                const int64_t ng = im.reader->read_blob(
-                    static_cast<uint32_t>(il), static_cast<uint32_t>(e),
-                    ExpertTensorKind::kGate, d);
-                const int64_t nu = im.reader->read_blob(
-                    static_cast<uint32_t>(il), static_cast<uint32_t>(e),
-                    ExpertTensorKind::kUp, d + gb);
-                const int64_t nd = im.reader->read_blob(
-                    static_cast<uint32_t>(il), static_cast<uint32_t>(e),
-                    ExpertTensorKind::kDown, d + gb + ub);
-                if (ng != static_cast<int64_t>(gb) ||
-                    nu != static_cast<int64_t>(ub) ||
-                    nd != static_cast<int64_t>(db)) {
-                    load_ok = false;
+                // FEAT-002: ONE coalesced read of the whole gate|up|down bundle
+                // (3 reads -> 1) when the layout is the tightly-packed
+                // three-slice form, byte-identical to the three read_blob calls.
+                // read_bundle returns -1 for a fused gate_up layout; fall back
+                // to the per-kind reads then (same bytes).
+                const int64_t nb = im.reader->read_bundle(
+                    static_cast<uint32_t>(il), static_cast<uint32_t>(e), d);
+                if (nb == static_cast<int64_t>(gb + ub + db)) {
+                    // whole bundle read in one call
+                } else {
+                    const int64_t ng = im.reader->read_blob(
+                        static_cast<uint32_t>(il), static_cast<uint32_t>(e),
+                        ExpertTensorKind::kGate, d);
+                    const int64_t nu = im.reader->read_blob(
+                        static_cast<uint32_t>(il), static_cast<uint32_t>(e),
+                        ExpertTensorKind::kUp, d + gb);
+                    const int64_t nd = im.reader->read_blob(
+                        static_cast<uint32_t>(il), static_cast<uint32_t>(e),
+                        ExpertTensorKind::kDown, d + gb + ub);
+                    if (ng != static_cast<int64_t>(gb) ||
+                        nu != static_cast<int64_t>(ub) ||
+                        nd != static_cast<int64_t>(db)) {
+                        load_ok = false;
+                    }
                 }
             } else {
                 std::memcpy(d,
@@ -1901,15 +1912,21 @@ void Engine::warm_expert(int il, int expert) {
     im.pool->acquire(id, [&](void *dst) {
         uint8_t *d = static_cast<uint8_t *>(dst);
         if (im.reader != nullptr) {
-            im.reader->read_blob(static_cast<uint32_t>(il),
-                                 static_cast<uint32_t>(e),
-                                 ExpertTensorKind::kGate, d);
-            im.reader->read_blob(static_cast<uint32_t>(il),
-                                 static_cast<uint32_t>(e),
-                                 ExpertTensorKind::kUp, d + gb);
-            im.reader->read_blob(static_cast<uint32_t>(il),
-                                 static_cast<uint32_t>(e),
-                                 ExpertTensorKind::kDown, d + gb + ub);
+            // FEAT-002: one coalesced bundle read (byte-identical to the three
+            // per-kind reads); fall back to per-kind on a fused layout.
+            const int64_t nb = im.reader->read_bundle(
+                static_cast<uint32_t>(il), static_cast<uint32_t>(e), d);
+            if (nb != static_cast<int64_t>(gb + ub + db)) {
+                im.reader->read_blob(static_cast<uint32_t>(il),
+                                     static_cast<uint32_t>(e),
+                                     ExpertTensorKind::kGate, d);
+                im.reader->read_blob(static_cast<uint32_t>(il),
+                                     static_cast<uint32_t>(e),
+                                     ExpertTensorKind::kUp, d + gb);
+                im.reader->read_blob(static_cast<uint32_t>(il),
+                                     static_cast<uint32_t>(e),
+                                     ExpertTensorKind::kDown, d + gb + ub);
+            }
         } else {
             std::memcpy(d,
                         static_cast<const uint8_t *>(src_gate->data) +
@@ -1955,6 +1972,10 @@ bool Engine::pf_read_bundle(int il, int expert, void *dst) const {
     const uint32_t ue = static_cast<uint32_t>(expert);
 
     if (im.reader != nullptr) {
+        // FEAT-002: one coalesced bundle read (byte-identical to the three
+        // per-kind reads); fall back to per-kind on a fused layout.
+        const int64_t nb = im.reader->read_bundle(ul, ue, d);
+        if (nb == static_cast<int64_t>(gb + ub + db)) return true;
         const int64_t ng =
             im.reader->read_blob(ul, ue, ExpertTensorKind::kGate, d);
         const int64_t nu =
