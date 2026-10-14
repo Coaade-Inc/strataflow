@@ -444,12 +444,8 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
 
     // Slot-count-INDEPENDENT fields (the Max monotonicity guard below may still
     // raise slots / KV window / trunk pool, so the slot/window/trunk/peak fields
-    // are set AFTER the guard).
-    plan.expert_slots_ram =
-        per_bundle > 0 ? static_cast<uint32_t>(
-                             (usable > reserved ? usable - reserved : 0) /
-                             per_bundle)
-                       : 0;
+    // - including expert_slots_ram, which the guard can change via the clamped
+    // reserved cost - are set AFTER the guard).
     plan.staging_bytes = staging;
     plan.process_floor_bytes = process_floor;
     plan.safety_margin_bytes = margin;
@@ -545,6 +541,19 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
     const uint64_t compute_final = compute_estimate_bytes(
         model, used_auto_window ? chosen_window : model.n_ctx);
     plan.compute_bytes = compute_final;
+
+    // Diagnostic: how many expert bundles the RAM remainder affords after the
+    // non-expert reserved cost. Computed from the FINAL (post-guard) reserved
+    // terms so a clamped Max plan reports a figure consistent with its final
+    // resident experts / KV window, not the pre-clamp remainder.
+    const uint64_t reserved_final = trunk_in_ram_eff + kv_resident + staging +
+                                    compute_final + process_floor + margin;
+    plan.expert_slots_ram =
+        per_bundle > 0 ? static_cast<uint32_t>(
+                             (usable > reserved_final ? usable - reserved_final
+                                                      : 0) /
+                             per_bundle)
+                       : 0;
     plan.trunk_pool_layers = trunk_pool_layers;
     plan.trunk_resident_bytes = trunk_pool_layers > 0
                                     ? per_layer_attn * trunk_pool_layers
@@ -613,7 +622,6 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
         const uint64_t floor_peak = floor_trunk + floor_experts + floor_kv +
                                     staging + floor_compute + process_floor +
                                     margin;
-        const uint64_t over = floor_peak > usable ? floor_peak - usable : 0;
         const bool floor_windowed =
             floor_window && model.n_ctx && floor_window < model.n_ctx;
 
@@ -624,12 +632,30 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
             os << ", KV window " << floor_window;
         if (floor_pool)
             os << ", trunk stream[hot=" << floor_pool << " layers]";
-        os << ") projects peak " << (floor_peak / kMiB)
-           << " MiB, which is " << (over / kMiB) << " MiB over the usable RAM "
-           << (usable / kMiB) << " MiB. The achievable floor (this minimal "
-           << "projected peak of " << (floor_peak / kMiB)
-           << " MiB) is the smallest this model fits in; raise the target to "
-           << "at least that. Dominant components: trunk-in-RAM "
+        os << ") projects peak " << (floor_peak / kMiB) << " MiB";
+        if (floor_peak > usable) {
+            // The minimal floor itself exceeds the budget: name the overage so
+            // the user knows how much more RAM/budget the floor needs.
+            os << ", which is " << ((floor_peak - usable) / kMiB)
+               << " MiB over the usable RAM " << (usable / kMiB)
+               << " MiB. The achievable floor (this minimal projected peak of "
+               << (floor_peak / kMiB) << " MiB) is the smallest this model fits "
+               << "in; raise the target to at least that.";
+        } else {
+            // The minimal floor would fit under usable, but the natural plan's
+            // peak still refuses (the pessimistic VRAM-resident-experts RAM
+            // accounting the comment above describes). Do NOT claim a "0 MiB
+            // over" overage - that would imply the load fits while it is
+            // refused. Frame the floor as the achievable target to aim at and
+            // make clear the refusal is driven by the natural plan's peak.
+            os << " against the usable RAM " << (usable / kMiB)
+               << " MiB. This minimal projected peak is the achievable floor "
+               << "(the smallest this model fits in); the load is refused "
+               << "because the natural plan's projected peak "
+               << (plan.planned_peak_bytes / kMiB)
+               << " MiB exceeds usable, so target this floor instead.";
+        }
+        os << " Dominant components: trunk-in-RAM "
            << (floor_trunk / kMiB) << " MiB, experts "
            << (floor_experts / kMiB) << " MiB, KV " << (floor_kv / kMiB)
            << " MiB, staging " << (staging / kMiB) << " MiB, compute "
