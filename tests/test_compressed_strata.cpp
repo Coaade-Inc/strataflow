@@ -532,9 +532,198 @@ static void test_compressed_seam_win() {
     std::remove(path.c_str());
 }
 
+// Same hand-built-.strata seam approach as test_compressed_seam_win, but for a
+// FUSED gate_up layout (gate_rel == up_rel == 0, a two-slice gate_up|down
+// bundle) - the only layout the compressed per-kind read_blob fallback ever
+// serves, and the one the in-tree Mixtral fixture never exercises (it is non-
+// fused). This gate pins the two review fixes on the fused + compressed path:
+//   (1) streamed_bytes() counts the COMPRESSED size EXACTLY ONCE across the
+//       gate/up/down read_blob calls, even though gate and up both have
+//       slice_rel == 0 (the old slice_rel-based guard counted it twice), and
+//   (2) read_bundle now SERVES the compressed fused bundle with a single whole-
+//       blob decode (byte-exact, counted once) instead of returning -1 and
+//       forcing three whole-blob decompressions through read_blob.
+// It also re-asserts the lossless guarantee: every read path yields bytes that
+// are byte-identical to the uncompressed fused bundle.
+static void test_compressed_seam_fused() {
+    // A FUSED bundle has TWO physical slices: a fused gate_up slice at rel 0
+    // (size gate_len+up_len) and a down slice after it. The reader's engine-
+    // facing view still asks for gate|up|down; for a fused layout gate_rel ==
+    // up_rel == 0, so read_blob(kGate) and read_blob(kUp) both resolve to the
+    // slice starting at rel 0 (gate maps to [0, gate_len), up to [0, up_len)).
+    const size_t gate_len = 4096, up_len = 4096, down_len = 8192;
+    const size_t gate_up_len = gate_len + up_len;
+    const size_t blob_len = gate_up_len + down_len;
+    std::vector<uint8_t> raw(blob_len);
+    for (size_t i = 0; i < blob_len; ++i) {
+        raw[i] = static_cast<uint8_t>((i / 64) & 0x0F);
+    }
+
+    std::vector<uint8_t> comp(lz_compress_bound(blob_len));
+    const int64_t clen = lz_compress(raw.data(), blob_len, comp.data(),
+                                     comp.size());
+    CHECK(clen > 0);
+    CHECK(static_cast<uint64_t>(clen) < blob_len);  // genuinely compressible
+    if (clen <= 0 || static_cast<uint64_t>(clen) >= blob_len) return;
+
+    const uint32_t kAlign = static_cast<uint32_t>(kIoAlignment);
+    auto align_up_local = [&](uint64_t v) {
+        return (v + kAlign - 1) & ~static_cast<uint64_t>(kAlign - 1);
+    };
+
+    const uint64_t meta_off = 128;
+    const uint64_t meta_size = 16;  // stub, non-zero
+    const uint64_t index_off = meta_off + meta_size;
+    const uint64_t index_count = 1;
+    const uint64_t index_bytes = index_count * sizeof(ExpertIndexEntry);
+    const uint64_t blob_off = align_up_local(index_off + index_bytes);
+    const uint64_t region_off = blob_off;
+    const uint64_t cindex_off =
+        align_up_local(blob_off + static_cast<uint64_t>(clen));
+    const uint64_t cindex_count = 1;
+    const uint64_t cindex_bytes = cindex_count * sizeof(ExpertBlobCompression);
+    const uint64_t file_size = cindex_off + cindex_bytes;
+
+    std::vector<uint8_t> file(static_cast<size_t>(file_size), 0);
+
+    // FUSED expert index entry: gate_rel == up_rel == 0 (the gate_up slice),
+    // down_rel == gate_up_len. This is exactly the layout read_bundle rejects
+    // for the VERBATIM path and the layout the per-kind read_blob fallback
+    // serves.
+    ExpertIndexEntry ent{};
+    ent.layer = 0;
+    ent.expert = 0;
+    ent.blob_offset = blob_off;
+    ent.blob_length = blob_len;
+    ent.gate_rel = 0;
+    ent.up_rel = 0;  // FUSED: gate and up share the rel-0 gate_up slice
+    ent.down_rel = gate_up_len;
+    std::memcpy(file.data() + index_off, &ent, sizeof(ent));
+
+    std::memcpy(file.data() + blob_off, comp.data(), static_cast<size_t>(clen));
+
+    ExpertBlobCompression ci{};
+    ci.codec = static_cast<uint32_t>(StrataCodec::kLz);
+    ci.compressed_length = static_cast<uint64_t>(clen);
+    ci.uncompressed_length = blob_len;
+    std::memcpy(file.data() + cindex_off, &ci, sizeof(ci));
+
+    std::memcpy(file.data() + 0, kStrataMagic, sizeof(kStrataMagic));
+    const uint32_t version = 3;
+    const uint32_t flags = kStrataFlagExpertsBundled | kStrataFlagIndexSorted |
+                           kStrataFlagExpertsCompressed;
+    std::memcpy(file.data() + 8, &version, 4);
+    std::memcpy(file.data() + 12, &flags, 4);
+    std::memcpy(file.data() + 16, &meta_off, 8);
+    std::memcpy(file.data() + 24, &meta_size, 8);
+    std::memcpy(file.data() + 32, &index_off, 8);
+    std::memcpy(file.data() + 40, &index_count, 8);
+    const uint64_t trunk_off = 0, trunk_size = 0;
+    std::memcpy(file.data() + 48, &trunk_off, 8);
+    std::memcpy(file.data() + 56, &trunk_size, 8);
+    std::memcpy(file.data() + 64, &region_off, 8);
+    const uint64_t region_size = cindex_off - region_off;
+    std::memcpy(file.data() + 72, &region_size, 8);
+    const uint64_t trunk_index_off = 0, trunk_index_count = 0;
+    std::memcpy(file.data() + 80, &trunk_index_off, 8);
+    std::memcpy(file.data() + 88, &trunk_index_count, 8);
+    std::memcpy(file.data() + 96, &cindex_off, 8);
+    std::memcpy(file.data() + 104, &cindex_count, 8);
+    const uint32_t n_layers = 1, n_experts = 1;
+    std::memcpy(file.data() + 112, &n_layers, 4);
+    std::memcpy(file.data() + 116, &n_experts, 4);
+    std::memcpy(file.data() + 120, &kAlign, 4);
+    const uint32_t crc = strata_crc32(file.data(), 124);
+    std::memcpy(file.data() + 124, &crc, 4);
+
+    const std::string path = "./test_compressed_seam_fused.strata";
+    FILE *f = std::fopen(path.c_str(), "wb");
+    CHECK(f != nullptr);
+    if (f == nullptr) return;
+    const size_t wrote = std::fwrite(file.data(), 1, file.size(), f);
+    std::fclose(f);
+    CHECK_EQ(wrote, file.size());
+
+    StrataReader r;
+    CHECK(r.open(path));
+    if (!r.is_open()) {
+        std::remove(path.c_str());
+        return;
+    }
+
+    // FIX (2): read_bundle now SERVES the compressed fused bundle (previously
+    // returned -1 for any fused layout). One whole-blob decode, byte-exact, and
+    // the COMPRESSED size counted exactly once.
+    std::vector<uint8_t> got(blob_len);
+    const uint64_t rb_s0 = r.streamed_bytes();
+    const uint64_t rb_c0 = r.read_calls();
+    const int64_t n = r.read_bundle(0, 0, got.data());
+    const uint64_t rb_streamed = r.streamed_bytes() - rb_s0;
+    const uint64_t rb_calls = r.read_calls() - rb_c0;
+    CHECK_EQ(n, static_cast<int64_t>(blob_len));
+    CHECK_EQ(std::memcmp(got.data(), raw.data(), blob_len), 0);
+    CHECK_EQ(rb_streamed, static_cast<uint64_t>(clen));
+    // ONE underlying read + ONE decode for the whole fused bundle.
+    CHECK_EQ(rb_calls, static_cast<uint64_t>(1));
+
+    // Slice ranges for the FUSED layout. slice_rel(kGate) == slice_rel(kUp) ==
+    // 0 (both resolve to the rel-0 gate_up slice), so the reader bounds both to
+    // the gap up to down_rel == gate_up_len: gate and up each report the WHOLE
+    // fused gate_up slice [0, gate_up_len), and down reports [gate_up_len,
+    // blob_len). (The engine never consumes a fused slice as a split gate/up
+    // here; what matters for the review fixes is the decode + the counting, and
+    // both read_blob slices decompress byte-exact against the real bundle.)
+    uint64_t goff = 0, glen = 0, uoff = 0, ulen = 0, doff = 0, dlen = 0;
+    CHECK(r.slice_range(0, 0, ExpertTensorKind::kGate, goff, glen));
+    CHECK(r.slice_range(0, 0, ExpertTensorKind::kUp, uoff, ulen));
+    CHECK(r.slice_range(0, 0, ExpertTensorKind::kDown, doff, dlen));
+    CHECK_EQ(glen, static_cast<uint64_t>(gate_up_len));
+    CHECK_EQ(ulen, static_cast<uint64_t>(gate_up_len));
+    CHECK_EQ(dlen, static_cast<uint64_t>(down_len));
+
+    // FIX (1): the three per-kind read_blob calls on the FUSED compressed blob
+    // each decode byte-exact, and the COMPRESSED size is counted EXACTLY ONCE
+    // across them - even though gate and up both have slice_rel == 0. The old
+    // slice_rel-based guard counted it TWICE (gate + up); keying the increment
+    // on the gate KIND (kGate) fixes it.
+    const uint64_t s1 = r.streamed_bytes();
+    std::vector<uint8_t> gate_bytes(static_cast<size_t>(glen)),
+        up_bytes(static_cast<size_t>(ulen)),
+        down_bytes(static_cast<size_t>(dlen));
+    const int64_t bg = r.read_blob(0, 0, ExpertTensorKind::kGate,
+                                   gate_bytes.data());
+    const int64_t bu = r.read_blob(0, 0, ExpertTensorKind::kUp,
+                                   up_bytes.data());
+    const int64_t bd = r.read_blob(0, 0, ExpertTensorKind::kDown,
+                                   down_bytes.data());
+    const uint64_t streamed_blobs = r.streamed_bytes() - s1;
+    CHECK_EQ(bg, static_cast<int64_t>(glen));
+    CHECK_EQ(bu, static_cast<int64_t>(ulen));
+    CHECK_EQ(bd, static_cast<int64_t>(dlen));
+    // gate slice (fused, rel 0) == first gate_up_len bytes of the decompressed
+    // bundle; up slice (also rel 0) is byte-identical to it; down slice ==
+    // bytes at [gate_up_len, blob_len). Lossless decode on every slice.
+    CHECK_EQ(std::memcmp(gate_bytes.data(), raw.data(), gate_up_len), 0);
+    CHECK_EQ(std::memcmp(up_bytes.data(), raw.data(), gate_up_len), 0);
+    CHECK_EQ(std::memcmp(down_bytes.data(), raw.data() + gate_up_len, down_len),
+             0);
+    // THE FIX: counted ONCE (== clen), not twice (== 2*clen).
+    CHECK_EQ(streamed_blobs, static_cast<uint64_t>(clen));
+
+    std::printf("[compressed seam fused: blob=%zuB compressed=%lldB "
+                "read_bundle streamed=%lluB (once) read_blob x3 streamed=%lluB "
+                "(once, not 2x)] ",
+                blob_len, static_cast<long long>(clen),
+                static_cast<unsigned long long>(rb_streamed),
+                static_cast<unsigned long long>(streamed_blobs));
+
+    std::remove(path.c_str());
+}
+
 static void run_all() {
     RUN(test_compressed_strata);
     RUN(test_compressed_seam_win);
+    RUN(test_compressed_seam_fused);
 }
 
 TEST_MAIN()

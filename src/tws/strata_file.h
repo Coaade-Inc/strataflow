@@ -81,10 +81,15 @@ public:
     // sequential read, higher effective bandwidth), never WHICH bytes.
     //
     // Returns the number of bytes read (== blob_length) on success, or -1 on a
-    // lookup/read error OR on a FUSED-gate_up bundle (gate_rel == up_rel),
-    // whose two-slice layout does not match the engine's three-slice slot; the
-    // caller must then fall back to the per-kind read_blob path. streamed_bytes()
-    // counts the bundle's bytes exactly once (identical total to three reads).
+    // lookup/read error OR on a VERBATIM FUSED-gate_up bundle (gate_rel ==
+    // up_rel), whose two-slice on-disk layout does not match the engine's
+    // three-slice slot; the caller must then fall back to the per-kind
+    // read_blob path. A COMPRESSED fused bundle IS served here: the whole blob
+    // is decoded once into dst (its decompressed layout is the same tightly-
+    // packed gate|up|down the three read_blob calls would produce), so a fused
+    // compressed expert is read and decoded exactly once rather than three
+    // times. streamed_bytes() counts the bundle's (compressed, when stored
+    // compressed) bytes exactly once (identical total to three reads).
     int64_t read_bundle(uint32_t layer, uint32_t expert, void *dst) const;
 
     // Count of underlying BlockFile::read_at calls issued by the EXPERT read

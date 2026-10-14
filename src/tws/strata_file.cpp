@@ -306,10 +306,13 @@ int64_t StrataReader::read_blob(uint32_t layer, uint32_t expert,
 
     const ExpertBlobCompression *ci = compression_at(it->second);
     if (ci != nullptr && ci->codec != static_cast<uint32_t>(StrataCodec::kNone)) {
-        // COMPRESSED per-kind path (the fallback the engine uses only for a
-        // fused layout; the common path is read_bundle). Read the whole
-        // compressed blob into a PER-CALL-LOCAL scratch, decompress the whole
-        // blob into another per-call buffer, then copy the requested kind's
+        // COMPRESSED per-kind path. This is now a FALLBACK: the engine's
+        // compressed fused bundles are served by read_bundle's single whole-
+        // blob decode (which both counts once and decodes once). This per-kind
+        // branch stays correct and self-contained for any caller that reads an
+        // individual slice (e.g. the compressed-seam test), reading the whole
+        // compressed blob into a PER-CALL-LOCAL scratch, decompressing it into
+        // another per-call buffer, then copying the requested kind's
         // [slice_rel, slice_rel+length) range into dst. No shared mutable
         // state, so concurrent compute+prefetch calls are race-free.
         const uint64_t slice_rel_off = slice_rel(e, kind);
@@ -329,10 +332,17 @@ int64_t StrataReader::read_blob(uint32_t layer, uint32_t expert,
 
         std::memcpy(dst, raw.data() + slice_rel_off,
                     static_cast<size_t>(length));
-        // Count the COMPRESSED bytes read, but only ONCE per blob so three
-        // per-kind calls do not treble-count: attribute them to the gate (the
-        // first slice, rel == 0). The up/down calls count 0 compressed bytes.
-        if (slice_rel_off == 0) {
+        // Count the COMPRESSED bytes read EXACTLY ONCE per blob across the
+        // three per-kind calls. Attribute them to the GATE kind specifically
+        // (kGate for a three-slice layout, kGateUp for a fused layout) rather
+        // than to "any slice whose slice_rel == 0": in a FUSED bundle both the
+        // gate and the up slice have slice_rel == 0, so a slice_rel-based guard
+        // would count the compressed size twice (once for kGate, once for
+        // kUp). Keying on the gate KIND makes the fused case count once, and
+        // leaves the non-fused case unchanged (kGate is the rel==0 slice
+        // there too). The up/down calls count 0 compressed bytes.
+        if (kind == ExpertTensorKind::kGate ||
+            kind == ExpertTensorKind::kGateUp) {
             streamed_bytes_.fetch_add(ci->compressed_length,
                                       std::memory_order_relaxed);
         }
@@ -359,24 +369,6 @@ int64_t StrataReader::read_bundle(uint32_t layer, uint32_t expert,
                                   void *dst) const {
     const ExpertIndexEntry *e = find(layer, expert);
     if (e == nullptr) return -1;
-    // A FUSED gate_up bundle (gate_rel == up_rel) has a two-slice layout
-    // (gate_up fused, then down) that does NOT match the engine's three-slice
-    // gate|up|down slot buffer. Refuse so the caller falls back to the per-kind
-    // read_blob path (which handles the fused case). The non-fused path below
-    // is the common MoE arch (Mixtral et al.).
-    if (e->up_rel == e->gate_rel) return -1;
-    // The three slices must be tightly packed in gate|up|down order starting at
-    // the blob start and covering the whole blob_length, so that ONE read of
-    // [blob_offset, blob_offset+blob_length) yields the exact same bytes as the
-    // three read_blob calls concatenated. The packer guarantees this (gate_rel
-    // == 0, up_rel == gate_len, down_rel == gate_len+up_len, blob_length ==
-    // gate_len+up_len+down_len). Verify defensively; refuse (fall back) if any
-    // assumption fails so a malformed/unexpected layout can never silently
-    // corrupt the slot.
-    if (e->gate_rel != 0 || e->up_rel <= e->gate_rel ||
-        e->down_rel <= e->up_rel || e->down_rel >= e->blob_length) {
-        return -1;
-    }
 
     // COMPRESSED path (FEAT-002 'compress what streams'). Read the COMPRESSED
     // bytes from blob_offset into a PER-CALL-LOCAL scratch, decompress straight
@@ -385,6 +377,18 @@ int64_t StrataReader::read_bundle(uint32_t layer, uint32_t expert,
     // unchanged. streamed_bytes_ counts the COMPRESSED bytes actually read -
     // the WIN. No shared mutable reader state: all scratch is per-call local, so
     // the compute thread and the async prefetch worker may call concurrently.
+    //
+    // This branch serves BOTH the three-slice (gate|up|down) AND the FUSED
+    // gate_up (gate_rel == up_rel) layouts: the decompressed blob is the whole
+    // tightly-packed bundle, exactly blob_length bytes, laid out exactly as the
+    // three read_blob calls concatenated would produce (a fused gate_up slice
+    // is gate followed by up contiguously, == gb+ub bytes, so [gate_up | down]
+    // is byte-identical to [gate | up | down]). Decoding ONCE here is what
+    // keeps a fused compressed expert from the per-kind read_blob fallback,
+    // which would otherwise decompress the whole blob THREE times per expert
+    // and attribute the compressed size to streamed_bytes_ more than once. The
+    // VERBATIM path below still rejects fused (its three-slice contiguity
+    // checks do not hold), so a fused VERBATIM bundle falls back to read_blob.
     auto it = map_.find(pack_key(layer, expert));
     const size_t index_pos = (it != map_.end()) ? it->second : compress_.size();
     const ExpertBlobCompression *ci = compression_at(index_pos);
@@ -401,6 +405,25 @@ int64_t StrataReader::read_bundle(uint32_t layer, uint32_t expert,
         streamed_bytes_.fetch_add(ci->compressed_length,
                                   std::memory_order_relaxed);
         return static_cast<int64_t>(e->blob_length);
+    }
+
+    // VERBATIM path. A FUSED gate_up bundle (gate_rel == up_rel) has a two-slice
+    // layout (gate_up fused, then down) that does NOT match the engine's three-
+    // slice gate|up|down slot buffer. Refuse so the caller falls back to the
+    // per-kind read_blob path (which handles the fused case). The non-fused
+    // path below is the common MoE arch (Mixtral et al.).
+    if (e->up_rel == e->gate_rel) return -1;
+    // The three slices must be tightly packed in gate|up|down order starting at
+    // the blob start and covering the whole blob_length, so that ONE read of
+    // [blob_offset, blob_offset+blob_length) yields the exact same bytes as the
+    // three read_blob calls concatenated. The packer guarantees this (gate_rel
+    // == 0, up_rel == gate_len, down_rel == gate_len+up_len, blob_length ==
+    // gate_len+up_len+down_len). Verify defensively; refuse (fall back) if any
+    // assumption fails so a malformed/unexpected layout can never silently
+    // corrupt the slot.
+    if (e->gate_rel != 0 || e->up_rel <= e->gate_rel ||
+        e->down_rel <= e->up_rel || e->down_rel >= e->blob_length) {
+        return -1;
     }
 
     read_calls_.fetch_add(1, std::memory_order_relaxed);
