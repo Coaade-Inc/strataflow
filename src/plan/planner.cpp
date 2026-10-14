@@ -301,26 +301,26 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
     const uint64_t lower_experts =
         model.n_experts_used ? model.n_experts_used : 1;
 
-    // Trunk footprint the KV step-down should budget against. The per-layer
-    // attention trunk (attn_trunk_bytes) is STREAMABLE (FEAT-003), so when a
-    // tight budget would otherwise force the trunk into a bounded hot pool, the
-    // KV window must step down against the MINIMAL achievable trunk footprint
-    // (non-attention trunk + a single hot attention layer), not the full
-    // resident trunk. Otherwise the two levers do not co-reduce and a tight
-    // target cannot be met even though streaming the trunk would free the RAM
-    // the smaller KV window needs. When nothing is streamable
-    // (attn_trunk_bytes==0) this equals the full trunk, so the existing
-    // behavior is unchanged. This only ever LOWERS the fixed estimate used to
-    // pick the window; it does not change which bytes compute.
-    const uint64_t kv_attn_trunk =
-        model.n_layers ? std::min(model.attn_trunk_bytes, trunk_in_ram) : 0;
-    const uint64_t kv_non_attn_trunk =
-        trunk_in_ram > kv_attn_trunk ? trunk_in_ram - kv_attn_trunk : 0;
-    const uint64_t kv_per_layer_attn =
-        model.n_layers ? kv_attn_trunk / model.n_layers : 0;
-    const uint64_t trunk_floor_for_kv =
-        kv_per_layer_attn > 0 ? kv_non_attn_trunk + kv_per_layer_attn
-                              : trunk_in_ram;
+    // Trunk footprint the KV step-down budgets against (FEAT-002 COHERENCE).
+    //
+    // COHERENCE INVARIANT: AUTO (and any mode) must NEVER keep the FULL n_ctx
+    // KV resident while simultaneously HARD-STREAMING the per-layer attention
+    // trunk (trunk_pool_layers>0 and << n_layers). The two resident levers must
+    // CO-REDUCE: on a tight box the KV window steps down FIRST (it is lossless
+    // paging) so the full trunk can stay resident; the trunk only streams if
+    // even a windowed KV + the full resident trunk cannot fit.
+    //
+    // The old code budgeted the KV step-down against the MINIMAL (streamed)
+    // trunk floor (non-attn + one hot layer). That let AUTO keep FULL KV
+    // because full KV "fit" once the trunk was assumed streamed - and then the
+    // trunk-streaming pass below streamed the trunk hard, yielding the forbidden
+    // full-KV + hard-trunk-streaming combination (observed on real Mixtral:
+    // 8 GiB resident KV with hot=9/32 trunk). Budgeting the KV window against
+    // the FULL resident trunk instead forces the KV to step down before the
+    // trunk is streamed, so the levers co-reduce and the invariant holds by
+    // construction. When nothing is streamable (attn_trunk_bytes==0) this is
+    // the full trunk either way, so dense/non-streamable behavior is unchanged.
+    const uint64_t trunk_floor_for_kv = trunk_in_ram;
 
     const uint64_t fixed_wo_kv =
         trunk_floor_for_kv + staging + process_floor + margin +
@@ -357,7 +357,7 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
         }
     }
 
-    const uint64_t compute = compute_estimate_bytes(model, chosen_window);
+    uint64_t compute = compute_estimate_bytes(model, chosen_window);
 
     // FEAT-003 ADAPTIVE PER-LAYER TRUNK STREAMING (technique 6.4). After the KV
     // window, the dominant resident cost on a tight box is the per-layer
@@ -409,6 +409,43 @@ PlacementPlan plan_placement(const HardwareProfile &hw,
                                    per_layer_attn * trunk_pool_layers;
             }
         }
+    }
+
+    // FEAT-002 COHERENCE GUARANTEE (explicit, step iii). The KV window above
+    // was budgeted against the FULL resident trunk, so by construction the
+    // trunk only hard-streams after the KV has already stepped down. Enforce
+    // the invariant EXPLICITLY as a backstop so no future change to the lever
+    // ordering can reintroduce the forbidden combination: if the trunk is
+    // hard-streaming (trunk_pool_layers>0 and < n_layers) the KV window MUST be
+    // windowed (0 < kv_window < n_ctx). If somehow it is still full, step it
+    // down to the largest window that fits alongside the (now streamed) trunk,
+    // so the two levers co-reduce. Lossless (cold KV columns page out).
+    if (trunk_pool_layers > 0 && trunk_pool_layers < model.n_layers &&
+        !used_auto_window && model.n_ctx > 0 && model.head_dim &&
+        model.n_head_kv) {
+        const uint64_t non_attn_trunk =
+            trunk_in_ram > attn_trunk_total ? trunk_in_ram - attn_trunk_total : 0;
+        const uint64_t trunk_hot = non_attn_trunk +
+                                   per_layer_attn * trunk_pool_layers;
+        uint32_t w = 1;
+        while (w * 2u <= model.n_ctx) w *= 2u;  // largest pow2 <= n_ctx
+        for (; w >= kMinKvWindow; w /= 2u) {
+            if (w >= model.n_ctx) continue;  // must be a true window (< n_ctx)
+            const uint64_t kvw = kv_bytes_for_window(model, w);
+            const uint64_t compute_w = compute_estimate_bytes(model, w);
+            const uint64_t fixed_w = trunk_hot + staging + process_floor +
+                                     margin + compute_w +
+                                     lower_experts * per_bundle;
+            if (fixed_w + kvw <= usable) {
+                chosen_window = w;
+                kv_resident = kvw;
+                used_auto_window = true;
+                break;
+            }
+        }
+        // If nothing fit, the refusal path below fires; we never return a plan
+        // that keeps full KV while hard-streaming the trunk and still "fits".
+        compute = compute_estimate_bytes(model, chosen_window);
     }
 
     // Size the expert cache from the REMAINDER after every other mandatory
