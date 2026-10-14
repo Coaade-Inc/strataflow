@@ -150,6 +150,14 @@ public:
 private:
     uint64_t slice_rel(const ExpertIndexEntry &e, ExpertTensorKind kind) const;
 
+    // The compression record for the index entry at position `index_pos`, or
+    // nullptr when the file carries no compression index (v1/v2, or a v3 file
+    // with no compressed blob) so the blob is stored verbatim.
+    const ExpertBlobCompression *compression_at(size_t index_pos) const {
+        if (index_pos >= compress_.size()) return nullptr;
+        return &compress_[index_pos];
+    }
+
     bool                            open_ = false;
     mutable BlockFile               file_;
     // Accumulated expert-slice bytes read via read_blob(). mutable because
@@ -178,6 +186,13 @@ private:
     // for O(1) lookup. Empty for a v1 file (full-resident fallback).
     std::vector<TrunkIndexEntry>    trunk_index_;
     std::unordered_map<std::string, size_t> trunk_map_;
+    // v3 per-expert-blob compression index (FEAT-002 'compress what streams'),
+    // aligned 1:1 with index_ by POSITION (compress_[i] describes index_[i]'s
+    // on-disk blob). Empty for a v1/v2 file or a v3 file with no compressed
+    // blob, in which case every blob is streamed verbatim (byte-identical to
+    // the uncompressed path). read_blob/read_bundle decompress transparently
+    // when compress_[i].codec != kNone, using PER-CALL-LOCAL scratch only.
+    std::vector<ExpertBlobCompression> compress_;
 };
 
 }  // namespace sf

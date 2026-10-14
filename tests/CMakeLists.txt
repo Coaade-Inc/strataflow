@@ -113,6 +113,25 @@ sf_add_test(test_target_ram_modes_real_path)
 # library (pack + reader), so a plain sf_add_test suffices.
 sf_add_test(test_coalesced_expert_read)
 
+# test_compressed_strata is the FEAT-002 'compress what streams' gate: it packs
+# the Mixtral-geometry legacy fixture TWICE (verbatim and --compress lz) and
+# proves, through the REAL StrataReader + the REAL engine, that (a) the engine
+# decode on the compressed .strata is byte-identical (greedy sequence + per-step
+# logit max|delta|==0.0) to the uncompressed .strata and matches the libllama
+# oracle on the matched stacked GGUF within the soft quant bound; (b) the
+# compressed expert_region_size (and total file) is <= the uncompressed one
+# (strictly < when any blob compresses; the already-quantized K-quant fixture is
+# high-entropy, so the ratio is reported honestly - typically ~1.0); (c)
+# read_bundle on the compressed reader yields decompressed bytes memcmp-identical
+# to the uncompressed read_bundle AND to the three read_blob calls concatenated,
+# while streamed_bytes() advances by no more than the uncompressed reader
+# (strictly less when compressed); and (d) lz_decompress(lz_compress(blob))==blob
+# at the codec level on a real expert blob. Guarded on
+# STRATAFLOW_TEST_MIXTRAL_GEOM_GGUF (+ _STACKED for the oracle decode half);
+# skips cleanly when unset. Only drives the library (pack + reader + engine +
+# oracle), so a plain sf_add_test suffices.
+sf_add_test(test_compressed_strata)
+
 # test_lz_codec is the FEAT-001 unit gate for the self-contained LZ codec
 # (src/common/lz_codec): it round-trips empty / tiny / highly-compressible /
 # high-entropy / multi-MiB blob inputs byte-exact, asserts the
